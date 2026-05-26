@@ -44,13 +44,6 @@ let poly = {
   windowOpeningBTC: null,
   windowOpeningSource: null,
 };
-let polyBook = {
-  up: { bids: [], asks: [] },
-  down: { bids: [], asks: [] },
-  ts: null,
-  available: true,
-  lastErr: null,
-};
 let polyClobOk = true;
 
 // Chainlink
@@ -207,15 +200,6 @@ function getVWAP(sec = 60) {
   if (!v) return null;
   return ((ticks[ticks.length - 1].price - sv / v) / (sv / v)) * 100;
 }
-function getVWAPAbsolute(sec = 60) {
-  const c = Date.now() - sec * 1000;
-  const r = ticks.filter(t => t.time >= c);
-  if (r.length < 5) return null;
-  const sv = r.reduce((a, t) => a + t.price * t.qty, 0);
-  const v  = r.reduce((a, t) => a + t.qty, 0);
-  if (!v) return null;
-  return sv / v;
-}
 function getTickDir(sec = 10) {
   const c = Date.now() - sec * 1000;
   const r = ticks.filter(t => t.time >= c);
@@ -302,17 +286,6 @@ function getTPSAcceleration() {
   if (recent === null || past30 === null || past30 < 0.5) return null;
   return (recent - past30) / past30;
 }
-function getBTCPolyBookSignal(levels = 5) {
-  if (!polyBook.up.bids?.length || !polyBook.down.bids?.length) return null;
-  const sum = arr => arr.slice(0, levels).reduce((a, o) => a + (parseFloat(o.size) || 0), 0);
-  const upBids = sum(polyBook.up.bids), upAsks = sum(polyBook.up.asks);
-  const dnBids = sum(polyBook.down.bids), dnAsks = sum(polyBook.down.asks);
-  const bullW = upBids + dnAsks, bearW = dnBids + upAsks;
-  const total = bullW + bearW;
-  if (!total) return null;
-  return { signal: (bullW - bearW) / total, upBids, upAsks, dnBids, dnAsks };
-}
-
 // ─── PREDICTION ENGINES ──────────────────────────────────────────────────────
 function predictScalp() {
   let sc = 0, w = 0;
@@ -449,23 +422,6 @@ async function fetchClobBook(tokenId) {
   return res.json();
 }
 
-async function fetchPolyBook() {
-  if (!poly.market || !polyBook.available) return;
-  try {
-    const [u, d] = await Promise.all([
-      fetchClobBook(poly.market.tokenIdUp),
-      fetchClobBook(poly.market.tokenIdDown),
-    ]);
-    polyBook.up   = { bids: u.bids || [], asks: u.asks || [] };
-    polyBook.down = { bids: d.bids || [], asks: d.asks || [] };
-    polyBook.ts   = Date.now();
-    polyBook.lastErr = null;
-  } catch (e) {
-    polyBook.available = false;
-    polyBook.lastErr   = e.message || 'book fetch fail';
-  }
-}
-
 async function determineWindowOpening() {
   if (chain.currentPrice) {
     poly.windowOpeningBTC    = chain.currentPrice;
@@ -584,112 +540,7 @@ const STRAT_MOMENTUM = {
   },
 };
 
-const STRAT_MEANREV = {
-  id: 'meanRev',
-  name: 'Mean Reversion',
-  desc: 'Против шары > 78¢ за 30-120с до конца',
-  defaults: { threshold: 0.78, minTimeMs: 30000, maxTimeMs: 120000, tpReturnTo: 0.65, slPct: 0.40, kellyFrac: 0.15, maxFrac: 0.015 },
-  shouldEnter(ctx, p) {
-    if (ctx.msToEnd < p.minTimeMs || ctx.msToEnd > p.maxTimeMs) return null;
-    if (ctx.polyUp === null) return null;
-    if (ctx.polyUp >= p.threshold) {
-      const ourProb = 1 - ctx.polyUp + 0.05;
-      const edge    = ourProb - ctx.polyDn;
-      return { side: 'DOWN', polyPrice: ctx.polyDn, ourProb, edge, info: `UP перегрет ${(ctx.polyUp * 100).toFixed(0)}¢` };
-    }
-    if (ctx.polyDn >= p.threshold) {
-      const ourProb = 1 - ctx.polyDn + 0.05;
-      const edge    = ourProb - ctx.polyUp;
-      return { side: 'UP', polyPrice: ctx.polyUp, ourProb, edge, info: `DOWN перегрет ${(ctx.polyDn * 100).toFixed(0)}¢` };
-    }
-    return null;
-  },
-  shouldExit(ctx, pos, p) {
-    const curMid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
-    if (curMid !== null) {
-      if (curMid >= p.tpReturnTo) return { reason: 'TP', exitPrice: curMid };
-      const mv = (curMid - pos.polyEntryPrice) / pos.polyEntryPrice;
-      if (mv <= -p.slPct) return { reason: 'SL', exitPrice: curMid };
-    }
-    return null;
-  },
-};
-
-const STRAT_BOOKIMB = {
-  id: 'bookImb',
-  name: 'Poly Book Imbalance',
-  desc: 'Имбаланс глубины Polymarket стакана > 40%',
-  defaults: { minImb: 0.40, minTimeMs: 120000, tpPct: 0.40, slPct: 0.25, reverseExit: true, kellyFrac: 0.20, maxFrac: 0.02 },
-  shouldEnter(ctx, p) {
-    if (ctx.msToEnd < p.minTimeMs) return null;
-    if (ctx.polyUp === null) return null;
-    const sig = getBTCPolyBookSignal(5);
-    if (!sig || Math.abs(sig.signal) < p.minImb) return null;
-    const side      = sig.signal > 0 ? 'UP' : 'DOWN';
-    const polyPrice = side === 'UP' ? ctx.polyUp : ctx.polyDn;
-    const ourProb   = polyPrice + Math.min(0.10, Math.abs(sig.signal) * 0.10);
-    const edge      = ourProb - polyPrice;
-    return { side, polyPrice, ourProb, edge, info: `book imb ${(sig.signal * 100).toFixed(0)}%` };
-  },
-  shouldExit(ctx, pos, p) {
-    const curMid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
-    if (curMid !== null) {
-      const mv = (curMid - pos.polyEntryPrice) / pos.polyEntryPrice;
-      if (mv >= p.tpPct)  return { reason: 'TP', exitPrice: curMid };
-      if (mv <= -p.slPct) return { reason: 'SL', exitPrice: curMid };
-    }
-    if (p.reverseExit) {
-      const sig = getBTCPolyBookSignal(5);
-      if (sig) {
-        if (pos.side === 'UP'   && sig.signal < 0) return { reason: 'IMB_REV', exitPrice: curMid };
-        if (pos.side === 'DOWN' && sig.signal > 0) return { reason: 'IMB_REV', exitPrice: curMid };
-      }
-    }
-    return null;
-  },
-};
-
-const STRAT_VWAPREV = {
-  id: 'vwapRev',
-  name: 'VWAP Reversion',
-  desc: 'BTC > 1.5 ATR от VWAP60с → ставит на возврат',
-  defaults: { minDevATR: 1.5, minTimeMs: 120000, tpReturnATR: 0.5, slPct: 0.30, kellyFrac: 0.15, maxFrac: 0.015 },
-  shouldEnter(ctx, p) {
-    if (ctx.msToEnd < p.minTimeMs) return null;
-    if (ctx.polyUp === null || !ctx.curBTC) return null;
-    const vwap   = getVWAPAbsolute(60);
-    const atrBps = getATR(60);
-    if (vwap === null || atrBps === null || atrBps < 2) return null;
-    const atrAbs = atrBps / 10000 * ctx.curBTC;
-    const dev    = ctx.curBTC - vwap;
-    const devATR = dev / atrAbs;
-    if (Math.abs(devATR) < p.minDevATR) return null;
-    const side      = devATR > 0 ? 'DOWN' : 'UP';
-    const polyPrice = side === 'UP' ? ctx.polyUp : ctx.polyDn;
-    const ourProb   = polyPrice + Math.min(0.08, Math.abs(devATR) * 0.025);
-    const edge      = ourProb - polyPrice;
-    return { side, polyPrice, ourProb, edge, info: `dev=${devATR.toFixed(2)} ATR` };
-  },
-  shouldExit(ctx, pos, p) {
-    const curMid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
-    if (curMid !== null) {
-      const mv = (curMid - pos.polyEntryPrice) / pos.polyEntryPrice;
-      if (mv >= 0.40)     return { reason: 'TP', exitPrice: curMid };
-      if (mv <= -p.slPct) return { reason: 'SL', exitPrice: curMid };
-    }
-    const vwap   = getVWAPAbsolute(60);
-    const atrBps = getATR(60);
-    if (vwap !== null && atrBps !== null && atrBps > 0 && ctx.curBTC) {
-      const atrAbs = atrBps / 10000 * ctx.curBTC;
-      const devATR = (ctx.curBTC - vwap) / atrAbs;
-      if (pos.side === 'UP'   && devATR > -p.tpReturnATR) return { reason: 'VWAP_OK', exitPrice: curMid };
-      if (pos.side === 'DOWN' && devATR < p.tpReturnATR)  return { reason: 'VWAP_OK', exitPrice: curMid };
-    }
-    return null;
-  },
-};
-
-const STRAT_DEFINITIONS = [STRAT_MOMENTUM, STRAT_MEANREV, STRAT_BOOKIMB, STRAT_VWAPREV];
+const STRAT_DEFINITIONS = [STRAT_MOMENTUM];
 
 function initStrategies() {
   for (const def of STRAT_DEFINITIONS) {
@@ -1021,8 +872,6 @@ setInterval(() => {
 
 // Polymarket every 2s
 setInterval(() => { if (poly.autoFetch) fetchPolyMarket().catch(e => console.error('[poly]', e.message)); }, 2000);
-// Polymarket book every 4s
-setInterval(() => { if (poly.autoFetch && poly.market && polyBook.available) fetchPolyBook().catch(() => {}); }, 4000);
 // Chainlink every 4s
 setInterval(() => { if (chain.enabled && !isSim) refreshChainlinkPrice().catch(() => {}); }, 4000);
 // Strategy engine every 1s
