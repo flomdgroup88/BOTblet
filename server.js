@@ -805,7 +805,7 @@ const STRAT_MOMENTUM = {
   id: 'momentum',
   name: 'Momentum / Trend',
   desc: 'Высокая уверенность модели + edge ≥ 3pp',
-  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, tpPct: 0.50, slPct: 0.30, flipConf: 50, advMovePct: 0.25, kellyFrac: 0.25, maxFrac: 0.02 },
+  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, tpPct: 0.50, slPct: 0.30, flipConf: 50, advMovePct: 0.25, kellyFrac: 0.25, maxFrac: 0.10 },
   shouldEnter(ctx, p) {
     if (ctx.sigP.dir === 'WAIT') return null;
     if (ctx.sigP.conf < p.minConf) return null;
