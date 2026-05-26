@@ -5,6 +5,7 @@ const express  = require('express');
 const { WebSocket } = require('ws');
 // Node 18+ has built-in fetch — no import needed
 const { ethers } = require('ethers');
+const crypto   = require('crypto');   // built-in, for HMAC-SHA256
 const fs       = require('fs');
 const path     = require('path');
 
@@ -21,6 +22,15 @@ const POLYGON_RPCS     = [
   'https://polygon-bor-rpc.publicnode.com',
 ];
 const CHAINLINK_ABI    = ['function latestAnswer() view returns (int256)'];
+
+// ─── REAL TRADING CONFIG ──────────────────────────────────────────────────────
+// To enable: set REAL_TRADING=true and POLY_PRIVATE_KEY=0x... in Railway env vars
+// Optionally set POLY_API_KEY + POLY_API_SECRET + POLY_PASSPHRASE to skip key derivation
+const REAL_TRADING  = process.env.REAL_TRADING === 'true';
+const POLY_PK       = process.env.POLY_PRIVATE_KEY || '';
+// Polymarket CTF Exchange contract on Polygon mainnet (settles all prediction markets)
+const CTF_EXCHANGE  = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
+const POLY_CHAIN_ID = 137;
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
 let ticks        = [];   // { time, price, qty, isBuyerMaker }
@@ -497,6 +507,291 @@ async function refreshChainlinkPrice() {
   }
 }
 
+// ─── REAL TRADING MODULE (POLYMARKET CLOB) ───────────────────────────────────
+// Only active when REAL_TRADING=true and POLY_PRIVATE_KEY is set.
+// Only the Momentum strategy places real orders; all others stay in simulation.
+
+let polyWallet   = null;   // ethers.Wallet derived from POLY_PRIVATE_KEY
+let polyApiCreds = null;   // { key, secret, passphrase, address }
+let realBalance  = null;   // latest USDC balance fetched from CLOB
+
+/** EIP-712 domain for CTF Exchange order signing */
+const ORDER_DOMAIN = {
+  name:              'Polymarket CTF Exchange',
+  version:           '1',
+  chainId:           POLY_CHAIN_ID,
+  verifyingContract: CTF_EXCHANGE,
+};
+
+/** EIP-712 types — must match the CTF Exchange contract exactly */
+const ORDER_TYPES = {
+  Order: [
+    { name: 'salt',          type: 'uint256' },
+    { name: 'maker',         type: 'address' },
+    { name: 'signer',        type: 'address' },
+    { name: 'taker',         type: 'address' },
+    { name: 'tokenId',       type: 'uint256' },
+    { name: 'makerAmount',   type: 'uint256' },
+    { name: 'takerAmount',   type: 'uint256' },
+    { name: 'expiration',    type: 'uint256' },
+    { name: 'nonce',         type: 'uint256' },
+    { name: 'feeRateBps',    type: 'uint256' },
+    { name: 'side',          type: 'uint8'   },
+    { name: 'signatureType', type: 'uint8'   },
+  ],
+};
+
+/**
+ * L1 auth headers (personal_sign).
+ * Required for: creating / fetching API keys via /auth/api-key.
+ */
+async function l1Headers(method, reqPath, body = '') {
+  const ts  = String(Math.floor(Date.now() / 1000));
+  const sig = await polyWallet.signMessage(ts + method + reqPath + body);
+  return {
+    'Content-Type':   'application/json',
+    'POLY_ADDRESS':   polyWallet.address,
+    'POLY_SIGNATURE': sig,
+    'POLY_TIMESTAMP': ts,
+    'POLY_NONCE':     '0',
+  };
+}
+
+/**
+ * L2 auth headers (HMAC-SHA256).
+ * Required for: placing orders, cancelling, querying balance, etc.
+ */
+function l2Headers(method, reqPath, body = '') {
+  const ts        = String(Math.floor(Date.now() / 1000));
+  const msg       = ts + method + reqPath + (body || '');
+  const secretBuf = Buffer.from(polyApiCreds.secret, 'base64');
+  const sig       = crypto.createHmac('sha256', secretBuf).update(msg).digest('base64');
+  return {
+    'Content-Type':    'application/json',
+    'POLY_ADDRESS':    polyApiCreds.address,
+    'POLY_SIGNATURE':  sig,
+    'POLY_TIMESTAMP':  ts,
+    'POLY_NONCE':      '0',
+    'POLY_API_KEY':    polyApiCreds.key,
+    'POLY_PASSPHRASE': polyApiCreds.passphrase,
+  };
+}
+
+/**
+ * Fetch or create an API key pair for the current wallet.
+ * If POLY_API_KEY / POLY_API_SECRET / POLY_PASSPHRASE are set in env,
+ * they are used directly (skip on-chain derivation).
+ */
+async function getOrCreateApiKey() {
+  if (process.env.POLY_API_KEY && process.env.POLY_API_SECRET && process.env.POLY_PASSPHRASE) {
+    console.log('[real] using pre-configured API credentials from env');
+    return {
+      key:        process.env.POLY_API_KEY,
+      secret:     process.env.POLY_API_SECRET,
+      passphrase: process.env.POLY_PASSPHRASE,
+      address:    polyWallet.address,
+    };
+  }
+
+  // Try fetching existing keys first (GET)
+  try {
+    const hdrs = await l1Headers('GET', '/auth/api-key');
+    const r    = await fetch(`${POLY_CLOB}/auth/api-key`, { method: 'GET', headers: hdrs, signal: AbortSignal.timeout(10000) });
+    if (r.ok) {
+      const body = await r.json();
+      const keys = Array.isArray(body) ? body : (body.apiKeys || [body]);
+      if (keys.length > 0 && keys[0].key) return { ...keys[0], address: polyWallet.address };
+    }
+  } catch (_) { /* fall through to creation */ }
+
+  // Create a fresh key pair (POST)
+  const hdrs = await l1Headers('POST', '/auth/api-key');
+  const r2   = await fetch(`${POLY_CLOB}/auth/api-key`, { method: 'POST', headers: hdrs, signal: AbortSignal.timeout(10000) });
+  if (!r2.ok) throw new Error(`create api-key failed: HTTP ${r2.status} — ${await r2.text()}`);
+  const creds = await r2.json();
+  return { ...creds, address: polyWallet.address };
+}
+
+/**
+ * Build and EIP-712 sign a Polymarket CTF order.
+ *
+ * @param {string}       tokenId   clobTokenId for the outcome
+ * @param {'BUY'|'SELL'} side
+ * @param {number}       size      BUY → USDC to spend; SELL → shares to sell
+ * @param {number}       price     price per share (0–1), e.g. 0.55
+ */
+async function buildSignedOrder(tokenId, side, size, price) {
+  const isBuy = side === 'BUY';
+  const MICRO = 1_000_000; // USDC and conditional tokens both use 6 decimal places
+
+  // BUY:  maker gives USDC (makerAmount),  taker gives shares (takerAmount)
+  // SELL: maker gives shares (makerAmount), taker gives USDC  (takerAmount)
+  const makerAmount = isBuy
+    ? BigInt(Math.round(size * MICRO))               // USDC to spend
+    : BigInt(Math.round(size * MICRO));               // shares to sell
+  const takerAmount = isBuy
+    ? BigInt(Math.round((size / price) * MICRO))     // shares to receive
+    : BigInt(Math.round((size * price) * MICRO));    // USDC to receive
+
+  const salt = BigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER));
+
+  const orderStruct = {
+    salt,
+    maker:         polyWallet.address,
+    signer:        polyWallet.address,
+    taker:         '0x0000000000000000000000000000000000000000',
+    tokenId:       BigInt(tokenId),
+    makerAmount,
+    takerAmount,
+    expiration:    0n,
+    nonce:         0n,
+    feeRateBps:    0n,
+    side:          isBuy ? 0 : 1,
+    signatureType: 0,  // 0 = EOA (plain wallet)
+  };
+
+  const signature = await polyWallet.signTypedData(ORDER_DOMAIN, ORDER_TYPES, orderStruct);
+
+  return {
+    salt:          salt.toString(),
+    maker:         polyWallet.address,
+    signer:        polyWallet.address,
+    taker:         '0x0000000000000000000000000000000000000000',
+    tokenId:       tokenId.toString(),
+    makerAmount:   makerAmount.toString(),
+    takerAmount:   takerAmount.toString(),
+    expiration:    '0',
+    nonce:         '0',
+    feeRateBps:    '0',
+    side,
+    signatureType: 0,
+    signature,
+  };
+}
+
+/**
+ * Place an order on the Polymarket CLOB.
+ * @param {{ tokenId, side, size, price, orderType? }} opts
+ * @returns {{ orderID, status, ... }}
+ */
+async function placeClobOrder({ tokenId, side, size, price, orderType = 'GTC' }) {
+  if (!polyWallet || !polyApiCreds) throw new Error('wallet not initialised');
+  if (!tokenId)                     throw new Error('tokenId is required');
+
+  const signedOrder = await buildSignedOrder(tokenId, side, size, price);
+  const body        = JSON.stringify({ order: signedOrder, owner: polyWallet.address, orderType });
+  const hdrs        = l2Headers('POST', '/order', body);
+
+  const res  = await fetch(`${POLY_CLOB}/order`, {
+    method: 'POST', headers: hdrs, body,
+    signal: AbortSignal.timeout(12000),
+  });
+  const data = await res.json().catch(() => ({}));
+
+  if (!res.ok || data.error || data.errorCode) {
+    throw new Error(data.errorMsg || data.error || data.errorCode || `HTTP ${res.status}`);
+  }
+  return data;  // { orderID, status, transactionsHashes?, ... }
+}
+
+/** Cancel an open order by ID. Safe to call even if already filled. */
+async function cancelClobOrder(orderId) {
+  if (!polyWallet || !polyApiCreds || !orderId) return;
+  try {
+    const body = JSON.stringify({ orderID: orderId });
+    const hdrs = l2Headers('DELETE', '/order', body);
+    const res  = await fetch(`${POLY_CLOB}/order`, {
+      method: 'DELETE', headers: hdrs, body,
+      signal: AbortSignal.timeout(8000),
+    });
+    console.log(`[real] cancel orderId=${orderId} HTTP ${res.status}`);
+  } catch (e) { console.error('[real] cancel error:', e.message); }
+}
+
+/** Fetch real USDC balance from the CLOB API. */
+async function fetchRealBalance() {
+  if (!polyWallet || !polyApiCreds) return null;
+  try {
+    const reqPath = '/balance-allowance?asset_type=USDC';
+    const hdrs    = l2Headers('GET', reqPath);
+    const res     = await fetch(`${POLY_CLOB}${reqPath}`, {
+      method: 'GET', headers: hdrs,
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const d = await res.json();
+    const b = parseFloat(d.balance ?? d.USDC ?? d.usdc ?? 0);
+    return isNaN(b) ? null : b;
+  } catch (_) { return null; }
+}
+
+/** Get the status of a specific order. */
+async function getClobOrderStatus(orderId) {
+  if (!polyWallet || !polyApiCreds || !orderId) return null;
+  try {
+    const reqPath = `/order/${orderId}`;
+    const hdrs    = l2Headers('GET', reqPath);
+    const res     = await fetch(`${POLY_CLOB}${reqPath}`, {
+      method: 'GET', headers: hdrs,
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    return res.json();
+  } catch (_) { return null; }
+}
+
+/**
+ * Boot: initialise wallet, derive API creds, sync real USDC balance.
+ * Must be called AFTER initStrategies() and loadState().
+ */
+async function initPolyWallet() {
+  if (!REAL_TRADING) {
+    console.log('[real] REAL_TRADING disabled — Momentum runs in simulation');
+    return;
+  }
+  if (!POLY_PK) {
+    console.warn('[real] REAL_TRADING=true but POLY_PRIVATE_KEY is not set — falling back to sim');
+    return;
+  }
+  try {
+    polyWallet   = new ethers.Wallet(POLY_PK);
+    console.log(`[real] wallet address : ${polyWallet.address}`);
+    polyApiCreds = await getOrCreateApiKey();
+    console.log(`[real] API key        : ${polyApiCreds.key}`);
+    realBalance  = await fetchRealBalance();
+    if (realBalance !== null) {
+      console.log(`[real] USDC balance   : $${realBalance.toFixed(2)}`);
+      // Sync Momentum strategy's balance with the actual wallet balance
+      const mom = STRATEGIES.momentum;
+      if (mom && realBalance > 0) {
+        mom.balance     = realBalance;
+        mom.peakBalance = Math.max(mom.peakBalance || 0, realBalance);
+        saveState();
+      }
+    } else {
+      console.warn('[real] could not fetch USDC balance — check API creds');
+    }
+  } catch (e) {
+    console.error('[real] init failed:', e.message);
+    polyWallet   = null;   // stay in sim if anything goes wrong
+    polyApiCreds = null;
+  }
+}
+
+// Periodically refresh real balance (every 30 s) and keep Momentum in sync
+setInterval(async () => {
+  if (!REAL_TRADING || !polyWallet || !polyApiCreds) return;
+  const b = await fetchRealBalance();
+  if (b !== null) {
+    realBalance = b;
+    const mom = STRATEGIES.momentum;
+    // Only overwrite balance when no position is open
+    if (mom && !mom.open && !mom.pendingReal) {
+      mom.balance = b;
+    }
+  }
+}, 30_000);
+
 // ─── STRATEGIES ──────────────────────────────────────────────────────────────
 function sizingByKelly(balance, prob, price, kellyFrac, maxFrac) {
   if (prob <= price) return 0;
@@ -546,12 +841,13 @@ function initStrategies() {
   for (const def of STRAT_DEFINITIONS) {
     STRATEGIES[def.id] = {
       def,
-      enabled:     false,
-      balance:     1000,
-      peakBalance: 1000,
-      open:        null,
-      log:         [],
-      params:      { ...def.defaults },
+      enabled:      false,
+      balance:      1000,
+      peakBalance:  1000,
+      open:         null,
+      log:          [],
+      params:       { ...def.defaults },
+      pendingReal:  false,   // true while a real BUY order is in-flight
     };
   }
 }
@@ -574,58 +870,147 @@ function getStratContext() {
 
 function stratOpen(s, ctx, entry) {
   const sizeUSDC = sizingByKelly(s.balance, entry.ourProb, entry.polyPrice, s.params.kellyFrac, s.params.maxFrac);
-  if (sizeUSDC < 1)                       return;
-  if (sizeUSDC > s.balance * 0.95)        return;
+  if (sizeUSDC < 1)                return;
+  if (sizeUSDC > s.balance * 0.95) return;
+
+  const isRealOrder = REAL_TRADING && s.def.id === 'momentum' && !!polyWallet && !!polyApiCreds;
+  const tokenId     = entry.side === 'UP' ? poly.market?.tokenIdUp : poly.market?.tokenIdDown;
+
+  // For real orders: block re-entry while async BUY is in-flight
+  if (isRealOrder && !tokenId) {
+    console.warn('[real] missing tokenId — skipping real entry');
+    return;
+  }
+
   const openingBTC = ctx.openingBTC || ctx.curBTC;
   s.open = {
-    side:              entry.side,
-    entryTime:         Date.now(),
-    btcAtEntry:        openingBTC,
+    side:               entry.side,
+    entryTime:          Date.now(),
+    btcAtEntry:         openingBTC,
     btcAtEntryCoinbase: ctx.curBTC,
-    polyEntryPrice:    entry.polyPrice,
+    polyEntryPrice:     entry.polyPrice,
     sizeUSDC,
-    edge:              entry.edge,
-    expiryTime:        ctx.win.endTs,
-    marketSlug:        poly.market ? poly.market.eventSlug : 'manual',
-    ourProb:           entry.ourProb,
-    openingSource:     ctx.openingSource,
-    entryInfo:         entry.info,
+    edge:               entry.edge,
+    expiryTime:         ctx.win.endTs,
+    marketSlug:         poly.market ? poly.market.eventSlug : 'manual',
+    ourProb:            entry.ourProb,
+    openingSource:      ctx.openingSource,
+    entryInfo:          entry.info,
+    // Real-trading fields
+    tokenId:            tokenId || null,
+    isReal:             isRealOrder,
+    realOrderId:        null,
+    realOrderStatus:    isRealOrder ? 'pending' : 'sim',
   };
-  s.balance -= sizeUSDC;
+  s.balance    -= sizeUSDC;
+  s.pendingReal = isRealOrder;   // prevent double-entry while order is in-flight
   saveState();
-  console.log(`[${s.def.id}] OPEN ${entry.side} @ ${entry.polyPrice.toFixed(3)} size=$${sizeUSDC.toFixed(2)} | ${entry.info}`);
+  console.log(`[${s.def.id}] ${isRealOrder ? 'REAL' : 'SIM'} OPEN ${entry.side} @ ${entry.polyPrice.toFixed(3)} size=$${sizeUSDC.toFixed(2)} | ${entry.info}`);
+
+  // ── Place real BUY order on Polymarket CLOB (async, Momentum only) ──────────
+  if (isRealOrder) {
+    placeClobOrder({ tokenId, side: 'BUY', size: sizeUSDC, price: entry.polyPrice })
+      .then(result => {
+        s.pendingReal = false;
+        if (s.open) {
+          s.open.realOrderId     = result.orderID;
+          s.open.realOrderStatus = result.status || 'placed';
+          saveState();
+          console.log(`[real] BUY placed orderId=${result.orderID} status=${result.status}`);
+        }
+      })
+      .catch(err => {
+        console.error('[real] BUY order FAILED:', err.message);
+        // Rollback: refund balance and clear the position
+        if (s.open) {
+          s.balance    += s.open.sizeUSDC;
+          s.open        = null;
+          s.pendingReal = false;
+          saveState();
+          console.warn('[real] position rolled back due to order failure');
+        }
+      });
+  }
 }
 
 function stratClose(s, ctx, reason, exitPolyPrice) {
-  const o = s.open;
+  const o      = s.open;
   const shares = o.sizeUSDC / o.polyEntryPrice;
   let proceeds, won;
+
   if (reason === 'SETTLE') {
     const settleBTC = ctx.curBTC;
-    won      = o.side === 'UP' ? settleBTC > o.btcAtEntry : settleBTC < o.btcAtEntry;
-    proceeds = won ? shares * 1.0 : 0;
+    won           = o.side === 'UP' ? settleBTC > o.btcAtEntry : settleBTC < o.btcAtEntry;
+    proceeds      = won ? shares * 1.0 : 0;
     exitPolyPrice = won ? 1.0 : 0.0;
   } else {
     proceeds = shares * exitPolyPrice;
     won      = proceeds > o.sizeUSDC;
   }
-  const pnl = proceeds - o.sizeUSDC;
+
+  const pnl   = proceeds - o.sizeUSDC;
   const entry = { ...o, closeTime: Date.now(), reason, proceeds, pnl, won, btcAtClose: ctx.curBTC, polyExitPrice: exitPolyPrice, strategy: s.def.id };
-  s.balance     += proceeds;
-  s.peakBalance  = Math.max(s.peakBalance, s.balance);
+  s.balance    += proceeds;
+  s.peakBalance = Math.max(s.peakBalance, s.balance);
   s.log.push(entry);
   if (s.log.length > 500) s.log.shift();
   s.open = null;
   saveState();
-  console.log(`[${s.def.id}] CLOSE ${o.side} reason=${reason} pnl=${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
+  console.log(`[${s.def.id}] ${o.isReal ? 'REAL' : 'SIM'} CLOSE ${o.side} reason=${reason} pnl=${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
+
+  // ── Place real SELL order (or wait for on-chain settlement) ─────────────────
+  if (o.isReal) {
+    if (reason === 'SETTLE') {
+      // Polymarket auto-redeems winning tokens ~1 min after window close.
+      // We just sync the real balance after the grace period.
+      setTimeout(async () => {
+        const b = await fetchRealBalance();
+        if (b !== null) {
+          realBalance = b;
+          const mom = STRATEGIES.momentum;
+          if (mom && !mom.open) {
+            mom.balance = b;
+            saveState();
+            console.log(`[real] post-settle balance: $${b.toFixed(2)}`);
+          }
+        }
+      }, 90_000); // 90 s after window close
+    } else if (o.tokenId && o.realOrderId && exitPolyPrice > 0.01) {
+      // Early exit (TP / SL / FLIP / ADVERSE): sell shares back on CLOB.
+      // Discount 0.5 % to increase fill probability.
+      const sellPrice = Math.max(0.01, parseFloat((exitPolyPrice * 0.995).toFixed(4)));
+      placeClobOrder({ tokenId: o.tokenId, side: 'SELL', size: shares, price: sellPrice })
+        .then(result => {
+          console.log(`[real] SELL placed orderId=${result.orderID} reason=${reason} price=${sellPrice}`);
+          // Refresh balance after sell fills (optimistic 10 s delay)
+          setTimeout(async () => {
+            const b = await fetchRealBalance();
+            if (b !== null) {
+              realBalance = b;
+              const mom = STRATEGIES.momentum;
+              if (mom && !mom.open) { mom.balance = b; saveState(); }
+            }
+          }, 10_000);
+        })
+        .catch(err => {
+          console.error(`[real] SELL order FAILED (${reason}):`, err.message);
+          // Position will auto-settle at expiry — no further action needed.
+        });
+    } else if (o.tokenId && !o.realOrderId) {
+      // BUY order was still pending when we decided to close — cancel it.
+      console.warn('[real] closing before BUY order confirmed — attempting cancel');
+      if (o.realOrderId) cancelClobOrder(o.realOrderId);
+    }
+  }
 }
 
 function processStrategies() {
   const ctx = getStratContext();
   for (const id in STRATEGIES) {
     const s = STRATEGIES[id];
-    if (!s.enabled) continue;
-    if (ticks.length < 60) continue;
+    if (!s.enabled)           continue;
+    if (ticks.length < 60)    continue;
+    if (s.pendingReal)        continue;   // real BUY in-flight, skip tick
 
     if (s.open) {
       if (Date.now() >= s.open.expiryTime) {
@@ -763,6 +1148,7 @@ function buildSnapshot() {
       wins,
       dd,
       open:     s.open,
+      pendingReal: s.pendingReal,
       lastTrades: log.slice(-5).reverse(),
     };
   }
@@ -791,6 +1177,12 @@ function buildSnapshot() {
     win: { endTs: win.endTs, msLeft: Math.max(0, win.endTs - Date.now()) },
     signals: { scalp: sigS, poly: sigP, main: sigM },
     strats,
+    realTrading: {
+      enabled:  REAL_TRADING,
+      ready:    !!(polyWallet && polyApiCreds),
+      wallet:   polyWallet?.address ?? null,
+      balance:  realBalance,
+    },
   };
 }
 
@@ -835,7 +1227,7 @@ app.post('/api/strategy/:id/reset', (req, res) => {
 
 // API: export CSV
 app.get('/api/export/csv', (_, res) => {
-  const rows = [['strategy','time_open','time_close','side','market','poly_entry','poly_exit','btc_open','btc_close','size','pnl','edge','reason','won','entry_info']];
+  const rows = [['strategy','time_open','time_close','side','market','poly_entry','poly_exit','btc_open','btc_close','size','pnl','edge','reason','won','entry_info','real_order_id']];
   for (const id in STRATEGIES) {
     for (const t of STRATEGIES[id].log) {
       rows.push([
@@ -850,6 +1242,7 @@ app.get('/api/export/csv', (_, res) => {
         (t.edge * 100).toFixed(2),
         t.reason, t.won ? 1 : 0,
         (t.entryInfo || '').replace(/,/g, ';'),
+        t.realOrderId || '',
       ]);
     }
   }
@@ -857,10 +1250,50 @@ app.get('/api/export/csv', (_, res) => {
   res.send(rows.map(r => r.join(',')).join('\n'));
 });
 
+// ─── REAL TRADING API ENDPOINTS ───────────────────────────────────────────────
+
+// GET /api/real/status — wallet address, readiness, live USDC balance
+app.get('/api/real/status', async (_, res) => {
+  const balance = polyWallet && polyApiCreds ? await fetchRealBalance() : null;
+  if (balance !== null) realBalance = balance;
+  res.json({
+    enabled:     REAL_TRADING,
+    ready:       !!(polyWallet && polyApiCreds),
+    wallet:      polyWallet?.address ?? null,
+    balance,
+    strategies:  Object.keys(STRATEGIES).filter(id => id === 'momentum').map(id => ({
+      id,
+      realEnabled: REAL_TRADING && id === 'momentum',
+      open:        STRATEGIES[id].open,
+    })),
+  });
+});
+
+// POST /api/real/cancel — cancel the open real order for Momentum (emergency stop)
+app.post('/api/real/cancel', async (_, res) => {
+  const mom = STRATEGIES.momentum;
+  if (!mom || !mom.open?.realOrderId) return res.json({ ok: false, reason: 'no open real order' });
+  await cancelClobOrder(mom.open.realOrderId);
+  res.json({ ok: true, cancelledOrderId: mom.open.realOrderId });
+});
+
+// POST /api/real/close-now — immediately close real position at current mid price
+app.post('/api/real/close-now', async (_, res) => {
+  const mom = STRATEGIES.momentum;
+  if (!mom || !mom.open) return res.status(400).json({ error: 'no open position' });
+  const ctx      = getStratContext();
+  const midPrice = mom.open.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+  if (!midPrice)  return res.status(400).json({ error: 'no poly price available' });
+  stratClose(mom, ctx, 'MANUAL', midPrice);
+  res.json({ ok: true, exitPrice: midPrice });
+});
+
 // ─── BOOT ────────────────────────────────────────────────────────────────────
 initStrategies();
 loadState();
 connectCoinbase();
+// Real trading: init wallet AFTER strategies are loaded
+initPolyWallet().catch(e => console.error('[real] boot error:', e.message));
 
 // Book snapshot for OFI every 500ms
 setInterval(() => {
