@@ -599,21 +599,38 @@ async function getOrCreateApiKey() {
 
   // Try fetching existing keys first (GET)
   try {
+    console.log('[real] GET /auth/api-key ...');
     const hdrs = await l1Headers('GET', '/auth/api-key');
+    console.log('[real] L1 headers built, POLY_ADDRESS=', hdrs['POLY_ADDRESS']);
     const r    = await fetch(`${POLY_CLOB}/auth/api-key`, { method: 'GET', headers: hdrs, signal: AbortSignal.timeout(10000) });
+    console.log('[real] GET /auth/api-key HTTP', r.status);
     if (r.ok) {
       const body = await r.json();
       const keys = Array.isArray(body) ? body : (body.apiKeys || [body]);
+      console.log('[real] existing keys found:', keys.length);
       if (keys.length > 0 && keys[0].key) return { ...keys[0], address: POLY_FUNDER || polyWallet.address };
+    } else {
+      const txt = await r.text().catch(() => '');
+      console.warn('[real] GET /auth/api-key failed:', r.status, txt.slice(0, 200));
     }
-  } catch (_) { /* fall through to creation */ }
+  } catch (e) {
+    console.warn('[real] GET /auth/api-key exception:', e.message);
+  }
 
   // Create a fresh key pair (POST)
-  const hdrs = await l1Headers('POST', '/auth/api-key');
-  const r2   = await fetch(`${POLY_CLOB}/auth/api-key`, { method: 'POST', headers: hdrs, signal: AbortSignal.timeout(10000) });
-  if (!r2.ok) throw new Error(`create api-key failed: HTTP ${r2.status} — ${await r2.text()}`);
-  const creds = await r2.json();
-  return { ...creds, address: POLY_FUNDER || polyWallet.address };
+  console.log('[real] POST /auth/api-key (creating new key)...');
+  try {
+    const hdrs = await l1Headers('POST', '/auth/api-key');
+    const r2   = await fetch(`${POLY_CLOB}/auth/api-key`, { method: 'POST', headers: hdrs, signal: AbortSignal.timeout(10000) });
+    const txt2 = await r2.text();
+    console.log('[real] POST /auth/api-key HTTP', r2.status, txt2.slice(0, 300));
+    if (!r2.ok) throw new Error(`create api-key failed: HTTP ${r2.status} — ${txt2}`);
+    const creds = JSON.parse(txt2);
+    return { ...creds, address: POLY_FUNDER || polyWallet.address };
+  } catch (e) {
+    console.error('[real] POST /auth/api-key exception:', e.message);
+    throw e;
+  }
 }
 
 /**
