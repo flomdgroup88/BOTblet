@@ -551,7 +551,7 @@ async function l1Headers(method, reqPath, body = '') {
   const sig = await polyWallet.signMessage(ts + method + reqPath + body);
   return {
     'Content-Type':   'application/json',
-    'POLY_ADDRESS':   POLY_FUNDER || polyWallet.address,  // аккаунт Polymarket (фандер/прокси для Safe, EOA для прямого входа)
+    'POLY_ADDRESS':   polyWallet.address,  // L1: всегда EOA — Polymarket проверяет что sig = recover(POLY_ADDRESS)
     'POLY_SIGNATURE': sig,
     'POLY_TIMESTAMP': ts,
     'POLY_NONCE':     '0',
