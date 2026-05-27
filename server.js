@@ -888,10 +888,9 @@ let _balanceFail401Count = 0;
 async function fetchRealBalance() {
   if (!polyWallet || !polyApiCreds) return null;
   try {
-    // API ключ создан для EOA (polyWallet.address) через L1 auth с EOA подписью.
-    // CLOB требует: owner в запросе = владелец ключа (POLY_ADDRESS в L2).
-    // Поэтому всегда запрашиваем баланс EOA.
-    const owner   = polyWallet.address;
+    // Деньги лежат на прокси-контракте (POLY_FUNDER), а не на EOA.
+    // Если POLY_FUNDER_ADDRESS задан — запрашиваем баланс прокси.
+    const owner   = POLY_FUNDER || polyWallet.address;
     const reqPath = `/balance-allowance?asset_type=USDC&owner=${owner}`;
     const hdrs    = l2Headers('GET', reqPath);
     const res     = await fetch(`${POLY_CLOB}${reqPath}`, {
