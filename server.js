@@ -32,8 +32,15 @@ const REAL_TRADING  = ['true','1','yes'].includes((process.env.REAL_TRADING || '
 const POLY_PK       = process.env.POLY_PRIVATE_KEY || '';
 const POLY_FUNDER   = process.env.POLY_FUNDER_ADDRESS || '';
 // Polymarket CTF Exchange contract on Polygon mainnet (settles all prediction markets)
-const CTF_EXCHANGE  = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
+// ✅ FIX: updated to current contract address (was: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E)
+const CTF_EXCHANGE  = '0xE111180000d2663C0091e4f400237545B87B996B';
 const POLY_CHAIN_ID = 137;
+// Signature type — set via SIGNATURE_TYPE env var:
+//   0 = EOA (plain MetaMask, no proxy)
+//   1 = POLY_PROXY (MetaMask + Polymarket proxy wallet created via website)
+//   2 = GNOSIS_SAFE (existing Gnosis Safe users)
+//   3 = POLY_1271  (new deposit wallet, recommended for fresh API setups)
+const SIG_TYPE      = parseInt(process.env.SIGNATURE_TYPE || '0', 10);
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
 let ticks        = [];   // { time, price, qty, isBuyerMaker }
@@ -709,15 +716,14 @@ async function getOrCreateApiKey() {
     };
   }
 
-  // Try fetching existing keys first (GET)
-  // NOTE: some Polymarket CLOB instances return 405 for GET /auth/api-key.
-  // We still attempt it, but treat 405 as "just skip to POST".
+  // ✅ FIX: use /auth/derive-api-key (correct derive endpoint per docs)
+  // /auth/api-key GET is not the documented derive endpoint — that's /auth/derive-api-key
   try {
-    console.log('[real] GET /auth/api-key ...');
-    const hdrs = await l1Headers('GET', '/auth/api-key');
+    console.log('[real] GET /auth/derive-api-key ...');
+    const hdrs = await l1Headers('GET', '/auth/derive-api-key');
     console.log('[real] L1 headers built, POLY_ADDRESS=', hdrs['POLY_ADDRESS']);
-    const r    = await fetch(`${POLY_CLOB}/auth/api-key`, { method: 'GET', headers: hdrs, signal: AbortSignal.timeout(10000) });
-    console.log('[real] GET /auth/api-key HTTP', r.status);
+    const r    = await fetch(`${POLY_CLOB}/auth/derive-api-key`, { method: 'GET', headers: hdrs, signal: AbortSignal.timeout(10000) });
+    console.log('[real] GET /auth/derive-api-key HTTP', r.status);
     if (r.ok) {
       const body = await r.json();
       const keys = Array.isArray(body) ? body : (body.apiKeys || [body]);
@@ -738,7 +744,7 @@ async function getOrCreateApiKey() {
         console.warn('[real] GET returned key but fields missing:', JSON.stringify(k).slice(0, 200));
       }
     } else if (r.status === 405) {
-      console.log('[real] GET /auth/api-key → 405 (not supported), skipping to POST');
+      console.log('[real] GET /auth/derive-api-key → 405 (not supported), skipping to POST');
     } else {
       const txt = await r.text().catch(() => '');
       console.warn('[real] GET /auth/api-key failed:', r.status, txt.slice(0, 200));
@@ -821,7 +827,9 @@ async function buildSignedOrder(tokenId, side, size, price) {
     nonce:         0n,
     feeRateBps:    0n,
     side:          isBuy ? 0 : 1,
-    signatureType: POLY_FUNDER ? 2 : 0,  // 2 = Gnosis Safe proxy, 0 = plain EOA
+    // ✅ FIX: use SIG_TYPE from env instead of hardcoded POLY_FUNDER ? 2 : 0
+    // (was wrong: type 2 = Gnosis Safe, but MetaMask+proxy needs 1, deposit wallet needs 3)
+    signatureType: SIG_TYPE,
   };
 
   const signature = await polyWallet.signTypedData(ORDER_DOMAIN, ORDER_TYPES, orderStruct);
@@ -838,7 +846,8 @@ async function buildSignedOrder(tokenId, side, size, price) {
     nonce:         '0',
     feeRateBps:    '0',
     side,
-    signatureType: POLY_FUNDER ? 2 : 0,  // 2 = Gnosis Safe proxy (Polymarket browser-wallet flow), 0 = plain EOA
+    // ✅ FIX: use SIG_TYPE from env (same as orderStruct above)
+    signatureType: SIG_TYPE,
     signature,
   };
 }
