@@ -686,6 +686,8 @@ async function getOrCreateApiKey() {
   }
 
   // Try fetching existing keys first (GET)
+  // NOTE: some Polymarket CLOB instances return 405 for GET /auth/api-key.
+  // We still attempt it, but treat 405 as "just skip to POST".
   try {
     console.log('[real] GET /auth/api-key ...');
     const hdrs = await l1Headers('GET', '/auth/api-key');
@@ -697,6 +699,8 @@ async function getOrCreateApiKey() {
       const keys = Array.isArray(body) ? body : (body.apiKeys || [body]);
       console.log('[real] existing keys found:', keys.length);
       if (keys.length > 0 && keys[0].key) return { ...keys[0], address: polyWallet.address };
+    } else if (r.status === 405) {
+      console.log('[real] GET /auth/api-key → 405 (not supported), skipping to POST');
     } else {
       const txt = await r.text().catch(() => '');
       console.warn('[real] GET /auth/api-key failed:', r.status, txt.slice(0, 200));
@@ -712,7 +716,19 @@ async function getOrCreateApiKey() {
     const r2   = await fetch(`${POLY_CLOB}/auth/api-key`, { method: 'POST', headers: hdrs, signal: AbortSignal.timeout(10000) });
     const txt2 = await r2.text();
     console.log('[real] POST /auth/api-key HTTP', r2.status, txt2.slice(0, 300));
-    if (!r2.ok) throw new Error(`create api-key failed: HTTP ${r2.status} — ${txt2}`);
+    if (!r2.ok) {
+      if (r2.status === 400) {
+        // Wallet not registered on Polymarket. Fix: go to app.polymarket.com,
+        // connect this wallet, open Settings → API Keys → Create, then set
+        // POLY_API_KEY / POLY_API_SECRET / POLY_PASSPHRASE in Railway env vars.
+        throw new Error(
+          `Wallet ${polyWallet.address} is not registered on Polymarket (HTTP 400). ` +
+          'Fix: go to app.polymarket.com → Settings → API Keys → Create, ' +
+          'then add POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE to Railway env vars.'
+        );
+      }
+      throw new Error(`create api-key failed: HTTP ${r2.status} — ${txt2}`);
+    }
     const creds = JSON.parse(txt2);
     return { ...creds, address: polyWallet.address };
   } catch (e) {
