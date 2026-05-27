@@ -622,25 +622,24 @@ const CLOB_AUTH_TYPES = {
 async function l1Headers(method, reqPath, body = '') {
   const ts         = String(Math.floor(Date.now() / 1000));
   const nonce      = 0;
-  // Для Safe/Gnosis (POLY_FUNDER задан): address в EIP-712 = FUNDER, подписывает EOA.
-  // Это создаёт API-ключ, принадлежащий FUNDER (где лежат USDC).
-  // Для чистого EOA (POLY_FUNDER не задан): address = EOA.
-  const accountAddress = POLY_FUNDER || polyWallet.address;
+  // L1 auth: POLY_ADDRESS = EOA (адрес, который реально подписывает).
+  // Polymarket делает ecrecover(signature) и сравнивает с POLY_ADDRESS —
+  // если передать FUNDER вместо EOA, получим 401 "Invalid L1 Request headers".
+  const eoaAddress = polyWallet.address;
 
   const sig = await polyWallet.signTypedData(
     CLOB_AUTH_DOMAIN,
     CLOB_AUTH_TYPES,
     {
-      address:   accountAddress,
+      address:   eoaAddress,
       timestamp: ts,
       nonce,
       message:   'This message attests that I control the given wallet',
     }
   );
-  console.log(`[real] L1 POLY_ADDRESS: ${accountAddress}`);
   return {
     'Content-Type':   'application/json',
-    'POLY_ADDRESS':   accountAddress,
+    'POLY_ADDRESS':   eoaAddress,
     'POLY_SIGNATURE': sig,
     'POLY_TIMESTAMP': ts,
     'POLY_NONCE':     String(nonce),
@@ -675,10 +674,13 @@ function l2Headers(method, reqPath, body = '') {
   if (explicitOwner) {
     // Явный override — самый высокий приоритет
     accountAddress = explicitOwner;
+  } else if (process.env.POLY_API_KEY) {
+    // Ключ задан вручную (создан через py-clob-client с EOA приватным ключом).
+    // Ключ принадлежит EOA → POLY_ADDRESS = EOA.
+    accountAddress = polyWallet.address;
   } else {
-    // L1 auth теперь всегда создаёт ключ для FUNDER (если задан) или EOA.
-    // L2 должен использовать тот же адрес — владельца ключа.
-    accountAddress = POLY_FUNDER || polyWallet.address;
+    // Автодеривация: L1 создаёт ключ под EOA → L2 тоже EOA.
+    accountAddress = polyWallet.address;
   }
 
   return {
@@ -886,8 +888,10 @@ let _balanceFail401Count = 0;
 async function fetchRealBalance() {
   if (!polyWallet || !polyApiCreds) return null;
   try {
-    // If POLY_FUNDER is set, the USDC lives there (Safe/proxy); otherwise it's in the EOA.
-    const owner   = POLY_FUNDER || polyWallet.address;
+    // API ключ создан для EOA (polyWallet.address) через L1 auth с EOA подписью.
+    // CLOB требует: owner в запросе = владелец ключа (POLY_ADDRESS в L2).
+    // Поэтому всегда запрашиваем баланс EOA.
+    const owner   = polyWallet.address;
     const reqPath = `/balance-allowance?asset_type=USDC&owner=${owner}`;
     const hdrs    = l2Headers('GET', reqPath);
     const res     = await fetch(`${POLY_CLOB}${reqPath}`, {
