@@ -653,11 +653,16 @@ async function l1Headers(method, reqPath, body = '') {
 function l2Headers(method, reqPath, body = '') {
   const ts        = String(Math.floor(Date.now() / 1000));
   const msg       = ts + method + reqPath + (body || '');
-  // Polymarket отдаёт secret в URL-safe base64 (символы - и _).
-  // Buffer.from(..., 'base64') их не понимает → неверный HMAC → 401 на всех запросах.
+  // ── СЕКРЕТ: Polymarket отдаёт secret в URL-safe base64 (символы - и _).
+  //    Buffer.from(..., 'base64') их не понимает → нужен пре-replace.
   const secret64  = polyApiCreds.secret.replace(/-/g, '+').replace(/_/g, '/');
   const secretBuf = Buffer.from(secret64, 'base64');
-  const sig       = crypto.createHmac('sha256', secretBuf).update(msg).digest('base64');
+  // ── ПОДПИСЬ: ОБЯЗАТЕЛЬНО URL-safe base64 на выходе.
+  //    Официальный clob-client (TS) и py-clob-client делают именно так:
+  //    digest base64 → replace('+', '-') → replace('/', '_').  '=' остаётся.
+  //    Без этого сервер вернёт 401 "Invalid api key" на КАЖДОМ L2-запросе.
+  const sig       = crypto.createHmac('sha256', secretBuf).update(msg).digest('base64')
+                      .replace(/\+/g, '-').replace(/\//g, '_');
 
   // ⚠️ POLY_ADDRESS = адрес, который СОЗДАЛ API ключ.
   //
@@ -1598,6 +1603,81 @@ app.post('/api/real/close-now', async (_, res) => {
   res.json({ ok: true, exitPrice: midPrice });
 });
 
+// GET /api/real/diagnose — detailed CLOB connectivity check
+// Open this in your browser after deploy to see what's actually happening
+app.get('/api/real/diagnose', async (_, res) => {
+  const report = {
+    timestamp:    new Date().toISOString(),
+    env: {
+      REAL_TRADING:      REAL_TRADING,
+      POLY_PRIVATE_KEY:  POLY_PK ? `set (${POLY_PK.length} chars)` : 'NOT SET',
+      POLY_FUNDER:       POLY_FUNDER || 'not set',
+      POLY_API_KEY:      process.env.POLY_API_KEY ? `${process.env.POLY_API_KEY.slice(0,8)}...` : 'not set',
+      POLY_API_SECRET:   process.env.POLY_API_SECRET ? `set (${process.env.POLY_API_SECRET.length} chars)` : 'not set',
+      POLY_PASSPHRASE:   process.env.POLY_PASSPHRASE ? `set (${process.env.POLY_PASSPHRASE.length} chars)` : 'not set',
+      POLY_API_OWNER:    process.env.POLY_API_OWNER || 'not set',
+    },
+    wallet:       polyWallet ? polyWallet.address : null,
+    walletReady:  !!(polyWallet && polyApiCreds),
+    apiKey:       polyApiCreds ? polyApiCreds.key : null,
+    tests: {},
+  };
+
+  if (!polyWallet || !polyApiCreds) {
+    report.error = 'wallet/creds not initialized — check Railway env vars';
+    return res.json(report);
+  }
+
+  // Test 1: GET /balance-allowance (L2 HMAC)
+  try {
+    const owner   = POLY_FUNDER || polyWallet.address;
+    const reqPath = `/balance-allowance?asset_type=USDC&owner=${owner}`;
+    const hdrs    = l2Headers('GET', reqPath);
+    const t0      = Date.now();
+    const r       = await fetch(`${POLY_CLOB}${reqPath}`, { method: 'GET', headers: hdrs, signal: AbortSignal.timeout(8000) });
+    const txt     = await r.text();
+    let parsed;
+    try { parsed = JSON.parse(txt); } catch { parsed = txt; }
+    report.tests.balanceAllowance = {
+      url:          `${POLY_CLOB}${reqPath}`,
+      status:       r.status,
+      ok:           r.ok,
+      ms:           Date.now() - t0,
+      response:     parsed,
+      sentHeaders:  {
+        POLY_ADDRESS:    hdrs.POLY_ADDRESS,
+        POLY_API_KEY:    hdrs.POLY_API_KEY,
+        POLY_TIMESTAMP:  hdrs.POLY_TIMESTAMP,
+        POLY_SIGNATURE:  hdrs.POLY_SIGNATURE.slice(0, 16) + '...' + hdrs.POLY_SIGNATURE.slice(-4),
+        sigContainsPlus: hdrs.POLY_SIGNATURE.includes('+'),
+        sigContainsSlash: hdrs.POLY_SIGNATURE.includes('/'),
+        sigContainsDash: hdrs.POLY_SIGNATURE.includes('-'),
+        sigContainsUnderscore: hdrs.POLY_SIGNATURE.includes('_'),
+      },
+    };
+  } catch (e) {
+    report.tests.balanceAllowance = { error: e.message };
+  }
+
+  // Test 2: parse the funder USDC on-chain (no API needed)
+  if (POLY_FUNDER) {
+    try {
+      const provider = getRpcProvider(POLYGON_RPCS[0]);
+      const USDC     = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+      const erc20    = new ethers.Contract(USDC, ['function balanceOf(address) view returns (uint256)'], provider);
+      const raw      = await erc20.balanceOf(POLY_FUNDER);
+      report.tests.onChainBalance = {
+        funder:  POLY_FUNDER,
+        usdc:    Number(raw) / 1e6,
+      };
+    } catch (e) {
+      report.tests.onChainBalance = { error: e.message };
+    }
+  }
+
+  res.json(report);
+});
+
 // ─── BOOT ────────────────────────────────────────────────────────────────────
 initStrategies();
 loadState();
@@ -1624,4 +1704,7 @@ setInterval(() => { if (sseClients.size > 0) broadcast(buildSnapshot()); }, 1000
 // Auto-save every 60s
 setInterval(saveState, 60000);
 
-app.listen(PORT, () => console.log(`[server] running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`[server] running on port ${PORT}`);
+  console.log(`[server] HMAC sig encoding: URL-safe base64 (+→-, /→_) ✓ POLYMARKET_FIX_APPLIED`);
+});
