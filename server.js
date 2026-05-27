@@ -551,7 +551,7 @@ async function l1Headers(method, reqPath, body = '') {
   const sig = await polyWallet.signMessage(ts + method + reqPath + body);
   return {
     'Content-Type':   'application/json',
-    'POLY_ADDRESS':   POLY_FUNDER || polyWallet.address,  // аккаунт на полимаркете (фандер/прокси)
+    'POLY_ADDRESS':   polyWallet.address,  // всегда EOA-подписант
     'POLY_SIGNATURE': sig,
     'POLY_TIMESTAMP': ts,
     'POLY_NONCE':     '0',
@@ -565,11 +565,14 @@ async function l1Headers(method, reqPath, body = '') {
 function l2Headers(method, reqPath, body = '') {
   const ts        = String(Math.floor(Date.now() / 1000));
   const msg       = ts + method + reqPath + (body || '');
-  const secretBuf = Buffer.from(polyApiCreds.secret, 'base64');
+  // Polymarket отдаёт secret в URL-safe base64 (символы - и _).
+  // Buffer.from(..., 'base64') их не понимает → неверный HMAC → 401 на всех запросах.
+  const secret64  = polyApiCreds.secret.replace(/-/g, '+').replace(/_/g, '/');
+  const secretBuf = Buffer.from(secret64, 'base64');
   const sig       = crypto.createHmac('sha256', secretBuf).update(msg).digest('base64');
   return {
     'Content-Type':    'application/json',
-    'POLY_ADDRESS':    POLY_FUNDER || polyApiCreds.address,  // аккаунт на полимаркете (фандер/прокси)
+    'POLY_ADDRESS':    polyWallet.address,  // всегда EOA-подписант
     'POLY_SIGNATURE':  sig,
     'POLY_TIMESTAMP':  ts,
     'POLY_NONCE':      '0',
