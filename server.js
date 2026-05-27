@@ -28,7 +28,7 @@ const CHAINLINK_ABI    = ['function latestAnswer() view returns (int256)'];
 // ─── REAL TRADING CONFIG ──────────────────────────────────────────────────────
 // To enable: set REAL_TRADING=true and POLY_PRIVATE_KEY=0x... in Railway env vars
 // Optionally set POLY_API_KEY + POLY_API_SECRET + POLY_PASSPHRASE to skip key derivation
-const REAL_TRADING  = process.env.REAL_TRADING === 'true';
+const REAL_TRADING  = ['true','1','yes'].includes((process.env.REAL_TRADING || '').toLowerCase().trim());
 const POLY_PK       = process.env.POLY_PRIVATE_KEY || '';
 const POLY_FUNDER   = process.env.POLY_FUNDER_ADDRESS || '';
 // Polymarket CTF Exchange contract on Polygon mainnet (settles all prediction markets)
@@ -869,7 +869,9 @@ async function initPolyWallet() {
     return;
   }
   try {
-    polyWallet   = new ethers.Wallet(POLY_PK);
+    // Validate private key format before creating wallet
+    const pkNorm = POLY_PK.startsWith('0x') ? POLY_PK : '0x' + POLY_PK;
+    polyWallet   = new ethers.Wallet(pkNorm);
     console.log(`[real] wallet address : ${polyWallet.address}`);
     if (POLY_FUNDER) console.log(`[real] funder address : ${POLY_FUNDER}`);
     polyApiCreds = await getOrCreateApiKey();
@@ -891,6 +893,24 @@ async function initPolyWallet() {
     console.error('[real] init failed:', e.message);
     polyWallet   = null;   // stay in sim if anything goes wrong
     polyApiCreds = null;
+    throw e;   // propagate so retry logic knows
+  }
+}
+
+/**
+ * Wrapper: попытка инициализации с автоматическим retry при сбое.
+ * Каждые 90 секунд повторяет, пока кошелёк не будет готов.
+ */
+async function initPolyWalletWithRetry(attempt = 1) {
+  try {
+    await initPolyWallet();
+    if (polyWallet && polyApiCreds) {
+      console.log(`[real] ✓ wallet ready on attempt ${attempt}`);
+    }
+  } catch (e) {
+    const nextDelay = Math.min(90_000, attempt * 15_000);
+    console.warn(`[real] init attempt ${attempt} failed — retry in ${nextDelay / 1000}s: ${e.message}`);
+    setTimeout(() => initPolyWalletWithRetry(attempt + 1), nextDelay);
   }
 }
 
@@ -1473,7 +1493,7 @@ initStrategies();
 loadState();
 connectCoinbase();
 // Real trading: init wallet AFTER strategies are loaded
-initPolyWallet().catch(e => console.error('[real] boot error:', e.message));
+initPolyWalletWithRetry().catch(e => console.error('[real] boot error:', e.message));
 
 // Book snapshot for OFI every 500ms
 setInterval(() => {
