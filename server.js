@@ -827,7 +827,7 @@ async function buildSignedOrder(tokenId, side, size, price) {
     nonce:         0n,
     feeRateBps:    0n,
     side:          isBuy ? 0 : 1,
-    signatureType: POLY_FUNDER ? 2 : 0,  // 2 = Gnosis Safe (when funder set), 0 = plain EOA
+    signatureType: POLY_FUNDER ? 1 : 0,  // 1 = Polymarket proxy wallet, 0 = plain EOA
   };
 
   const signature = await polyWallet.signTypedData(ORDER_DOMAIN, ORDER_TYPES, orderStruct);
@@ -844,7 +844,7 @@ async function buildSignedOrder(tokenId, side, size, price) {
     nonce:         '0',
     feeRateBps:    '0',
     side,
-    signatureType: POLY_FUNDER ? 2 : 0,
+    signatureType: POLY_FUNDER ? 1 : 0,
     signature,
   };
 }
@@ -893,9 +893,11 @@ let _balanceFail401Count = 0;
 async function fetchRealBalance() {
   if (!polyWallet || !polyApiCreds) return null;
   try {
-    // Деньги лежат на прокси-контракте (POLY_FUNDER), а не на EOA.
-    // Если POLY_FUNDER_ADDRESS задан — запрашиваем баланс прокси.
-    const owner   = POLY_FUNDER || polyWallet.address;
+    // POLY_ADDRESS (владелец API ключа) — всегда EOA (polyWallet.address),
+    // если явно не переопределён POLY_API_OWNER.
+    // POLY_FUNDER — это Polymarket proxy контракт, он НЕ является владельцем API ключа.
+    // Баланс USDC запрашиваем от имени того же адреса, что в POLY_ADDRESS L2.
+    const owner   = process.env.POLY_API_OWNER || polyWallet.address;
     const reqPath = `/balance-allowance?asset_type=USDC&owner=${owner}`;
     const hdrs    = l2Headers('GET', reqPath);
     const res     = await fetch(`${POLY_CLOB}${reqPath}`, {
@@ -975,7 +977,7 @@ async function initPolyWallet() {
     polyApiCreds = await getOrCreateApiKey();
     console.log(`[real] API key        : ${polyApiCreds.key}`);
     // Логируем какой адрес будет использован в L2 заголовках
-    const l2Addr = process.env.POLY_API_OWNER || (POLY_FUNDER || polyWallet.address);
+    const l2Addr = process.env.POLY_API_OWNER || polyWallet.address;
     console.log(`[real] L2 POLY_ADDRESS: ${l2Addr} (владелец ключа)`);
     realBalance  = await fetchRealBalance();
     if (realBalance !== null) {
@@ -1630,7 +1632,7 @@ app.get('/api/real/diagnose', async (_, res) => {
 
   // Test 1: GET /balance-allowance (L2 HMAC)
   try {
-    const owner   = POLY_FUNDER || polyWallet.address;
+    const owner   = process.env.POLY_API_OWNER || polyWallet.address; // EOA = владелец API ключа
     const reqPath = `/balance-allowance?asset_type=USDC&owner=${owner}`;
     const hdrs    = l2Headers('GET', reqPath);
     const t0      = Date.now();
