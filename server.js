@@ -658,10 +658,29 @@ function l2Headers(method, reqPath, body = '') {
   const secret64  = polyApiCreds.secret.replace(/-/g, '+').replace(/_/g, '/');
   const secretBuf = Buffer.from(secret64, 'base64');
   const sig       = crypto.createHmac('sha256', secretBuf).update(msg).digest('base64');
-  // ⚠️ L2: POLY_ADDRESS must be the account that OWNS the API key.
-  // If POLY_FUNDER is set, the API key belongs to the funder wallet — use it here.
-  // For pure EOA setups (no funder), the EOA itself owns the key.
-  const accountAddress = POLY_FUNDER || polyWallet.address;
+
+  // ⚠️ POLY_ADDRESS = адрес, который СОЗДАЛ API ключ.
+  //
+  // Два сценария:
+  // 1) POLY_API_KEY задан вручную через Railway env → ключ создан на polymarket.com
+  //    при подключённом EOA кошельке → POLY_ADDRESS = EOA.
+  //
+  // 2) Ключ автодеривован через POST /auth/api-key с L1 от имени фандера (POLY_FUNDER)
+  //    → POLY_ADDRESS = POLY_FUNDER.
+  //
+  // POLY_API_OWNER в env позволяет явно переопределить (для нестандартных сетапов).
+  const explicitOwner = process.env.POLY_API_OWNER;
+  let accountAddress;
+  if (explicitOwner) {
+    accountAddress = explicitOwner;
+  } else if (process.env.POLY_API_KEY) {
+    // Pre-configured via env → ключ принадлежит EOA (создан на polymarket.com под EOA)
+    accountAddress = polyWallet.address;
+  } else {
+    // Автодеривация → ключ создан от имени фандера (если он есть)
+    accountAddress = POLY_FUNDER || polyWallet.address;
+  }
+
   return {
     'Content-Type':    'application/json',
     'POLY_ADDRESS':    accountAddress,
@@ -947,6 +966,9 @@ async function initPolyWallet() {
     if (POLY_FUNDER) console.log(`[real] funder address : ${POLY_FUNDER}`);
     polyApiCreds = await getOrCreateApiKey();
     console.log(`[real] API key        : ${polyApiCreds.key}`);
+    // Логируем какой адрес будет использован в L2 заголовках
+    const l2Addr = process.env.POLY_API_OWNER || (process.env.POLY_API_KEY ? polyWallet.address : (POLY_FUNDER || polyWallet.address));
+    console.log(`[real] L2 POLY_ADDRESS: ${l2Addr} (владелец ключа)`);
     realBalance  = await fetchRealBalance();
     if (realBalance !== null) {
       console.log(`[real] USDC balance   : $${realBalance.toFixed(2)}`);
