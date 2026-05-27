@@ -853,7 +853,9 @@ async function placeClobOrder({ tokenId, side, size, price, orderType = 'GTC' })
   if (!tokenId)                     throw new Error('tokenId is required');
 
   const signedOrder = await buildSignedOrder(tokenId, side, size, price);
-  const body        = JSON.stringify({ order: signedOrder, owner: polyWallet.address, orderType });
+  // owner must match POLY_ADDRESS in L2 headers (proxy address if using Gnosis Safe / funder, else EOA)
+  const ownerAddr   = process.env.POLY_API_OWNER || POLY_FUNDER || polyWallet.address;
+  const body        = JSON.stringify({ order: signedOrder, owner: ownerAddr, orderType });
   const hdrs        = l2Headers('POST', '/order', body);
 
   const res  = await fetch(`${POLY_CLOB}/order`, {
@@ -872,10 +874,11 @@ async function placeClobOrder({ tokenId, side, size, price, orderType = 'GTC' })
 async function cancelClobOrder(orderId) {
   if (!polyWallet || !polyApiCreds || !orderId) return;
   try {
-    const body = JSON.stringify({ orderID: orderId });
-    const hdrs = l2Headers('DELETE', '/order', body);
-    const res  = await fetch(`${POLY_CLOB}/order`, {
-      method: 'DELETE', headers: hdrs, body,
+    // Correct endpoint: DELETE /order/{order_id} (path param, no body)
+    const reqPath = `/order/${orderId}`;
+    const hdrs    = l2Headers('DELETE', reqPath);
+    const res     = await fetch(`${POLY_CLOB}${reqPath}`, {
+      method: 'DELETE', headers: hdrs,
       signal: AbortSignal.timeout(8000),
     });
     console.log(`[real] cancel orderId=${orderId} HTTP ${res.status}`);
@@ -1012,7 +1015,23 @@ async function initPolyWalletWithRetry(attempt = 1) {
   }
 }
 
-// Periodically refresh real balance (every 30 s) and keep real accounts in sync
+// ─── CLOB HEARTBEAT ──────────────────────────────────────────────────────────
+// Polymarket auto-cancels all open orders if no heartbeat is received for ~30s.
+// We send one every 15 seconds when real trading is active and a position is open.
+setInterval(async () => {
+  if (!REAL_TRADING || !polyWallet || !polyApiCreds) return;
+  const hasOpenPosition = Object.values(STRATEGIES).some(s => s.real.open?.isReal);
+  if (!hasOpenPosition) return;
+  try {
+    const hdrs = l2Headers('POST', '/heartbeat');
+    const res  = await fetch(`${POLY_CLOB}/heartbeat`, {
+      method: 'POST', headers: hdrs,
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) console.warn('[real] heartbeat failed HTTP', res.status);
+  } catch (e) { console.warn('[real] heartbeat error:', e.message); }
+}, 15_000);
 setInterval(async () => {
   if (!REAL_TRADING || !polyWallet || !polyApiCreds) return;
   const b = await fetchRealBalance();
@@ -1238,8 +1257,17 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
           console.error(`[real] SELL order FAILED (${reason}):`, err.message);
         });
     } else if (o.tokenId && !o.realOrderId) {
-      console.warn('[real] closing before BUY order confirmed — attempting cancel');
-      if (o.realOrderId) cancelClobOrder(o.realOrderId);
+      // BUY order was placed but hasn't confirmed yet — attempt cancel by querying open orders
+      console.warn('[real] closing before BUY order confirmed — will cancel once orderId is known');
+      // Poll for orderId for up to 10s then cancel
+      const waitAndCancel = async () => {
+        for (let i = 0; i < 10; i++) {
+          await new Promise(r => setTimeout(r, 1000));
+          if (o.realOrderId) { await cancelClobOrder(o.realOrderId); return; }
+        }
+        console.warn('[real] BUY orderId never arrived — could not cancel');
+      };
+      waitAndCancel().catch(e => console.error('[real] waitAndCancel error:', e.message));
     }
   }
 }
