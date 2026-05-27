@@ -28,6 +28,7 @@ const CHAINLINK_ABI    = ['function latestAnswer() view returns (int256)'];
 // Optionally set POLY_API_KEY + POLY_API_SECRET + POLY_PASSPHRASE to skip key derivation
 const REAL_TRADING  = process.env.REAL_TRADING === 'true';
 const POLY_PK       = process.env.POLY_PRIVATE_KEY || '';
+const POLY_FUNDER   = process.env.POLY_FUNDER_ADDRESS || '';
 // Polymarket CTF Exchange contract on Polygon mainnet (settles all prediction markets)
 const CTF_EXCHANGE  = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
 const POLY_CHAIN_ID = 137;
@@ -637,8 +638,8 @@ async function buildSignedOrder(tokenId, side, size, price) {
 
   const orderStruct = {
     salt,
-    maker:         polyWallet.address,
-    signer:        polyWallet.address,
+    maker:         POLY_FUNDER || polyWallet.address,  // сейф, где лежат деньги
+    signer:        polyWallet.address,                 // EOA, которым подписываем
     taker:         '0x0000000000000000000000000000000000000000',
     tokenId:       BigInt(tokenId),
     makerAmount,
@@ -647,14 +648,14 @@ async function buildSignedOrder(tokenId, side, size, price) {
     nonce:         0n,
     feeRateBps:    0n,
     side:          isBuy ? 0 : 1,
-    signatureType: 0,  // 0 = EOA (plain wallet)
+    signatureType: 2,  // 2 = Gnosis Safe (браузер-кошелёк)
   };
 
   const signature = await polyWallet.signTypedData(ORDER_DOMAIN, ORDER_TYPES, orderStruct);
 
   return {
     salt:          salt.toString(),
-    maker:         polyWallet.address,
+    maker:         (POLY_FUNDER || polyWallet.address),  // та же замена
     signer:        polyWallet.address,
     taker:         '0x0000000000000000000000000000000000000000',
     tokenId:       tokenId.toString(),
@@ -664,7 +665,7 @@ async function buildSignedOrder(tokenId, side, size, price) {
     nonce:         '0',
     feeRateBps:    '0',
     side,
-    signatureType: 0,
+    signatureType: 2,  // было 0
     signature,
   };
 }
