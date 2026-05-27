@@ -622,24 +622,25 @@ const CLOB_AUTH_TYPES = {
 async function l1Headers(method, reqPath, body = '') {
   const ts         = String(Math.floor(Date.now() / 1000));
   const nonce      = 0;
-  // ⚠️ L1 auth MUST use the EOA address (polyWallet.address) — Polymarket does
-  // ecrecover(signature) and compares it to POLY_ADDRESS.
-  // POLY_FUNDER is only used in order signing (maker field), NOT here.
-  const eoaAddress = polyWallet.address;
+  // Для Safe/Gnosis (POLY_FUNDER задан): address в EIP-712 = FUNDER, подписывает EOA.
+  // Это создаёт API-ключ, принадлежащий FUNDER (где лежат USDC).
+  // Для чистого EOA (POLY_FUNDER не задан): address = EOA.
+  const accountAddress = POLY_FUNDER || polyWallet.address;
 
   const sig = await polyWallet.signTypedData(
     CLOB_AUTH_DOMAIN,
     CLOB_AUTH_TYPES,
     {
-      address:   eoaAddress,
+      address:   accountAddress,
       timestamp: ts,
       nonce,
       message:   'This message attests that I control the given wallet',
     }
   );
+  console.log(`[real] L1 POLY_ADDRESS: ${accountAddress}`);
   return {
     'Content-Type':   'application/json',
-    'POLY_ADDRESS':   eoaAddress,
+    'POLY_ADDRESS':   accountAddress,
     'POLY_SIGNATURE': sig,
     'POLY_TIMESTAMP': ts,
     'POLY_NONCE':     String(nonce),
@@ -674,14 +675,9 @@ function l2Headers(method, reqPath, body = '') {
   if (explicitOwner) {
     // Явный override — самый высокий приоритет
     accountAddress = explicitOwner;
-  } else if (process.env.POLY_API_KEY) {
-    // Ключ задан вручную через Railway env.
-    // Если POLY_FUNDER задан — ключ был создан на polymarket.com через Safe/Gnosis UI,
-    // значит POLY_ADDRESS должен быть FUNDER (иначе CLOB вернёт 401).
-    // Если фандера нет — ключ создан под чистым EOA.
-    accountAddress = POLY_FUNDER || polyWallet.address;
   } else {
-    // Автодеривация → ключ создан от имени фандера (если он есть)
+    // L1 auth теперь всегда создаёт ключ для FUNDER (если задан) или EOA.
+    // L2 должен использовать тот же адрес — владельца ключа.
     accountAddress = POLY_FUNDER || polyWallet.address;
   }
 
