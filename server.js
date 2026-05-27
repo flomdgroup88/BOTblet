@@ -18,8 +18,10 @@ const POLY_INTERVAL    = 'btc-updown-5m';
 const POLY_WINDOW_SEC  = 300;
 const CHAINLINK_ADDR   = '0xc907E116054Ad103354f2D350FD2514433D57F6f'; // BTC/USD Polygon
 const POLYGON_RPCS     = [
-  'https://polygon-rpc.com',
   'https://polygon-bor-rpc.publicnode.com',
+  'https://polygon.llamarpc.com',
+  'https://rpc.ankr.com/polygon',
+  'https://1rpc.io/matic',
 ];
 const CHAINLINK_ABI    = ['function latestAnswer() view returns (int256)'];
 
@@ -491,20 +493,39 @@ async function fetchPolyMarket() {
 }
 
 // ─── CHAINLINK ───────────────────────────────────────────────────────────────
+// Cache one provider per RPC so we don't re-detect network on every call.
+const _rpcProviders = new Map();
+function getRpcProvider(url) {
+  if (!_rpcProviders.has(url)) {
+    // staticNetwork skips the eth_chainId probe that causes "failed to detect network" spam
+    _rpcProviders.set(url, new ethers.JsonRpcProvider(url, 137, { staticNetwork: ethers.Network.from(137) }));
+  }
+  return _rpcProviders.get(url);
+}
+
 async function refreshChainlinkPrice() {
-  const rpc = POLYGON_RPCS[chain.lastRpcIdx % POLYGON_RPCS.length];
+  const rpc      = POLYGON_RPCS[chain.lastRpcIdx % POLYGON_RPCS.length];
   chain.lastRpcIdx++;
   try {
-    const provider  = new ethers.JsonRpcProvider(rpc);
+    const provider  = getRpcProvider(rpc);
     const contract  = new ethers.Contract(CHAINLINK_ADDR, CHAINLINK_ABI, provider);
-    const answer    = await contract.latestAnswer();
+    // Race against a 6-second timeout
+    const answer    = await Promise.race([
+      contract.latestAnswer(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 6000)),
+    ]);
     chain.currentPrice = Number(answer) / 1e8;
     chain.available    = true;
     chain.lastUpdate   = Date.now();
     chain.lastErr      = null;
   } catch (e) {
     chain.lastErr = e.message || String(e);
-    console.error('[chainlink] error:', e.message);
+    // Only log once per RPC, not every 4 seconds
+    if (chain.lastRpcIdx % POLYGON_RPCS.length === 1) {
+      console.warn('[chainlink] error (will try next RPC):', (e.message || String(e)).slice(0, 120));
+    }
+    // Evict broken provider so next call gets a fresh one
+    _rpcProviders.delete(rpc);
   }
 }
 
