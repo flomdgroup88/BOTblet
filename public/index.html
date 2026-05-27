@@ -646,7 +646,7 @@ function updateAll(d) {
   // Poly status
   $('poly-status').textContent = d.poly.status + (d.poly.lastErr ? ' (' + d.poly.lastErr + ')' : '');
 
-  // Aggregate stats — demo accounts
+  // Aggregate stats — demo accounts only
   let totalBal = 0, totalPnl = 0, totalTrades = 0, totalWins = 0, minDd = 0;
   for (const [, s] of Object.entries(d.strats)) {
     totalBal    += s.demo.balance;
@@ -669,10 +669,19 @@ function updateAll(d) {
   if (d.realTrading) {
     const rt = d.realTrading;
     if (rt.enabled && rt.ready) {
-      $('real-banner').style.display    = 'none';
       $('real-ok-banner').style.display = '';
       if (rt.wallet) $('real-wallet-addr').textContent = rt.wallet.slice(0,6) + '…' + rt.wallet.slice(-4) + ' (EOA)';
-      $('real-usdc-bal').textContent = rt.balance !== null ? '$' + fmt2(rt.balance) : '—';
+      if (rt.balance !== null) {
+        $('real-usdc-bal').textContent = '$' + fmt2(rt.balance);
+        $('real-usdc-bal').style.color = 'var(--up)';
+        $('real-banner').style.display = 'none';
+      } else {
+        // Кошелёк подключён, но баланс не тянется → 401 с API ключом
+        $('real-usdc-bal').textContent = '⚠ нет доступа';
+        $('real-usdc-bal').style.color = 'var(--warn)';
+        $('real-banner').style.display = '';
+        $('real-banner-txt').textContent = 'API key не работает (401). Добавь POLY_API_KEY + POLY_API_SECRET + POLY_PASSPHRASE в Railway env vars (app.polymarket.com → Settings → API Keys)';
+      }
     } else if (rt.enabled && !rt.ready) {
       $('real-banner').style.display    = '';
       $('real-ok-banner').style.display = 'none';
@@ -767,8 +776,17 @@ function updateStratCards(strats, polyData, realTrading) {
         tgl.textContent = enabled ? 'ON' : 'OFF';
       }
 
-      // Stats
-      $(`sbal-${id}-${mode}`).textContent = '$' + fmt2(acct.balance);
+      // Stats — для REAL счёта показываем Polymarket USDC баланс если доступен
+      const balEl = $(`sbal-${id}-${mode}`);
+      if (mode === 'real' && realTrading && realTrading.balance !== null && realTrading.balance !== undefined) {
+        balEl.textContent = '$' + fmt2(realTrading.balance);
+        balEl.title = 'Баланс USDC на Polymarket';
+        balEl.style.color = 'var(--up)';
+      } else {
+        balEl.textContent = '$' + fmt2(acct.balance);
+        balEl.style.color = '';
+        balEl.title = '';
+      }
       const pnlEl = $(`spnl-${id}-${mode}`);
       pnlEl.textContent = fmtPnl(acct.pnl);
       pnlEl.style.color = acct.pnl >= 0 ? 'var(--up)' : 'var(--dn)';
@@ -857,7 +875,10 @@ async function toggleAcct(id, mode) {
 }
 
 async function resetAcct(id, mode) {
-  if (!confirm(`Сбросить ${mode.toUpperCase()} счёт стратегии ${id}?\nБаланс → $1000, позиция и лог очищаются.`)) return;
+  const msg = mode === 'real'
+    ? `Сбросить REAL счёт стратегии ${id}?\nЭто очистит историю сделок и позицию в боте.\nРеальные средства на Polymarket НЕ затрагиваются.`
+    : `Сбросить DEMO счёт стратегии ${id}?\nБаланс → $1000, позиция и лог очищаются.`;
+  if (!confirm(msg)) return;
   await fetch(`/api/strategy/${id}/${mode}/reset`, { method: 'POST' });
 }
 
