@@ -88,11 +88,20 @@ function saveState() {
     for (const id in STRATEGIES) {
       const s = STRATEGIES[id];
       out[id] = {
-        enabled: s.enabled,
-        balance: s.balance,
-        peakBalance: s.peakBalance,
-        open: s.open,
-        log: s.log.slice(-500),
+        demoEnabled: s.demoEnabled,
+        realEnabled: s.realEnabled,
+        demo: {
+          balance:     s.demo.balance,
+          peakBalance: s.demo.peakBalance,
+          open:        s.demo.open,
+          log:         s.demo.log.slice(-500),
+        },
+        real: {
+          balance:     s.real.balance,
+          peakBalance: s.real.peakBalance,
+          open:        s.real.open,
+          log:         s.real.log.slice(-500),
+        },
         params: s.params,
       };
     }
@@ -105,14 +114,31 @@ function loadState() {
     if (!fs.existsSync(STATE_FILE)) return;
     const stored = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     for (const id in stored) {
-      if (STRATEGIES[id]) {
-        STRATEGIES[id].enabled    = stored[id].enabled ?? false;
-        STRATEGIES[id].balance    = stored[id].balance ?? 1000;
-        STRATEGIES[id].peakBalance = stored[id].peakBalance ?? 1000;
-        STRATEGIES[id].open       = stored[id].open ?? null;
-        STRATEGIES[id].log        = stored[id].log ?? [];
-        STRATEGIES[id].params     = { ...STRATEGIES[id].params, ...(stored[id].params ?? {}) };
+      const s = STRATEGIES[id];
+      if (!s) continue;
+      const st = stored[id];
+      if (st.demo !== undefined) {
+        // New dual-account format
+        s.demoEnabled      = st.demoEnabled      ?? false;
+        s.realEnabled      = st.realEnabled      ?? false;
+        s.demo.balance     = st.demo.balance     ?? 1000;
+        s.demo.peakBalance = st.demo.peakBalance ?? 1000;
+        s.demo.open        = st.demo.open        ?? null;
+        s.demo.log         = st.demo.log         ?? [];
+        s.real.balance     = st.real.balance     ?? 1000;
+        s.real.peakBalance = st.real.peakBalance ?? 1000;
+        s.real.open        = st.real.open        ?? null;
+        s.real.log         = st.real.log         ?? [];
+      } else {
+        // Migrate from old format — move data into demo account
+        s.demoEnabled      = st.enabled          ?? false;
+        s.demo.balance     = st.balance          ?? 1000;
+        s.demo.peakBalance = st.peakBalance      ?? 1000;
+        s.demo.open        = st.open             ?? null;
+        s.demo.log         = st.log              ?? [];
+        console.log(`[state] migrated ${id} to dual-account format`);
       }
+      s.params = { ...s.params, ...(st.params ?? {}) };
     }
     console.log('[state] loaded');
   } catch (e) { console.error('[state] load error:', e.message); }
@@ -835,11 +861,11 @@ async function initPolyWallet() {
   // Диагностика — лог всегда, независимо от условий
   console.log(`[real] initPolyWallet called. REAL_TRADING=${REAL_TRADING}, POLY_PK_set=${!!POLY_PK}, POLY_FUNDER=${POLY_FUNDER || '(none)'}`);
   if (!REAL_TRADING) {
-    console.log('[real] REAL_TRADING disabled — Momentum runs in simulation');
+    console.log('[real] REAL_TRADING disabled — real account runs without on-chain orders');
     return;
   }
   if (!POLY_PK) {
-    console.warn('[real] REAL_TRADING=true but POLY_PRIVATE_KEY is not set — falling back to sim');
+    console.warn('[real] REAL_TRADING=true but POLY_PRIVATE_KEY is not set — real account in sim');
     return;
   }
   try {
@@ -851,11 +877,11 @@ async function initPolyWallet() {
     realBalance  = await fetchRealBalance();
     if (realBalance !== null) {
       console.log(`[real] USDC balance   : $${realBalance.toFixed(2)}`);
-      // Sync Momentum strategy's balance with the actual wallet balance
+      // Sync Momentum real account balance with actual wallet balance
       const mom = STRATEGIES.momentum;
       if (mom && realBalance > 0) {
-        mom.balance     = realBalance;
-        mom.peakBalance = Math.max(mom.peakBalance || 0, realBalance);
+        mom.real.balance     = realBalance;
+        mom.real.peakBalance = Math.max(mom.real.peakBalance || 0, realBalance);
         saveState();
       }
     } else {
@@ -868,16 +894,16 @@ async function initPolyWallet() {
   }
 }
 
-// Periodically refresh real balance (every 30 s) and keep Momentum in sync
+// Periodically refresh real balance (every 30 s) and keep Momentum real account in sync
 setInterval(async () => {
   if (!REAL_TRADING || !polyWallet || !polyApiCreds) return;
   const b = await fetchRealBalance();
   if (b !== null) {
     realBalance = b;
     const mom = STRATEGIES.momentum;
-    // Only overwrite balance when no position is open
-    if (mom && !mom.open && !mom.pendingReal) {
-      mom.balance = b;
+    // Only overwrite balance when no real position is open
+    if (mom && !mom.real.open && !mom.pendingReal) {
+      mom.real.balance = b;
     }
   }
 }, 30_000);
@@ -931,11 +957,10 @@ function initStrategies() {
   for (const def of STRAT_DEFINITIONS) {
     STRATEGIES[def.id] = {
       def,
-      enabled:      false,
-      balance:      1000,
-      peakBalance:  1000,
-      open:         null,
-      log:          [],
+      demoEnabled:  false,
+      realEnabled:  false,
+      demo: { balance: 1000, peakBalance: 1000, open: null, log: [] },
+      real: { balance: 1000, peakBalance: 1000, open: null, log: [] },
       params:       { ...def.defaults },
       pendingReal:  false,   // true while a real BUY order is in-flight
     };
@@ -958,22 +983,22 @@ function getStratContext() {
   };
 }
 
-function stratOpen(s, ctx, entry) {
-  const sizeUSDC = sizingByKelly(s.balance, entry.ourProb, entry.polyPrice, s.params.kellyFrac, s.params.maxFrac);
-  if (sizeUSDC < 1)                return;
-  if (sizeUSDC > s.balance * 0.95) return;
+function stratOpen(s, ctx, entry, acct, isReal) {
+  const sizeUSDC = sizingByKelly(acct.balance, entry.ourProb, entry.polyPrice, s.params.kellyFrac, s.params.maxFrac);
+  if (sizeUSDC < 1)                  return;
+  if (sizeUSDC > acct.balance * 0.95) return;
 
-  const isRealOrder = REAL_TRADING && s.def.id === 'momentum' && !!polyWallet && !!polyApiCreds;
+  const isRealOrder = isReal && s.def.id === 'momentum' && !!polyWallet && !!polyApiCreds;
   const tokenId     = entry.side === 'UP' ? poly.market?.tokenIdUp : poly.market?.tokenIdDown;
 
-  // For real orders: block re-entry while async BUY is in-flight
+  // For real orders: need tokenId
   if (isRealOrder && !tokenId) {
     console.warn('[real] missing tokenId — skipping real entry');
     return;
   }
 
   const openingBTC = ctx.openingBTC || ctx.curBTC;
-  s.open = {
+  acct.open = {
     side:               entry.side,
     entryTime:          Date.now(),
     btcAtEntry:         openingBTC,
@@ -992,8 +1017,8 @@ function stratOpen(s, ctx, entry) {
     realOrderId:        null,
     realOrderStatus:    isRealOrder ? 'pending' : 'sim',
   };
-  s.balance    -= sizeUSDC;
-  s.pendingReal = isRealOrder;   // prevent double-entry while order is in-flight
+  acct.balance    -= sizeUSDC;
+  if (isRealOrder) s.pendingReal = true;
   saveState();
   console.log(`[${s.def.id}] ${isRealOrder ? 'REAL' : 'SIM'} OPEN ${entry.side} @ ${entry.polyPrice.toFixed(3)} size=$${sizeUSDC.toFixed(2)} | ${entry.info}`);
 
@@ -1002,9 +1027,9 @@ function stratOpen(s, ctx, entry) {
     placeClobOrder({ tokenId, side: 'BUY', size: sizeUSDC, price: entry.polyPrice })
       .then(result => {
         s.pendingReal = false;
-        if (s.open) {
-          s.open.realOrderId     = result.orderID;
-          s.open.realOrderStatus = result.status || 'placed';
+        if (acct.open) {
+          acct.open.realOrderId     = result.orderID;
+          acct.open.realOrderStatus = result.status || 'placed';
           saveState();
           console.log(`[real] BUY placed orderId=${result.orderID} status=${result.status}`);
         }
@@ -1012,10 +1037,10 @@ function stratOpen(s, ctx, entry) {
       .catch(err => {
         console.error('[real] BUY order FAILED:', err.message);
         // Rollback: refund balance and clear the position
-        if (s.open) {
-          s.balance    += s.open.sizeUSDC;
-          s.open        = null;
-          s.pendingReal = false;
+        if (acct.open) {
+          acct.balance    += acct.open.sizeUSDC;
+          acct.open        = null;
+          s.pendingReal    = false;
           saveState();
           console.warn('[real] position rolled back due to order failure');
         }
@@ -1023,8 +1048,8 @@ function stratOpen(s, ctx, entry) {
   }
 }
 
-function stratClose(s, ctx, reason, exitPolyPrice) {
-  const o      = s.open;
+function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
+  const o      = acct.open;
   const shares = o.sizeUSDC / o.polyEntryPrice;
   let proceeds, won;
 
@@ -1040,11 +1065,11 @@ function stratClose(s, ctx, reason, exitPolyPrice) {
 
   const pnl   = proceeds - o.sizeUSDC;
   const entry = { ...o, closeTime: Date.now(), reason, proceeds, pnl, won, btcAtClose: ctx.curBTC, polyExitPrice: exitPolyPrice, strategy: s.def.id };
-  s.balance    += proceeds;
-  s.peakBalance = Math.max(s.peakBalance, s.balance);
-  s.log.push(entry);
-  if (s.log.length > 500) s.log.shift();
-  s.open = null;
+  acct.balance    += proceeds;
+  acct.peakBalance = Math.max(acct.peakBalance, acct.balance);
+  acct.log.push(entry);
+  if (acct.log.length > 500) acct.log.shift();
+  acct.open = null;
   saveState();
   console.log(`[${s.def.id}] ${o.isReal ? 'REAL' : 'SIM'} CLOSE ${o.side} reason=${reason} pnl=${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
 
@@ -1052,14 +1077,13 @@ function stratClose(s, ctx, reason, exitPolyPrice) {
   if (o.isReal) {
     if (reason === 'SETTLE') {
       // Polymarket auto-redeems winning tokens ~1 min after window close.
-      // We just sync the real balance after the grace period.
       setTimeout(async () => {
         const b = await fetchRealBalance();
         if (b !== null) {
           realBalance = b;
           const mom = STRATEGIES.momentum;
-          if (mom && !mom.open) {
-            mom.balance = b;
+          if (mom && !mom.real.open) {
+            mom.real.balance = b;
             saveState();
             console.log(`[real] post-settle balance: $${b.toFixed(2)}`);
           }
@@ -1067,30 +1091,40 @@ function stratClose(s, ctx, reason, exitPolyPrice) {
       }, 90_000); // 90 s after window close
     } else if (o.tokenId && o.realOrderId && exitPolyPrice > 0.01) {
       // Early exit (TP / SL / FLIP / ADVERSE): sell shares back on CLOB.
-      // Discount 0.5 % to increase fill probability.
       const sellPrice = Math.max(0.01, parseFloat((exitPolyPrice * 0.995).toFixed(4)));
       placeClobOrder({ tokenId: o.tokenId, side: 'SELL', size: shares, price: sellPrice })
         .then(result => {
           console.log(`[real] SELL placed orderId=${result.orderID} reason=${reason} price=${sellPrice}`);
-          // Refresh balance after sell fills (optimistic 10 s delay)
           setTimeout(async () => {
             const b = await fetchRealBalance();
             if (b !== null) {
               realBalance = b;
               const mom = STRATEGIES.momentum;
-              if (mom && !mom.open) { mom.balance = b; saveState(); }
+              if (mom && !mom.real.open) { mom.real.balance = b; saveState(); }
             }
           }, 10_000);
         })
         .catch(err => {
           console.error(`[real] SELL order FAILED (${reason}):`, err.message);
-          // Position will auto-settle at expiry — no further action needed.
         });
     } else if (o.tokenId && !o.realOrderId) {
-      // BUY order was still pending when we decided to close — cancel it.
       console.warn('[real] closing before BUY order confirmed — attempting cancel');
       if (o.realOrderId) cancelClobOrder(o.realOrderId);
     }
+  }
+}
+
+function processAccount(s, ctx, acct, isReal) {
+  if (acct.open) {
+    if (Date.now() >= acct.open.expiryTime) {
+      stratClose(s, ctx, 'SETTLE', null, acct, isReal); return;
+    }
+    const exit = s.def.shouldExit(ctx, acct.open, s.params);
+    if (exit && exit.exitPrice !== null) stratClose(s, ctx, exit.reason, exit.exitPrice, acct, isReal);
+  } else {
+    if (ctx.polyUp === null) return;
+    const entry = s.def.shouldEnter(ctx, s.params);
+    if (entry) stratOpen(s, ctx, entry, acct, isReal);
   }
 }
 
@@ -1098,20 +1132,17 @@ function processStrategies() {
   const ctx = getStratContext();
   for (const id in STRATEGIES) {
     const s = STRATEGIES[id];
-    if (!s.enabled)           continue;
-    if (ticks.length < 60)    continue;
-    if (s.pendingReal)        continue;   // real BUY in-flight, skip tick
+    if (ticks.length < 60) continue;
 
-    if (s.open) {
-      if (Date.now() >= s.open.expiryTime) {
-        stratClose(s, ctx, 'SETTLE', null); continue;
-      }
-      const exit = s.def.shouldExit(ctx, s.open, s.params);
-      if (exit && exit.exitPrice !== null) stratClose(s, ctx, exit.reason, exit.exitPrice);
-    } else {
-      if (ctx.polyUp === null) continue;
-      const entry = s.def.shouldEnter(ctx, s.params);
-      if (entry) stratOpen(s, ctx, entry);
+    // Demo account — always simulation, never real orders
+    if (s.demoEnabled) {
+      processAccount(s, ctx, s.demo, false);
+    }
+
+    // Real account — places CLOB orders if wallet is configured; otherwise sim
+    if (s.realEnabled && !s.pendingReal) {
+      const canReal = REAL_TRADING && !!polyWallet && !!polyApiCreds;
+      processAccount(s, ctx, s.real, canReal);
     }
   }
 }
@@ -1214,6 +1245,26 @@ function startSim() {
 }
 
 // ─── STATE SNAPSHOT FOR DASHBOARD ────────────────────────────────────────────
+function accountSummary(acct) {
+  const log  = acct.log;
+  const wins = log.filter(t => t.won).length;
+  const pnl  = log.reduce((a, t) => a + t.pnl, 0);
+  const dd   = (() => {
+    let peak = 1000, cur = 1000, d = 0;
+    for (const t of log) { cur += t.pnl; peak = Math.max(peak, cur); d = Math.min(d, (cur - peak) / peak); }
+    return d;
+  })();
+  return {
+    balance:    acct.balance,
+    pnl,
+    trades:     log.length,
+    wins,
+    dd,
+    open:       acct.open,
+    lastTrades: log.slice(-5).reverse(),
+  };
+}
+
 function buildSnapshot() {
   const sigS   = predictScalp();
   const sigP   = predictPoly();
@@ -1224,22 +1275,14 @@ function buildSnapshot() {
   // Per-strategy summary
   const strats = {};
   for (const id in STRATEGIES) {
-    const s   = STRATEGIES[id];
-    const log = s.log;
-    const wins = log.filter(t => t.won).length;
-    const pnl  = log.reduce((a, t) => a + t.pnl, 0);
-    const dd   = (() => { let peak = 1000, cur = 1000, d = 0; for (const t of log) { cur += t.pnl; peak = Math.max(peak, cur); d = Math.min(d, (cur - peak) / peak); } return d; })();
+    const s = STRATEGIES[id];
     strats[id] = {
-      name:     s.def.name,
-      enabled:  s.enabled,
-      balance:  s.balance,
-      pnl,
-      trades:   log.length,
-      wins,
-      dd,
-      open:     s.open,
+      name:        s.def.name,
+      demoEnabled: s.demoEnabled,
+      realEnabled: s.realEnabled,
+      demo:        accountSummary(s.demo),
+      real:        accountSummary(s.real),
       pendingReal: s.pendingReal,
-      lastTrades: log.slice(-5).reverse(),
     };
   }
 
@@ -1293,47 +1336,94 @@ app.get('/events', (req, res) => {
 // API: get state
 app.get('/api/state', (_, res) => res.json(buildSnapshot()));
 
-// API: toggle strategy
+// API: toggle strategy demo account (backward-compat shortcut)
 app.post('/api/strategy/:id/toggle', (req, res) => {
   const s = STRATEGIES[req.params.id];
   if (!s) return res.status(404).json({ error: 'not found' });
-  s.enabled = !s.enabled;
+  s.demoEnabled = !s.demoEnabled;
   saveState();
-  console.log(`[strategy] ${req.params.id} → ${s.enabled ? 'ON' : 'OFF'}`);
-  res.json({ id: req.params.id, enabled: s.enabled });
+  console.log(`[strategy] ${req.params.id} demo → ${s.demoEnabled ? 'ON' : 'OFF'}`);
+  res.json({ id: req.params.id, demoEnabled: s.demoEnabled });
 });
 
-// API: reset strategy
+// API: toggle DEMO account
+app.post('/api/strategy/:id/demo/toggle', (req, res) => {
+  const s = STRATEGIES[req.params.id];
+  if (!s) return res.status(404).json({ error: 'not found' });
+  s.demoEnabled = !s.demoEnabled;
+  saveState();
+  console.log(`[strategy] ${req.params.id} demo → ${s.demoEnabled ? 'ON' : 'OFF'}`);
+  res.json({ id: req.params.id, demoEnabled: s.demoEnabled });
+});
+
+// API: toggle REAL account
+app.post('/api/strategy/:id/real/toggle', (req, res) => {
+  const s = STRATEGIES[req.params.id];
+  if (!s) return res.status(404).json({ error: 'not found' });
+  s.realEnabled = !s.realEnabled;
+  saveState();
+  console.log(`[strategy] ${req.params.id} real → ${s.realEnabled ? 'ON' : 'OFF'}`);
+  res.json({ id: req.params.id, realEnabled: s.realEnabled });
+});
+
+// API: reset DEMO account (backward-compat shortcut)
 app.post('/api/strategy/:id/reset', (req, res) => {
   const s = STRATEGIES[req.params.id];
   if (!s) return res.status(404).json({ error: 'not found' });
-  s.balance    = 1000;
-  s.peakBalance = 1000;
-  s.open       = null;
-  s.log        = [];
+  s.demo.balance     = 1000;
+  s.demo.peakBalance = 1000;
+  s.demo.open        = null;
+  s.demo.log         = [];
+  saveState();
+  res.json({ ok: true });
+});
+
+// API: reset DEMO account
+app.post('/api/strategy/:id/demo/reset', (req, res) => {
+  const s = STRATEGIES[req.params.id];
+  if (!s) return res.status(404).json({ error: 'not found' });
+  s.demo.balance     = 1000;
+  s.demo.peakBalance = 1000;
+  s.demo.open        = null;
+  s.demo.log         = [];
+  saveState();
+  res.json({ ok: true });
+});
+
+// API: reset REAL account
+app.post('/api/strategy/:id/real/reset', (req, res) => {
+  const s = STRATEGIES[req.params.id];
+  if (!s) return res.status(404).json({ error: 'not found' });
+  s.real.balance     = 1000;
+  s.real.peakBalance = 1000;
+  s.real.open        = null;
+  s.real.log         = [];
   saveState();
   res.json({ ok: true });
 });
 
 // API: export CSV
 app.get('/api/export/csv', (_, res) => {
-  const rows = [['strategy','time_open','time_close','side','market','poly_entry','poly_exit','btc_open','btc_close','size','pnl','edge','reason','won','entry_info','real_order_id']];
+  const rows = [['mode','strategy','time_open','time_close','side','market','poly_entry','poly_exit','btc_open','btc_close','size','pnl','edge','reason','won','entry_info','real_order_id']];
   for (const id in STRATEGIES) {
-    for (const t of STRATEGIES[id].log) {
-      rows.push([
-        t.strategy,
-        new Date(t.entryTime).toISOString(),
-        new Date(t.closeTime).toISOString(),
-        t.side, t.marketSlug || '',
-        t.polyEntryPrice.toFixed(4),
-        (t.polyExitPrice ?? (t.won ? 1 : 0)).toFixed(4),
-        (t.btcAtEntry || 0).toFixed(2), (t.btcAtClose || 0).toFixed(2),
-        t.sizeUSDC.toFixed(4), t.pnl.toFixed(4),
-        (t.edge * 100).toFixed(2),
-        t.reason, t.won ? 1 : 0,
-        (t.entryInfo || '').replace(/,/g, ';'),
-        t.realOrderId || '',
-      ]);
+    for (const [mode, acct] of [['demo', STRATEGIES[id].demo], ['real', STRATEGIES[id].real]]) {
+      for (const t of acct.log) {
+        rows.push([
+          mode,
+          t.strategy,
+          new Date(t.entryTime).toISOString(),
+          new Date(t.closeTime).toISOString(),
+          t.side, t.marketSlug || '',
+          t.polyEntryPrice.toFixed(4),
+          (t.polyExitPrice ?? (t.won ? 1 : 0)).toFixed(4),
+          (t.btcAtEntry || 0).toFixed(2), (t.btcAtClose || 0).toFixed(2),
+          t.sizeUSDC.toFixed(4), t.pnl.toFixed(4),
+          (t.edge * 100).toFixed(2),
+          t.reason, t.won ? 1 : 0,
+          (t.entryInfo || '').replace(/,/g, ';'),
+          t.realOrderId || '',
+        ]);
+      }
     }
   }
   res.set({ 'Content-Type': 'text/csv', 'Content-Disposition': `attachment; filename="bot_log_${Date.now()}.csv"` });
@@ -1353,8 +1443,8 @@ app.get('/api/real/status', async (_, res) => {
     balance,
     strategies:  Object.keys(STRATEGIES).filter(id => id === 'momentum').map(id => ({
       id,
-      realEnabled: REAL_TRADING && id === 'momentum',
-      open:        STRATEGIES[id].open,
+      realEnabled: STRATEGIES[id].realEnabled,
+      open:        STRATEGIES[id].real.open,
     })),
   });
 });
@@ -1362,19 +1452,19 @@ app.get('/api/real/status', async (_, res) => {
 // POST /api/real/cancel — cancel the open real order for Momentum (emergency stop)
 app.post('/api/real/cancel', async (_, res) => {
   const mom = STRATEGIES.momentum;
-  if (!mom || !mom.open?.realOrderId) return res.json({ ok: false, reason: 'no open real order' });
-  await cancelClobOrder(mom.open.realOrderId);
-  res.json({ ok: true, cancelledOrderId: mom.open.realOrderId });
+  if (!mom || !mom.real.open?.realOrderId) return res.json({ ok: false, reason: 'no open real order' });
+  await cancelClobOrder(mom.real.open.realOrderId);
+  res.json({ ok: true, cancelledOrderId: mom.real.open.realOrderId });
 });
 
 // POST /api/real/close-now — immediately close real position at current mid price
 app.post('/api/real/close-now', async (_, res) => {
   const mom = STRATEGIES.momentum;
-  if (!mom || !mom.open) return res.status(400).json({ error: 'no open position' });
+  if (!mom || !mom.real.open) return res.status(400).json({ error: 'no open position' });
   const ctx      = getStratContext();
-  const midPrice = mom.open.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+  const midPrice = mom.real.open.side === 'UP' ? ctx.polyUp : ctx.polyDn;
   if (!midPrice)  return res.status(400).json({ error: 'no poly price available' });
-  stratClose(mom, ctx, 'MANUAL', midPrice);
+  stratClose(mom, ctx, 'MANUAL', midPrice, mom.real, true);
   res.json({ ok: true, exitPrice: midPrice });
 });
 
