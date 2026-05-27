@@ -602,7 +602,7 @@ async function l1Headers(method, reqPath, body = '') {
     CLOB_AUTH_DOMAIN,
     CLOB_AUTH_TYPES,
     {
-      address:   polyWallet.address,  // always the EOA signing key
+      address:   polyAddress,  // "I attest I control THIS wallet" = funder for Safe, EOA otherwise
       timestamp: ts,
       nonce,
       message:   'This message attests that I control the given wallet',
@@ -610,7 +610,7 @@ async function l1Headers(method, reqPath, body = '') {
   );
   return {
     'Content-Type':   'application/json',
-    'POLY_ADDRESS':   polyAddress,   // funder for Safe, EOA otherwise
+    'POLY_ADDRESS':   polyAddress,
     'POLY_SIGNATURE': sig,
     'POLY_TIMESTAMP': ts,
     'POLY_NONCE':     String(nonce),
