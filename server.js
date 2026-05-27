@@ -1805,6 +1805,52 @@ app.get('/api/real/diagnose', async (_, res) => {
     return res.json(report);
   }
 
+  // ─── ТЕСТ ДОСТУПНОСТИ POLYMARKET ИЗ RAILWAY ─────────────────────────────
+  // Стучимся в публичные endpoints без auth. Если они отвечают — геоблока нет,
+  // проблема в нашем auth flow. Если не отвечают — Railway IP заблокирован Polymarket.
+  try {
+    const t0   = Date.now();
+    const r    = await fetch(`${POLY_CLOB}/markets?limit=1`, { method: 'GET', signal: AbortSignal.timeout(8000) });
+    const ms   = Date.now() - t0;
+    const txt  = await r.text();
+    let parsed = null;
+    try { parsed = JSON.parse(txt); } catch {}
+    report.tests.publicClob = {
+      url:     `${POLY_CLOB}/markets?limit=1`,
+      status:  r.status,
+      ok:      r.ok,
+      ms,
+      hasData: !!(parsed && (parsed.data || parsed.length || parsed.markets)),
+      preview: typeof parsed === 'object' ? Object.keys(parsed || {}).slice(0,5).join(',') : txt.slice(0, 100),
+      verdict: r.ok
+        ? '✅ Публичный CLOB доступен с Railway. Значит геоблока нет → проблема в auth (аккаунте/регистрации).'
+        : `❌ Публичный CLOB не отвечает (${r.status}). Возможен геоблок Railway IP.`,
+    };
+  } catch (e) {
+    report.tests.publicClob = {
+      error:   e.message,
+      verdict: '❌ Не смогли достучаться до публичного CLOB. Геоблок Railway IP вероятен.',
+    };
+  }
+
+  // Дополнительно — проверим data-api (другой хост Polymarket)
+  try {
+    const r    = await fetch(`https://data-api.polymarket.com/value?user=${POLY_FUNDER || polyWallet.address}`, {
+      method: 'GET', signal: AbortSignal.timeout(8000),
+    });
+    const txt  = await r.text();
+    let parsed; try { parsed = JSON.parse(txt); } catch { parsed = txt.slice(0, 200); }
+    report.tests.dataApi = {
+      url:     `https://data-api.polymarket.com/value?user=${POLY_FUNDER ? 'FUNDER' : 'EOA'}`,
+      status:  r.status,
+      ok:      r.ok,
+      response: parsed,
+      verdict: r.ok ? '✅ data-api Polymarket видит твой аккаунт.' : '❌ data-api недоступен.',
+    };
+  } catch (e) {
+    report.tests.dataApi = { error: e.message };
+  }
+
   // ─── РЕШАЮЩИЙ ТЕСТ ────────────────────────────────────────────────────────
   // Берём credentials, которые Polymarket САМ возвращает для текущего EOA через
   // GET /auth/derive-api-key (на 100% принадлежат этому EOA), и делаем balance-allowance
