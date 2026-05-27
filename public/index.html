@@ -179,11 +179,56 @@ body::before {
   padding: 14px;
   position: relative;
 }
-.strat-card.enabled-card {
-  background: linear-gradient(135deg, rgba(68,102,255,.04), var(--bg2));
+
+/* DUAL ACCOUNT PANELS inside a strategy card */
+.acct-panels {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 10px;
 }
-.strat-card.has-pos {
+.acct-panel {
+  border-radius: 3px;
+  border: 1px solid var(--bd);
+  padding: 10px 11px;
+  position: relative;
+}
+.acct-panel.acct-demo {
+  background: rgba(68,102,255,.04);
+  border-color: rgba(68,102,255,.18);
+}
+.acct-panel.acct-demo.acct-active {
+  background: rgba(68,102,255,.08);
+  border-color: rgba(68,102,255,.35);
+  box-shadow: inset 0 0 0 1px rgba(68,102,255,.2);
+}
+.acct-panel.acct-real {
+  background: rgba(255,136,51,.04);
+  border-color: rgba(255,136,51,.18);
+}
+.acct-panel.acct-real.acct-active {
+  background: rgba(255,136,51,.08);
+  border-color: rgba(255,136,51,.35);
+  box-shadow: inset 0 0 0 1px rgba(255,136,51,.22);
+}
+.acct-panel.has-pos {
   box-shadow: inset 3px 0 0 var(--warn);
+}
+.acct-label {
+  font-size: 8px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.acct-demo .acct-label { color: rgba(100,130,255,.8); }
+.acct-real .acct-label { color: rgba(255,160,80,.8); }
+
+.acct-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
 }
 
 /* TOGGLE BUTTON */
@@ -200,14 +245,16 @@ body::before {
   transition: all .15s;
   text-transform: uppercase;
 }
-.toggle-btn.on  { color: var(--up);  border-color: rgba(0,232,122,.4); }
+.acct-demo .toggle-btn.on  { color: #7090ff;  border-color: rgba(100,130,255,.5); }
+.acct-real .toggle-btn.on  { color: var(--warn); border-color: rgba(255,136,51,.5); }
 .toggle-btn.off { color: var(--tx3); border-color: var(--bd); }
 .toggle-btn:hover { opacity: .8; }
+.toggle-btn:disabled { opacity: .35; cursor: not-allowed; }
 
 .reset-btn {
   font-family: var(--mono);
-  font-size: 9px;
-  padding: 3px 8px;
+  font-size: 8px;
+  padding: 2px 6px;
   border: 1px solid var(--bd);
   background: transparent;
   color: var(--tx3);
@@ -219,14 +266,23 @@ body::before {
 /* OPEN POSITION BADGE */
 .pos-badge {
   display: inline-block;
-  font-size: 9px;
-  padding: 2px 7px;
+  font-size: 8px;
+  padding: 1px 5px;
   border-radius: 2px;
   letter-spacing: 1px;
-  margin-left: 6px;
 }
 .pos-up { background: rgba(0,232,122,.12); color: var(--up); border: 1px solid rgba(0,232,122,.25); }
 .pos-dn { background: rgba(255,51,85,.12);  color: var(--dn); border: 1px solid rgba(255,51,85,.25); }
+
+/* real-not-ready lock badge */
+.lock-badge {
+  font-size: 8px;
+  color: var(--tx3);
+  border: 1px solid var(--bd);
+  padding: 1px 6px;
+  border-radius: 2px;
+  letter-spacing: .5px;
+}
 
 /* LOG TABLE */
 .log-wrap { max-height: 200px; overflow-y: auto; }
@@ -451,7 +507,7 @@ table.log tr:hover td { background: var(--bg3); }
     <table class="log" id="main-log">
       <thead>
         <tr>
-          <th>Стратегия</th><th>Время</th><th>Сторона</th><th>Вход</th><th>Выход</th><th>Размер</th><th>P&L</th><th>Причина</th><th>Info</th>
+          <th>Режим</th><th>Стратегия</th><th>Время</th><th>Сторона</th><th>Вход</th><th>Выход</th><th>Размер</th><th>P&L</th><th>Причина</th>
         </tr>
       </thead>
       <tbody id="log-body">
@@ -578,14 +634,14 @@ function updateAll(d) {
   // Poly status
   $('poly-status').textContent = d.poly.status + (d.poly.lastErr ? ' (' + d.poly.lastErr + ')' : '');
 
-  // Aggregate stats
+  // Aggregate stats — demo accounts
   let totalBal = 0, totalPnl = 0, totalTrades = 0, totalWins = 0, minDd = 0;
   for (const [, s] of Object.entries(d.strats)) {
-    totalBal    += s.balance;
-    totalPnl    += s.pnl;
-    totalTrades += s.trades;
-    totalWins   += s.wins;
-    minDd        = Math.min(minDd, s.dd);
+    totalBal    += s.demo.balance;
+    totalPnl    += s.demo.pnl;
+    totalTrades += s.demo.trades;
+    totalWins   += s.demo.wins;
+    minDd        = Math.min(minDd, s.demo.dd);
   }
   $('total-bal').textContent = '$' + fmt2(totalBal);
   $('total-bal').style.color = totalPnl >= 0 ? 'var(--tx2)' : 'var(--dn)';
@@ -598,7 +654,7 @@ function updateAll(d) {
   $('total-wr-pct').textContent = totalTrades ? (wrPct * 100).toFixed(0) + '%' : '—';
 
   // Strategy cards
-  updateStratCards(d.strats, d.poly);
+  updateStratCards(d.strats, d.poly, d.realTrading);
 
   // Combined log
   updateLog(d.strats);
@@ -612,92 +668,113 @@ function updateAll(d) {
 // ─── STRATEGY CARDS ───────────────────────────────────────────────────────────
 const renderedCards = new Set();
 
-function updateStratCards(strats, polyData) {
+function acctPanelHtml(id, mode, label, isLocked) {
+  const lockBit = isLocked ? `<span class="lock-badge" title="Настрой REAL_TRADING и POLY_PRIVATE_KEY в Railway env">🔒 нет кошелька</span>` : `<button id="stgl-${id}-${mode}" class="toggle-btn off" onclick="toggleAcct('${id}','${mode}')">OFF</button>`;
+  return `
+    <div class="acct-panel acct-${mode}" id="apanel-${id}-${mode}">
+      <div class="acct-header">
+        <span class="acct-label">${label}</span>
+        <div style="display:flex;gap:5px;align-items:center;">
+          <button class="reset-btn" onclick="resetAcct('${id}','${mode}')">сброс</button>
+          ${lockBit}
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:6px;">
+        <div><div class="lbl">Баланс</div><div id="sbal-${id}-${mode}" class="num-md">$1000</div></div>
+        <div><div class="lbl">P&L</div><div id="spnl-${id}-${mode}" class="num-md">$0</div></div>
+        <div><div class="lbl">Сделок/W%</div><div id="swr-${id}-${mode}" class="num-md">—</div></div>
+      </div>
+      <div id="sopen-${id}-${mode}" style="font-size:9px;color:var(--tx3);margin-bottom:6px;">нет позиции</div>
+      <div class="log-wrap" style="max-height:80px;">
+        <table class="log"><thead><tr><th>Время</th><th>Сторона</th><th>P&L</th><th>Причина</th></tr></thead>
+        <tbody id="slog-${id}-${mode}"></tbody></table>
+      </div>
+    </div>`;
+}
+
+function updateStratCards(strats, polyData, realTrading) {
   const grid = $('strat-grid');
   for (const [id, s] of Object.entries(strats)) {
     if (!renderedCards.has(id)) {
+      const realLocked = !realTrading.ready;
       const card = document.createElement('div');
       card.id = 'scard-' + id;
       card.className = 'strat-card';
       card.innerHTML = `
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
-          <div>
-            <div class="lbl" style="margin-bottom:2px;">${s.name}</div>
-            <span id="spos-${id}" style="font-size:9px;color:var(--tx3);"></span>
-          </div>
-          <div style="display:flex;gap:6px;">
-            <button class="reset-btn" onclick="resetStrat('${id}')">сброс</button>
-            <button id="stgl-${id}" class="toggle-btn off" onclick="toggleStrat('${id}')">OFF</button>
-          </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+          <div class="lbl" style="margin-bottom:0;">${s.name}</div>
+          <div id="spos-${id}" style="font-size:9px;"></div>
         </div>
-        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:8px;">
-          <div><div class="lbl">Баланс</div><div id="sbal-${id}" class="num-md">$1000</div></div>
-          <div><div class="lbl">P&L</div><div id="spnl-${id}" class="num-md">$0</div></div>
-          <div><div class="lbl">Trades/W%</div><div id="swr-${id}" class="num-md">—</div></div>
-        </div>
-        <div style="margin-bottom:8px;">
-          <div id="sopen-${id}" style="font-size:9px;color:var(--tx3);">нет открытой позиции</div>
-        </div>
-        <div class="log-wrap" style="max-height:100px;">
-          <table class="log"><thead><tr><th>Время</th><th>Сторона</th><th>P&L</th><th>Причина</th></tr></thead>
-          <tbody id="slog-${id}"></tbody></table>
+        <div class="acct-panels">
+          ${acctPanelHtml(id, 'demo', '▣ DEMO', false)}
+          ${acctPanelHtml(id, 'real', '◈ REAL', realLocked)}
         </div>`;
       grid.appendChild(card);
       renderedCards.add(id);
     }
 
-    const card = $('scard-' + id);
-    card.className = 'strat-card' + (s.enabled ? ' enabled-card' : '') + (s.open ? ' has-pos' : '');
+    // Update each account panel
+    for (const mode of ['demo', 'real']) {
+      const acct    = mode === 'demo' ? s.demo : s.real;
+      const enabled = mode === 'demo' ? s.demoEnabled : s.realEnabled;
+      const panel   = $(`apanel-${id}-${mode}`);
+      const tgl     = $(`stgl-${id}-${mode}`);
 
-    // Toggle
-    const tgl = $('stgl-' + id);
-    tgl.className = 'toggle-btn ' + (s.enabled ? 'on' : 'off');
-    tgl.textContent = s.enabled ? 'ON' : 'OFF';
+      panel.className = `acct-panel acct-${mode}${enabled ? ' acct-active' : ''}${acct.open ? ' has-pos' : ''}`;
 
-    // Stats
-    $('sbal-' + id).textContent = '$' + fmt2(s.balance);
-    const pnlEl = $('spnl-' + id);
-    pnlEl.textContent  = fmtPnl(s.pnl);
-    pnlEl.style.color  = s.pnl >= 0 ? 'var(--up)' : 'var(--dn)';
-    const wr = s.trades ? (s.wins / s.trades * 100).toFixed(0) + '%' : '—';
-    $('swr-' + id).textContent = s.trades + ' / ' + wr;
+      if (tgl) {
+        tgl.className = 'toggle-btn ' + (enabled ? 'on' : 'off');
+        tgl.textContent = enabled ? 'ON' : 'OFF';
+      }
 
-    // Open position
-    const openEl = $('sopen-' + id);
-    if (s.open) {
-      const o = s.open;
-      const posColor = o.side === 'UP' ? 'var(--up)' : 'var(--dn)';
-      const curPoly  = o.side === 'UP' ? polyData.up : polyData.down;
-      const curPnl   = curPoly !== null ? ((curPoly - o.polyEntryPrice) / o.polyEntryPrice * 100).toFixed(1) : '?';
-      openEl.innerHTML = `<span style="color:${posColor};font-weight:500;">${o.side}</span> · вход ${o.polyEntryPrice.toFixed(3)} · $${o.sizeUSDC.toFixed(2)} · текущий Δ: ${curPnl}%`;
-    } else {
-      openEl.textContent = 'нет открытой позиции';
-    }
+      // Stats
+      $(`sbal-${id}-${mode}`).textContent = '$' + fmt2(acct.balance);
+      const pnlEl = $(`spnl-${id}-${mode}`);
+      pnlEl.textContent = fmtPnl(acct.pnl);
+      pnlEl.style.color = acct.pnl >= 0 ? 'var(--up)' : 'var(--dn)';
+      const wr = acct.trades ? (acct.wins / acct.trades * 100).toFixed(0) + '%' : '—';
+      $(`swr-${id}-${mode}`).textContent = acct.trades + ' / ' + wr;
 
-    // Position badge
-    const posB = $('spos-' + id);
-    if (s.open) {
-      posB.innerHTML = `<span class="pos-badge pos-${s.open.side.toLowerCase()}">${s.open.side}</span>`;
-    } else { posB.innerHTML = ''; }
+      // Open position
+      const openEl = $(`sopen-${id}-${mode}`);
+      if (acct.open) {
+        const o = acct.open;
+        const posColor = o.side === 'UP' ? 'var(--up)' : 'var(--dn)';
+        const curPoly  = o.side === 'UP' ? polyData.up : polyData.down;
+        const curPnl   = curPoly !== null ? ((curPoly - o.polyEntryPrice) / o.polyEntryPrice * 100).toFixed(1) : '?';
+        const realTag  = o.isReal ? ' <span style="color:var(--warn);font-size:8px;">●REAL</span>' : '';
+        openEl.innerHTML = `<span style="color:${posColor};font-weight:500;">${o.side}</span> · ${o.polyEntryPrice.toFixed(3)} · $${o.sizeUSDC.toFixed(2)} · Δ: ${curPnl}%${realTag}`;
+      } else {
+        openEl.textContent = 'нет открытой позиции';
+      }
 
-    // Mini log
-    const tbody = $('slog-' + id);
-    tbody.innerHTML = '';
-    if (!s.lastTrades?.length) {
-      tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--tx3);padding:6px;">нет сделок</td></tr>';
-    } else {
-      for (const t of s.lastTrades) {
-        const tr = document.createElement('tr');
-        const pnlCol = t.pnl >= 0 ? 'var(--up)' : 'var(--dn)';
-        const sideCol = t.side === 'UP' ? 'var(--up)' : 'var(--dn)';
-        tr.innerHTML = `
-          <td style="color:var(--tx3)">${new Date(t.closeTime).toLocaleTimeString('ru')}</td>
-          <td style="color:${sideCol}">${t.side}</td>
-          <td style="color:${pnlCol}">${fmtPnl(t.pnl)}</td>
-          <td style="color:var(--tx3)">${t.reason}</td>`;
-        tbody.appendChild(tr);
+      // Mini log
+      const tbody = $(`slog-${id}-${mode}`);
+      tbody.innerHTML = '';
+      if (!acct.lastTrades?.length) {
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--tx3);padding:4px;">нет сделок</td></tr>';
+      } else {
+        for (const t of acct.lastTrades) {
+          const tr = document.createElement('tr');
+          const pnlCol  = t.pnl >= 0 ? 'var(--up)' : 'var(--dn)';
+          const sideCol = t.side === 'UP' ? 'var(--up)' : 'var(--dn)';
+          tr.innerHTML = `
+            <td style="color:var(--tx3)">${new Date(t.closeTime).toLocaleTimeString('ru')}</td>
+            <td style="color:${sideCol}">${t.side}</td>
+            <td style="color:${pnlCol}">${fmtPnl(t.pnl)}</td>
+            <td style="color:var(--tx3)">${t.reason}</td>`;
+          tbody.appendChild(tr);
+        }
       }
     }
+
+    // Combined position badge in card header
+    const posB = $('spos-' + id);
+    const anyOpen = s.demo.open || s.real.open;
+    if (anyOpen) {
+      const o = s.demo.open || s.real.open;
+      posB.innerHTML = `<span class="pos-badge pos-${o.side.toLowerCase()}">${o.side}</span>`;
+    } else { posB.innerHTML = ''; }
   }
 }
 
@@ -705,7 +782,8 @@ function updateStratCards(strats, polyData) {
 function updateLog(strats) {
   const all = [];
   for (const [id, s] of Object.entries(strats)) {
-    for (const t of (s.lastTrades || [])) all.push({ ...t, strategy: id });
+    for (const t of (s.demo.lastTrades || [])) all.push({ ...t, strategy: id, mode: 'demo' });
+    for (const t of (s.real.lastTrades || [])) all.push({ ...t, strategy: id, mode: 'real' });
   }
   all.sort((a, b) => b.closeTime - a.closeTime);
 
@@ -718,7 +796,9 @@ function updateLog(strats) {
     const tr = document.createElement('tr');
     const pnlCol  = t.pnl >= 0 ? 'var(--up)' : 'var(--dn)';
     const sideCol = t.side === 'UP' ? 'var(--up)' : 'var(--dn)';
+    const modeCol = t.mode === 'real' ? 'var(--warn)' : 'rgba(100,130,255,.7)';
     tr.innerHTML = `
+      <td style="color:${modeCol};font-weight:600;">${t.mode}</td>
       <td style="color:var(--tx3)">${t.strategy}</td>
       <td style="color:var(--tx3)">${new Date(t.closeTime).toLocaleTimeString('ru')}</td>
       <td style="color:${sideCol}">${t.side}</td>
@@ -726,21 +806,24 @@ function updateLog(strats) {
       <td>${(t.polyExitPrice ?? 0).toFixed(3)}</td>
       <td>$${(t.sizeUSDC ?? 0).toFixed(2)}</td>
       <td style="color:${pnlCol};font-weight:500;">${fmtPnl(t.pnl)}</td>
-      <td style="color:var(--tx3)">${t.reason}</td>
-      <td style="color:var(--tx3);max-width:120px;overflow:hidden;text-overflow:ellipsis;">${t.entryInfo ?? ''}</td>`;
+      <td style="color:var(--tx3)">${t.reason}</td>`;
     body.appendChild(tr);
   }
 }
 
 // ─── ACTIONS ─────────────────────────────────────────────────────────────────
-async function toggleStrat(id) {
-  await fetch(`/api/strategy/${id}/toggle`, { method: 'POST' });
+async function toggleAcct(id, mode) {
+  await fetch(`/api/strategy/${id}/${mode}/toggle`, { method: 'POST' });
 }
 
-async function resetStrat(id) {
-  if (!confirm(`Сбросить стратегию ${id}?`)) return;
-  await fetch(`/api/strategy/${id}/reset`, { method: 'POST' });
+async function resetAcct(id, mode) {
+  if (!confirm(`Сбросить ${mode.toUpperCase()} счёт стратегии ${id}?\nБаланс → $1000, позиция и лог очищаются.`)) return;
+  await fetch(`/api/strategy/${id}/${mode}/reset`, { method: 'POST' });
 }
+
+// backward-compat (если где-то вызываются старые кнопки)
+async function toggleStrat(id) { await toggleAcct(id, 'demo'); }
+async function resetStrat(id)  { await resetAcct(id, 'demo'); }
 </script>
 </body>
 </html>
