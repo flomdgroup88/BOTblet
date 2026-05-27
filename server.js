@@ -702,7 +702,21 @@ async function getOrCreateApiKey() {
       const body = await r.json();
       const keys = Array.isArray(body) ? body : (body.apiKeys || [body]);
       console.log('[real] existing keys found:', keys.length);
-      if (keys.length > 0 && keys[0].key) return { ...keys[0], address: polyWallet.address };
+      if (keys.length > 0) {
+        const k = keys[0];
+        // Polymarket может возвращать apiKey или key — нормализуем в key
+        const normalized = {
+          key:        k.key        || k.apiKey    || k.api_key    || '',
+          secret:     k.secret     || k.apiSecret || k.api_secret || '',
+          passphrase: k.passphrase || k.passPhrase || '',
+          address:    polyWallet.address,
+        };
+        if (normalized.key && normalized.secret && normalized.passphrase) {
+          console.log('[real] existing key normalized, key prefix:', normalized.key.slice(0, 8));
+          return normalized;
+        }
+        console.warn('[real] GET returned key but fields missing:', JSON.stringify(k).slice(0, 200));
+      }
     } else if (r.status === 405) {
       console.log('[real] GET /auth/api-key → 405 (not supported), skipping to POST');
     } else {
@@ -722,9 +736,6 @@ async function getOrCreateApiKey() {
     console.log('[real] POST /auth/api-key HTTP', r2.status, txt2.slice(0, 300));
     if (!r2.ok) {
       if (r2.status === 400) {
-        // Wallet not registered on Polymarket. Fix: go to app.polymarket.com,
-        // connect this wallet, open Settings → API Keys → Create, then set
-        // POLY_API_KEY / POLY_API_SECRET / POLY_PASSPHRASE in Railway env vars.
         throw new Error(
           `Wallet ${polyWallet.address} is not registered on Polymarket (HTTP 400). ` +
           'Fix: go to app.polymarket.com → Settings → API Keys → Create, ' +
@@ -733,8 +744,22 @@ async function getOrCreateApiKey() {
       }
       throw new Error(`create api-key failed: HTTP ${r2.status} — ${txt2}`);
     }
-    const creds = JSON.parse(txt2);
-    return { ...creds, address: polyWallet.address };
+    const raw2 = JSON.parse(txt2);
+    console.log('[real] POST /auth/api-key response fields:', Object.keys(raw2).join(','));
+    // Polymarket возвращает apiKey (не key) — нормализуем
+    const creds = {
+      key:        raw2.key        || raw2.apiKey    || raw2.api_key    || '',
+      secret:     raw2.secret     || raw2.apiSecret || raw2.api_secret || '',
+      passphrase: raw2.passphrase || raw2.passPhrase || '',
+      address:    polyWallet.address,
+    };
+    if (!creds.key || !creds.secret || !creds.passphrase) {
+      throw new Error(`POST /auth/api-key returned incomplete creds. Fields: ${Object.keys(raw2).join(',')}. ` +
+        'Fix: set POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE in Railway env vars manually ' +
+        '(go to app.polymarket.com → Settings → API Keys → Create).');
+    }
+    console.log('[real] new API key created, prefix:', creds.key.slice(0, 8));
+    return creds;
   } catch (e) {
     console.error('[real] POST /auth/api-key exception:', e.message);
     throw e;
@@ -838,6 +863,7 @@ async function cancelClobOrder(orderId) {
 }
 
 /** Fetch real USDC balance from the CLOB API. */
+let _balanceFail401Count = 0;
 async function fetchRealBalance() {
   if (!polyWallet || !polyApiCreds) return null;
   try {
@@ -852,10 +878,30 @@ async function fetchRealBalance() {
     if (!res.ok) {
       const txt = await res.text().catch(() => '');
       console.warn(`[real] balance-allowance HTTP ${res.status}: ${txt.slice(0, 200)}`);
+      if (res.status === 401) {
+        _balanceFail401Count++;
+        console.warn(`[real] 401 count=${_balanceFail401Count}. API key prefix: "${(polyApiCreds.key || '').slice(0,8)}..."`);
+        console.warn('[real] Если ключ не работает → добавь POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE в Railway env vars');
+        console.warn('[real] (app.polymarket.com → Settings → API Keys → Create)');
+        // После 3 неудач — пробуем переполучить ключ
+        if (_balanceFail401Count >= 3 && !process.env.POLY_API_KEY) {
+          _balanceFail401Count = 0;
+          console.log('[real] Попытка переполучить API key...');
+          try {
+            polyApiCreds = await getOrCreateApiKey();
+            console.log('[real] Новый ключ получен, prefix:', polyApiCreds.key.slice(0, 8));
+          } catch (e) {
+            console.error('[real] Не удалось переполучить ключ:', e.message);
+          }
+        }
+      }
       return null;
     }
+    _balanceFail401Count = 0;
     const d = await res.json();
-    const b = parseFloat(d.balance ?? d.USDC ?? d.usdc ?? 0);
+    // Polymarket может возвращать разные поля
+    const b = parseFloat(d.balance ?? d.USDC ?? d.usdc ?? d.availableBalance ?? 0);
+    console.log(`[real] USDC balance fetched: $${b.toFixed(2)} (fields: ${Object.keys(d).join(',')})`);
     return isNaN(b) ? null : b;
   } catch (e) {
     console.warn('[real] fetchRealBalance error:', e.message);
@@ -941,17 +987,20 @@ async function initPolyWalletWithRetry(attempt = 1) {
   }
 }
 
-// Periodically refresh real balance (every 30 s) and keep Momentum real account in sync
+// Periodically refresh real balance (every 30 s) and keep real accounts in sync
 setInterval(async () => {
   if (!REAL_TRADING || !polyWallet || !polyApiCreds) return;
   const b = await fetchRealBalance();
   if (b !== null) {
     realBalance = b;
-    const mom = STRATEGIES.momentum;
-    // Only overwrite balance when no real position is open
-    if (mom && !mom.real.open && !mom.pendingReal) {
-      mom.real.balance = b;
+    // Sync ALL strategy real accounts when no position open
+    for (const id in STRATEGIES) {
+      const s = STRATEGIES[id];
+      if (!s.real.open && !s.pendingReal) {
+        s.real.balance = b;
+      }
     }
+    saveState();
   }
 }, 30_000);
 
