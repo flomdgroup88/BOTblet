@@ -566,9 +566,10 @@ async function refreshChainlinkPrice() {
 // Only active when REAL_TRADING=true and POLY_PRIVATE_KEY is set.
 // Only the Momentum strategy places real orders; all others stay in simulation.
 
-let polyWallet   = null;   // ethers.Wallet derived from POLY_PRIVATE_KEY
-let polyApiCreds = null;   // { key, secret, passphrase, address }
-let realBalance  = null;   // latest USDC balance fetched from CLOB
+let polyWallet         = null;   // ethers.Wallet derived from POLY_PRIVATE_KEY
+let polyApiCreds       = null;   // { key, secret, passphrase, address }
+let realBalance        = null;   // latest USDC balance fetched from CLOB
+let _workingPolyAddress = null;  // address that actually authenticates against CLOB (set by autodetectAuth)
 
 /** EIP-712 domain for CTF Exchange order signing */
 const ORDER_DOMAIN = {
@@ -671,23 +672,15 @@ function l2Headers(method, reqPath, body = '') {
   const sig       = crypto.createHmac('sha256', secretBuf).update(msg).digest('base64')
                       .replace(/\+/g, '-').replace(/\//g, '_');
 
-  // ⚠️ POLY_ADDRESS = адрес, под которым ключ зарегистрирован в БД Polymarket.
-  //
-  // КЛЮЧЕВОЕ ЗНАНИЕ (Polymarket issue #339):
-  // Когда ключ создан через UI app.polymarket.com → Settings → Разработчики,
-  // он регистрируется под PROXY-адресом (Gnosis Safe), а не под EOA.
-  // Это происходит потому, что аккаунт на Polymarket идентифицируется именно
-  // прокси-адресом — он показывается в /settings и используется как owner key'я.
-  //
-  // → Для browser-wallet юзеров (Phantom/MetaMask) с задеплоенным прокси:
-  //   POLY_ADDRESS = POLY_FUNDER (proxy)
-  //
-  // → Для plain EOA без прокси:
-  //   POLY_ADDRESS = polyWallet.address (EOA)
-  //
-  // → POLY_API_OWNER в env позволяет явно переопределить (для нестандартных сетапов).
-  const explicitOwner = process.env.POLY_API_OWNER;
-  const accountAddress = explicitOwner || POLY_FUNDER || polyWallet.address;
+  // POLY_ADDRESS resolution priority:
+  //   1) _workingPolyAddress — установлено autodetectAuth(), уже доказало что работает
+  //   2) POLY_API_OWNER env — явный override
+  //   3) POLY_FUNDER — для proxy/UI-keys
+  //   4) EOA — fallback
+  const accountAddress = _workingPolyAddress
+                       || process.env.POLY_API_OWNER
+                       || POLY_FUNDER
+                       || polyWallet.address;
 
   return {
     'Content-Type':    'application/json',
@@ -699,6 +692,128 @@ function l2Headers(method, reqPath, body = '') {
     'POLY_PASSPHRASE': polyApiCreds.passphrase,
   };
 }
+
+/**
+ * Автоматически определяет рабочую комбинацию (API credentials × POLY_ADDRESS)
+ * Перебирает все варианты, останавливается на первом, который вернёт 200 от
+ * /balance-allowance. Сохраняет результат в polyApiCreds и _workingPolyAddress.
+ *
+ * Возвращает массив попыток для отчёта в логи и /api/real/diagnose.
+ */
+async function autodetectAuth() {
+  console.log('[real] autodetectAuth: searching working CLOB credentials + POLY_ADDRESS...');
+  const attempts = [];
+  const EOA      = polyWallet.address;
+  const FUNDER   = POLY_FUNDER || null;
+
+  // Source 1: env credentials (если заданы)
+  const envCreds = (process.env.POLY_API_KEY && process.env.POLY_API_SECRET && process.env.POLY_PASSPHRASE)
+    ? {
+        key:        process.env.POLY_API_KEY,
+        secret:     process.env.POLY_API_SECRET,
+        passphrase: process.env.POLY_PASSPHRASE,
+        source:     'env',
+      }
+    : null;
+
+  // Source 2: derived credentials (запрашиваем у Polymarket)
+  let derivedCreds = null;
+  try {
+    const hdrs = await l1Headers('GET', '/auth/derive-api-key');
+    const r    = await fetch(`${POLY_CLOB}/auth/derive-api-key`, { method: 'GET', headers: hdrs, signal: AbortSignal.timeout(10000) });
+    if (r.ok) {
+      const d = await r.json();
+      if (d.apiKey && d.secret && d.passphrase) {
+        derivedCreds = { key: d.apiKey, secret: d.secret, passphrase: d.passphrase, source: 'derived' };
+        console.log(`[real] derived creds: ${derivedCreds.key.slice(0,8)}...`);
+      }
+    } else {
+      console.warn('[real] derive-api-key failed:', r.status);
+    }
+  } catch (e) {
+    console.warn('[real] derive-api-key exception:', e.message);
+  }
+
+  // Кандидаты адресов для POLY_ADDRESS в HMAC-заголовках
+  const addressCandidates = [];
+  if (FUNDER) addressCandidates.push({ label: 'FUNDER (proxy)', addr: FUNDER });
+  addressCandidates.push({ label: 'EOA', addr: EOA });
+
+  // Кандидаты credentials
+  const credCandidates = [];
+  if (envCreds)     credCandidates.push(envCreds);
+  if (derivedCreds && (!envCreds || derivedCreds.key !== envCreds.key)) credCandidates.push(derivedCreds);
+
+  if (credCandidates.length === 0) {
+    console.error('[real] no credentials available — neither env nor derive worked');
+    return { ok: false, attempts: [{ note: 'no credentials' }] };
+  }
+
+  // Owner для balance-allowance URL — пробуем оба варианта
+  const ownerCandidates = FUNDER ? [FUNDER, EOA] : [EOA];
+
+  // Перебираем все комбинации
+  for (const creds of credCandidates) {
+    for (const addrCand of addressCandidates) {
+      for (const owner of ownerCandidates) {
+        const ts      = String(Math.floor(Date.now() / 1000));
+        const reqPath = `/balance-allowance?asset_type=USDC&owner=${owner}`;
+        const msg     = ts + 'GET' + reqPath;
+        const sec64   = creds.secret.replace(/-/g, '+').replace(/_/g, '/');
+        const sig     = crypto.createHmac('sha256', Buffer.from(sec64, 'base64'))
+                              .update(msg).digest('base64')
+                              .replace(/\+/g, '-').replace(/\//g, '_');
+
+        try {
+          const r = await fetch(`${POLY_CLOB}${reqPath}`, {
+            method: 'GET',
+            headers: {
+              'POLY_ADDRESS':    addrCand.addr,
+              'POLY_SIGNATURE':  sig,
+              'POLY_TIMESTAMP':  ts,
+              'POLY_API_KEY':    creds.key,
+              'POLY_PASSPHRASE': creds.passphrase,
+            },
+            signal: AbortSignal.timeout(8000),
+          });
+          const txt = await r.text();
+          const attempt = {
+            creds:       `${creds.source} (${creds.key.slice(0,8)}...)`,
+            polyAddress: `${addrCand.label} ${addrCand.addr.slice(0,8)}...`,
+            urlOwner:    `${owner.slice(0,8)}...`,
+            status:      r.status,
+            ok:          r.ok,
+          };
+          attempts.push(attempt);
+
+          if (r.ok) {
+            // ПОБЕДА. Запоминаем и выходим.
+            polyApiCreds = {
+              key:        creds.key,
+              secret:     creds.secret,
+              passphrase: creds.passphrase,
+              address:    polyWallet.address,
+              source:     creds.source,
+            };
+            _workingPolyAddress = addrCand.addr;
+            const balance = parseFloat(JSON.parse(txt).balance || '0') / (creds.source === 'derived' ? 1e6 : 1);
+            console.log(`[real] ✅ FOUND WORKING AUTH: creds=${creds.source} (${creds.key.slice(0,8)}...), POLY_ADDRESS=${addrCand.label}, urlOwner=${owner.slice(0,8)}...`);
+            console.log(`[real] ✅ balance response: ${txt.slice(0,200)}`);
+            return { ok: true, attempts, working: attempt };
+          } else {
+            console.warn(`[real] ❌ ${creds.source} key + ${addrCand.label} + owner=${owner.slice(0,8)}... → ${r.status}`);
+          }
+        } catch (e) {
+          attempts.push({ creds: creds.source, polyAddress: addrCand.label, error: e.message });
+        }
+      }
+    }
+  }
+
+  console.error('[real] autodetectAuth: НИ ОДНА комбинация не сработала. Все варианты — 401.');
+  return { ok: false, attempts };
+}
+
 
 /**
  * Fetch or create an API key pair for the current wallet.
@@ -980,10 +1095,23 @@ async function initPolyWallet() {
     console.log(`[real] wallet address : ${polyWallet.address}`);
     if (POLY_FUNDER) console.log(`[real] funder address : ${POLY_FUNDER}`);
     polyApiCreds = await getOrCreateApiKey();
-    console.log(`[real] API key        : ${polyApiCreds.key}`);
-    // Логируем какой адрес будет использован в L2 заголовках
-    const l2Addr = process.env.POLY_API_OWNER || POLY_FUNDER || polyWallet.address;
-    console.log(`[real] L2 POLY_ADDRESS: ${l2Addr} ${POLY_FUNDER && l2Addr === POLY_FUNDER ? '(proxy = владелец ключа)' : '(EOA)'}`);
+    console.log(`[real] API key (initial): ${polyApiCreds.key}`);
+
+    // ─── AUTO-DETECT WORKING AUTH ────────────────────────────────────────────
+    // Перебираем все комбинации (env-keys + EOA, env-keys + FUNDER, derived + EOA,
+    // derived + FUNDER) пока не найдём ту, что даёт 200 от /balance-allowance.
+    // Результат записывается в polyApiCreds и _workingPolyAddress.
+    const auto = await autodetectAuth();
+    if (auto.ok) {
+      console.log(`[real] ✅ AUTH WORKING — все последующие запросы будут идти с этим набором`);
+      console.log(`[real] active creds source: ${polyApiCreds.source || 'env'}`);
+      console.log(`[real] active POLY_ADDRESS: ${_workingPolyAddress}`);
+    } else {
+      console.error('[real] ❌ AUTO-DETECT НЕ НАШЁЛ РАБОЧУЮ КОМБИНАЦИЮ. Реальная торговля невозможна.');
+      console.error('[real] Все попытки:');
+      auto.attempts.forEach((a, i) => console.error(`  ${i+1}. ${JSON.stringify(a)}`));
+      console.error('[real] Возможные причины: гео-блок Railway IP / EOA не зарегистрирован на Polymarket / необходимо подписать ToS через UI');
+    }
     realBalance  = await fetchRealBalance();
     if (realBalance !== null) {
       console.log(`[real] USDC balance   : $${realBalance.toFixed(2)}`);
@@ -1624,6 +1752,21 @@ app.post('/api/real/cancel', async (_, res) => {
   res.json({ ok: true, cancelledOrderId: mom.real.open.realOrderId });
 });
 
+// GET /api/real/redetect — manually re-run autodetectAuth (без рестарта).
+// Полезно после смены env vars в Railway, чтобы не ждать передеплой.
+app.get('/api/real/redetect', async (_, res) => {
+  if (!polyWallet) return res.status(400).json({ error: 'polyWallet not initialized' });
+  _workingPolyAddress = null;  // сбрасываем
+  const result = await autodetectAuth();
+  res.json({
+    ok:                  result.ok,
+    workingPolyAddress:  _workingPolyAddress,
+    activeApiKey:        polyApiCreds?.key,
+    activeCredsSource:   polyApiCreds?.source,
+    attempts:            result.attempts,
+  });
+});
+
 // POST /api/real/close-now — immediately close real position at current mid price
 app.post('/api/real/close-now', async (_, res) => {
   const mom = STRATEGIES.momentum;
@@ -1649,15 +1792,70 @@ app.get('/api/real/diagnose', async (_, res) => {
       POLY_PASSPHRASE:   process.env.POLY_PASSPHRASE ? `set (${process.env.POLY_PASSPHRASE.length} chars)` : 'not set',
       POLY_API_OWNER:    process.env.POLY_API_OWNER || 'not set',
     },
-    wallet:       polyWallet ? polyWallet.address : null,
-    walletReady:  !!(polyWallet && polyApiCreds),
-    apiKey:       polyApiCreds ? polyApiCreds.key : null,
+    wallet:              polyWallet ? polyWallet.address : null,
+    walletReady:         !!(polyWallet && polyApiCreds),
+    activeApiKey:        polyApiCreds ? polyApiCreds.key : null,
+    activeCredsSource:   polyApiCreds ? (polyApiCreds.source || 'env') : null,
+    workingPolyAddress:  _workingPolyAddress || '(not detected — no working combination)',
     tests: {},
   };
 
   if (!polyWallet || !polyApiCreds) {
     report.error = 'wallet/creds not initialized — check Railway env vars';
     return res.json(report);
+  }
+
+  // ─── РЕШАЮЩИЙ ТЕСТ ────────────────────────────────────────────────────────
+  // Берём credentials, которые Polymarket САМ возвращает для текущего EOA через
+  // GET /auth/derive-api-key (на 100% принадлежат этому EOA), и делаем balance-allowance
+  // с ними. Если этот тест пройдёт, а balanceAllowance с env-ключами — нет, значит
+  // ключи в env принадлежат ДРУГОМУ кошельку.
+  try {
+    // 1. derive credentials от текущего EOA
+    const l1 = await l1Headers('GET', '/auth/derive-api-key');
+    const r1 = await fetch(`${POLY_CLOB}/auth/derive-api-key`, { method: 'GET', headers: l1, signal: AbortSignal.timeout(10000) });
+    const derived = await r1.json();
+
+    if (!derived.apiKey) {
+      report.tests.derivedKeyTest = { skipped: true, reason: 'derive failed', response: derived };
+    } else {
+      // 2. вручную собираем L2 headers с derived креденшалами для balance-allowance
+      const ts      = String(Math.floor(Date.now() / 1000));
+      const reqPath = `/balance-allowance?asset_type=USDC&owner=${polyWallet.address}`;
+      const msg     = ts + 'GET' + reqPath;
+      const sec64   = derived.secret.replace(/-/g, '+').replace(/_/g, '/');
+      const sig     = crypto.createHmac('sha256', Buffer.from(sec64, 'base64'))
+                            .update(msg).digest('base64')
+                            .replace(/\+/g, '-').replace(/\//g, '_');
+
+      const r2 = await fetch(`${POLY_CLOB}${reqPath}`, {
+        method: 'GET',
+        headers: {
+          'POLY_ADDRESS':    polyWallet.address,
+          'POLY_SIGNATURE':  sig,
+          'POLY_TIMESTAMP':  ts,
+          'POLY_API_KEY':    derived.apiKey,
+          'POLY_PASSPHRASE': derived.passphrase,
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+      const txt = await r2.text();
+      let parsed; try { parsed = JSON.parse(txt); } catch { parsed = txt; }
+
+      report.tests.derivedKeyTest = {
+        derivedApiKey:    derived.apiKey,
+        envApiKey:        polyApiCreds.key,
+        keysMatch:        derived.apiKey === polyApiCreds.key,
+        status:           r2.status,
+        ok:               r2.ok,
+        response:         parsed,
+        diagnosis:        r2.ok
+          ? '✅ DERIVED ключ работает! Значит env-ключи (' + polyApiCreds.key + ') принадлежат ДРУГОМУ кошельку. Поставь в Railway: POLY_API_KEY=' + derived.apiKey + ', POLY_API_SECRET=' + derived.secret + ', POLY_PASSPHRASE=' + derived.passphrase
+          : '❌ Даже DERIVED ключ возвращает ' + r2.status + '. Значит проблема не в ключах, а в чём-то ещё (HMAC формат / EOA не зарегистрирован на Polymarket / гео-блок).',
+      };
+    }
+  } catch (e) {
+    report.tests.derivedKeyTest = { error: e.message };
   }
 
   // Test 1: GET /balance-allowance с PROXY (правильный вариант для UI-keys)
