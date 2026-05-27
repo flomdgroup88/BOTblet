@@ -658,9 +658,13 @@ function l2Headers(method, reqPath, body = '') {
   const secret64  = polyApiCreds.secret.replace(/-/g, '+').replace(/_/g, '/');
   const secretBuf = Buffer.from(secret64, 'base64');
   const sig       = crypto.createHmac('sha256', secretBuf).update(msg).digest('base64');
+  // ⚠️ L2: POLY_ADDRESS must be the account that OWNS the API key.
+  // If POLY_FUNDER is set, the API key belongs to the funder wallet — use it here.
+  // For pure EOA setups (no funder), the EOA itself owns the key.
+  const accountAddress = POLY_FUNDER || polyWallet.address;
   return {
     'Content-Type':    'application/json',
-    'POLY_ADDRESS':    polyWallet.address,  // всегда EOA-подписант
+    'POLY_ADDRESS':    accountAddress,
     'POLY_SIGNATURE':  sig,
     'POLY_TIMESTAMP':  ts,
     'POLY_NONCE':      '0',
@@ -909,6 +913,8 @@ async function initPolyWallet() {
       }
     } else {
       console.warn('[real] could not fetch USDC balance — check API creds');
+      // Don't throw here; wallet is still usable for order signing even if balance fetch fails.
+      // The balance will be retried every 30 s by the periodic refresh.
     }
   } catch (e) {
     console.error('[real] init failed:', e.message);
