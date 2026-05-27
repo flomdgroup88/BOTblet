@@ -551,7 +551,7 @@ async function l1Headers(method, reqPath, body = '') {
   const sig = await polyWallet.signMessage(ts + method + reqPath + body);
   return {
     'Content-Type':   'application/json',
-    'POLY_ADDRESS':   polyWallet.address,
+    'POLY_ADDRESS':   POLY_FUNDER || polyWallet.address,  // аккаунт на полимаркете (фандер/прокси)
     'POLY_SIGNATURE': sig,
     'POLY_TIMESTAMP': ts,
     'POLY_NONCE':     '0',
@@ -569,7 +569,7 @@ function l2Headers(method, reqPath, body = '') {
   const sig       = crypto.createHmac('sha256', secretBuf).update(msg).digest('base64');
   return {
     'Content-Type':    'application/json',
-    'POLY_ADDRESS':    polyApiCreds.address,
+    'POLY_ADDRESS':    POLY_FUNDER || polyApiCreds.address,  // аккаунт на полимаркете (фандер/прокси)
     'POLY_SIGNATURE':  sig,
     'POLY_TIMESTAMP':  ts,
     'POLY_NONCE':      '0',
@@ -601,7 +601,7 @@ async function getOrCreateApiKey() {
     if (r.ok) {
       const body = await r.json();
       const keys = Array.isArray(body) ? body : (body.apiKeys || [body]);
-      if (keys.length > 0 && keys[0].key) return { ...keys[0], address: polyWallet.address };
+      if (keys.length > 0 && keys[0].key) return { ...keys[0], address: POLY_FUNDER || polyWallet.address };
     }
   } catch (_) { /* fall through to creation */ }
 
@@ -610,7 +610,7 @@ async function getOrCreateApiKey() {
   const r2   = await fetch(`${POLY_CLOB}/auth/api-key`, { method: 'POST', headers: hdrs, signal: AbortSignal.timeout(10000) });
   if (!r2.ok) throw new Error(`create api-key failed: HTTP ${r2.status} — ${await r2.text()}`);
   const creds = await r2.json();
-  return { ...creds, address: polyWallet.address };
+  return { ...creds, address: POLY_FUNDER || polyWallet.address };
 }
 
 /**
@@ -719,11 +719,18 @@ async function fetchRealBalance() {
       method: 'GET', headers: hdrs,
       signal: AbortSignal.timeout(8000),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      console.warn(`[real] balance-allowance HTTP ${res.status}: ${txt.slice(0, 200)}`);
+      return null;
+    }
     const d = await res.json();
     const b = parseFloat(d.balance ?? d.USDC ?? d.usdc ?? 0);
     return isNaN(b) ? null : b;
-  } catch (_) { return null; }
+  } catch (e) {
+    console.warn('[real] fetchRealBalance error:', e.message);
+    return null;
+  }
 }
 
 /** Get the status of a specific order. */
@@ -757,6 +764,7 @@ async function initPolyWallet() {
   try {
     polyWallet   = new ethers.Wallet(POLY_PK);
     console.log(`[real] wallet address : ${polyWallet.address}`);
+    if (POLY_FUNDER) console.log(`[real] funder address : ${POLY_FUNDER}`);
     polyApiCreds = await getOrCreateApiKey();
     console.log(`[real] API key        : ${polyApiCreds.key}`);
     realBalance  = await fetchRealBalance();
