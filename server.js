@@ -543,18 +543,47 @@ const ORDER_TYPES = {
 };
 
 /**
- * L1 auth headers (personal_sign).
+ * EIP-712 domain and types for Polymarket CLOB L1 authentication.
+ * Must match the official clob-client exactly.
+ */
+const CLOB_AUTH_DOMAIN = {
+  name:    'ClobAuthDomain',
+  version: '1',
+  chainId: POLY_CHAIN_ID,   // 137
+};
+
+const CLOB_AUTH_TYPES = {
+  ClobAuth: [
+    { name: 'address',   type: 'address' },
+    { name: 'timestamp', type: 'string'  },
+    { name: 'nonce',     type: 'int256'  },
+    { name: 'message',   type: 'string'  },
+  ],
+};
+
+/**
+ * L1 auth headers (EIP-712 signTypedData on ClobAuthDomain).
  * Required for: creating / fetching API keys via /auth/api-key.
  */
 async function l1Headers(method, reqPath, body = '') {
-  const ts  = String(Math.floor(Date.now() / 1000));
-  const sig = await polyWallet.signMessage(ts + method + reqPath + body);
+  const ts    = String(Math.floor(Date.now() / 1000));
+  const nonce = 0;
+  const sig   = await polyWallet.signTypedData(
+    CLOB_AUTH_DOMAIN,
+    CLOB_AUTH_TYPES,
+    {
+      address:   polyWallet.address,
+      timestamp: ts,
+      nonce,
+      message:   'This message attests that I control the given wallet',
+    }
+  );
   return {
     'Content-Type':   'application/json',
-    'POLY_ADDRESS':   polyWallet.address,  // L1: всегда EOA — Polymarket проверяет что sig = recover(POLY_ADDRESS)
+    'POLY_ADDRESS':   polyWallet.address,
     'POLY_SIGNATURE': sig,
     'POLY_TIMESTAMP': ts,
-    'POLY_NONCE':     '0',
+    'POLY_NONCE':     String(nonce),
   };
 }
 
@@ -668,7 +697,7 @@ async function buildSignedOrder(tokenId, side, size, price) {
     nonce:         0n,
     feeRateBps:    0n,
     side:          isBuy ? 0 : 1,
-    signatureType: 2,  // 2 = Gnosis Safe (браузер-кошелёк)
+    signatureType: 0,  // 0 = EOA (plain private key wallet)
   };
 
   const signature = await polyWallet.signTypedData(ORDER_DOMAIN, ORDER_TYPES, orderStruct);
@@ -685,7 +714,7 @@ async function buildSignedOrder(tokenId, side, size, price) {
     nonce:         '0',
     feeRateBps:    '0',
     side,
-    signatureType: 2,  // было 0
+    signatureType: 0,  // 0 = EOA
     signature,
   };
 }
