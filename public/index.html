@@ -492,6 +492,18 @@ table.log tr:hover td { background: var(--bg3); }
 
 </div>
 
+<!-- REAL TRADING STATUS BANNER -->
+<div id="real-banner" style="display:none;padding:8px 16px;background:rgba(255,136,51,.08);border-top:1px solid rgba(255,136,51,.2);border-bottom:1px solid rgba(255,136,51,.2);">
+  <span style="font-size:10px;color:var(--warn);letter-spacing:1px;">⚠ REAL TRADING: </span>
+  <span id="real-banner-txt" style="font-size:10px;color:var(--tx);">инициализация...</span>
+</div>
+<div id="real-ok-banner" style="display:none;padding:8px 16px;background:rgba(0,232,122,.06);border-top:1px solid rgba(0,232,122,.15);border-bottom:1px solid rgba(0,232,122,.15);">
+  <span style="font-size:10px;color:var(--up);letter-spacing:1px;">✓ REAL TRADING ACTIVE — </span>
+  <span id="real-wallet-addr" style="font-size:10px;color:var(--tx3);">кошелёк подключён</span>
+  <span style="font-size:10px;color:var(--tx3);margin-left:16px;">Баланс USDC: </span>
+  <span id="real-usdc-bal" style="font-size:10px;color:var(--tx2);">—</span>
+</div>
+
 <!-- STRATEGY CARDS -->
 <div class="strat-grid" id="strat-grid">
   <!-- injected by JS -->
@@ -653,6 +665,24 @@ function updateAll(d) {
   $('total-wr-bar').style.width = (wrPct * 100) + '%';
   $('total-wr-pct').textContent = totalTrades ? (wrPct * 100).toFixed(0) + '%' : '—';
 
+  // Real trading banner
+  if (d.realTrading) {
+    const rt = d.realTrading;
+    if (rt.enabled && rt.ready) {
+      $('real-banner').style.display    = 'none';
+      $('real-ok-banner').style.display = '';
+      if (rt.wallet) $('real-wallet-addr').textContent = rt.wallet.slice(0,6) + '…' + rt.wallet.slice(-4) + ' (EOA)';
+      $('real-usdc-bal').textContent = rt.balance !== null ? '$' + fmt2(rt.balance) : '—';
+    } else if (rt.enabled && !rt.ready) {
+      $('real-banner').style.display    = '';
+      $('real-ok-banner').style.display = 'none';
+      $('real-banner-txt').textContent  = 'кошелёк инициализируется… проверь Railway Logs если долго';
+    } else {
+      $('real-banner').style.display    = 'none';
+      $('real-ok-banner').style.display = 'none';
+    }
+  }
+
   // Strategy cards
   updateStratCards(d.strats, d.poly, d.realTrading);
 
@@ -668,15 +698,18 @@ function updateAll(d) {
 // ─── STRATEGY CARDS ───────────────────────────────────────────────────────────
 const renderedCards = new Set();
 
-function acctPanelHtml(id, mode, label, isLocked) {
-  const lockBit = isLocked ? `<span class="lock-badge" title="Настрой REAL_TRADING и POLY_PRIVATE_KEY в Railway env">🔒 нет кошелька</span>` : `<button id="stgl-${id}-${mode}" class="toggle-btn off" onclick="toggleAcct('${id}','${mode}')">OFF</button>`;
+function acctPanelHtml(id, mode, label) {
+  const lockBadge = mode === 'real'
+    ? `<span id="slock-${id}-real" class="lock-badge" title="Кошелёк не готов: проверь REAL_TRADING=true и POLY_PRIVATE_KEY в Railway env" style="display:none;">🔒 нет кошелька</span>`
+    : '';
   return `
     <div class="acct-panel acct-${mode}" id="apanel-${id}-${mode}">
       <div class="acct-header">
         <span class="acct-label">${label}</span>
         <div style="display:flex;gap:5px;align-items:center;">
           <button class="reset-btn" onclick="resetAcct('${id}','${mode}')">сброс</button>
-          ${lockBit}
+          ${lockBadge}
+          <button id="stgl-${id}-${mode}" class="toggle-btn off" onclick="toggleAcct('${id}','${mode}')">OFF</button>
         </div>
       </div>
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:6px;">
@@ -696,7 +729,6 @@ function updateStratCards(strats, polyData, realTrading) {
   const grid = $('strat-grid');
   for (const [id, s] of Object.entries(strats)) {
     if (!renderedCards.has(id)) {
-      const realLocked = !realTrading.ready;
       const card = document.createElement('div');
       card.id = 'scard-' + id;
       card.className = 'strat-card';
@@ -706,8 +738,8 @@ function updateStratCards(strats, polyData, realTrading) {
           <div id="spos-${id}" style="font-size:9px;"></div>
         </div>
         <div class="acct-panels">
-          ${acctPanelHtml(id, 'demo', '▣ DEMO', false)}
-          ${acctPanelHtml(id, 'real', '◈ REAL', realLocked)}
+          ${acctPanelHtml(id, 'demo', '▣ DEMO')}
+          ${acctPanelHtml(id, 'real', '◈ REAL')}
         </div>`;
       grid.appendChild(card);
       renderedCards.add(id);
@@ -722,7 +754,15 @@ function updateStratCards(strats, polyData, realTrading) {
 
       panel.className = `acct-panel acct-${mode}${enabled ? ' acct-active' : ''}${acct.open ? ' has-pos' : ''}`;
 
-      if (tgl) {
+      // Dynamic lock/unlock for REAL panel based on wallet readiness
+      if (mode === 'real') {
+        const lockEl = $(`slock-${id}-real`);
+        const walletReady = realTrading && realTrading.ready;
+        if (lockEl) lockEl.style.display = walletReady ? 'none' : '';
+        if (tgl)    tgl.style.display    = walletReady ? '' : 'none';
+      }
+
+      if (tgl && (mode === 'demo' || (realTrading && realTrading.ready))) {
         tgl.className = 'toggle-btn ' + (enabled ? 'on' : 'off');
         tgl.textContent = enabled ? 'ON' : 'OFF';
       }
