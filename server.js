@@ -672,10 +672,14 @@ function l2Headers(method, reqPath, body = '') {
   const explicitOwner = process.env.POLY_API_OWNER;
   let accountAddress;
   if (explicitOwner) {
+    // Явный override — самый высокий приоритет
     accountAddress = explicitOwner;
   } else if (process.env.POLY_API_KEY) {
-    // Pre-configured via env → ключ принадлежит EOA (создан на polymarket.com под EOA)
-    accountAddress = polyWallet.address;
+    // Ключ задан вручную через Railway env.
+    // Если POLY_FUNDER задан — ключ был создан на polymarket.com через Safe/Gnosis UI,
+    // значит POLY_ADDRESS должен быть FUNDER (иначе CLOB вернёт 401).
+    // Если фандера нет — ключ создан под чистым EOA.
+    accountAddress = POLY_FUNDER || polyWallet.address;
   } else {
     // Автодеривация → ключ создан от имени фандера (если он есть)
     accountAddress = POLY_FUNDER || polyWallet.address;
@@ -967,7 +971,7 @@ async function initPolyWallet() {
     polyApiCreds = await getOrCreateApiKey();
     console.log(`[real] API key        : ${polyApiCreds.key}`);
     // Логируем какой адрес будет использован в L2 заголовках
-    const l2Addr = process.env.POLY_API_OWNER || (process.env.POLY_API_KEY ? polyWallet.address : (POLY_FUNDER || polyWallet.address));
+    const l2Addr = process.env.POLY_API_OWNER || (POLY_FUNDER || polyWallet.address);
     console.log(`[real] L2 POLY_ADDRESS: ${l2Addr} (владелец ключа)`);
     realBalance  = await fetchRealBalance();
     if (realBalance !== null) {
@@ -1102,9 +1106,18 @@ function getStratContext() {
 }
 
 function stratOpen(s, ctx, entry, acct, isReal) {
-  const sizeUSDC = sizingByKelly(acct.balance, entry.ourProb, entry.polyPrice, s.params.kellyFrac, s.params.maxFrac);
-  if (sizeUSDC < 1)                  return;
-  if (sizeUSDC > acct.balance * 0.95) return;
+  // ── Safety guard: never size a real trade from the default $1000 placeholder ──
+  // If the USDC balance was never successfully fetched from CLOB, bail out.
+  if (isReal && REAL_TRADING && realBalance === null) {
+    console.warn(`[real] skipping OPEN — USDC balance not yet confirmed (still at default). Will retry next signal.`);
+    return;
+  }
+
+  // For real accounts, always use the live wallet balance for sizing (not stale state value)
+  const effectiveBalance = isReal && realBalance !== null ? realBalance : acct.balance;
+  const sizeUSDC = sizingByKelly(effectiveBalance, entry.ourProb, entry.polyPrice, s.params.kellyFrac, s.params.maxFrac);
+  if (sizeUSDC < 1)                       return;
+  if (sizeUSDC > effectiveBalance * 0.95) return;
 
   const isRealOrder = isReal && s.def.id === 'momentum' && !!polyWallet && !!polyApiCreds;
   const tokenId     = entry.side === 'UP' ? poly.market?.tokenIdUp : poly.market?.tokenIdDown;
@@ -1138,7 +1151,7 @@ function stratOpen(s, ctx, entry, acct, isReal) {
   acct.balance    -= sizeUSDC;
   if (isRealOrder) s.pendingReal = true;
   saveState();
-  console.log(`[${s.def.id}] ${isRealOrder ? 'REAL' : 'SIM'} OPEN ${entry.side} @ ${entry.polyPrice.toFixed(3)} size=$${sizeUSDC.toFixed(2)} | ${entry.info}`);
+  console.log(`[${s.def.id}] ${isRealOrder ? 'REAL' : 'SIM'} OPEN ${entry.side} @ ${entry.polyPrice.toFixed(3)} size=$${sizeUSDC.toFixed(2)} (balance=$${effectiveBalance.toFixed(2)}) | ${entry.info}`);
 
   // ── Place real BUY order on Polymarket CLOB (async, Momentum only) ──────────
   if (isRealOrder) {
