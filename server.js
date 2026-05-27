@@ -577,7 +577,7 @@ const CLOB_AUTH_TYPES = {
   ClobAuth: [
     { name: 'address',   type: 'address' },
     { name: 'timestamp', type: 'string'  },
-    { name: 'nonce',     type: 'int256'  },
+    { name: 'nonce',     type: 'uint256' },  // must be uint256 per official Polymarket docs
     { name: 'message',   type: 'string'  },
   ],
 };
@@ -585,15 +585,24 @@ const CLOB_AUTH_TYPES = {
 /**
  * L1 auth headers (EIP-712 signTypedData on ClobAuthDomain).
  * Required for: creating / fetching API keys via /auth/api-key.
+ *
+ * For Gnosis Safe / proxy wallets (POLY_FUNDER set):
+ *   - POLY_ADDRESS = funder (Safe/proxy) address
+ *   - EIP-712 address value = signing EOA address
+ *   - Signature = from EOA
+ * For plain EOA:
+ *   - POLY_ADDRESS = EOA address (same as signer)
  */
 async function l1Headers(method, reqPath, body = '') {
-  const ts    = String(Math.floor(Date.now() / 1000));
-  const nonce = 0;
-  const sig   = await polyWallet.signTypedData(
+  const ts          = String(Math.floor(Date.now() / 1000));
+  const nonce       = 0;
+  const polyAddress = POLY_FUNDER || polyWallet.address;  // Safe/funder or EOA
+
+  const sig = await polyWallet.signTypedData(
     CLOB_AUTH_DOMAIN,
     CLOB_AUTH_TYPES,
     {
-      address:   polyWallet.address,
+      address:   polyWallet.address,  // always the EOA signing key
       timestamp: ts,
       nonce,
       message:   'This message attests that I control the given wallet',
@@ -601,7 +610,7 @@ async function l1Headers(method, reqPath, body = '') {
   );
   return {
     'Content-Type':   'application/json',
-    'POLY_ADDRESS':   polyWallet.address,
+    'POLY_ADDRESS':   polyAddress,   // funder for Safe, EOA otherwise
     'POLY_SIGNATURE': sig,
     'POLY_TIMESTAMP': ts,
     'POLY_NONCE':     String(nonce),
@@ -718,7 +727,7 @@ async function buildSignedOrder(tokenId, side, size, price) {
     nonce:         0n,
     feeRateBps:    0n,
     side:          isBuy ? 0 : 1,
-    signatureType: 0,  // 0 = EOA (plain private key wallet)
+    signatureType: POLY_FUNDER ? 2 : 0,  // 2 = Gnosis Safe (when funder set), 0 = plain EOA
   };
 
   const signature = await polyWallet.signTypedData(ORDER_DOMAIN, ORDER_TYPES, orderStruct);
@@ -735,7 +744,7 @@ async function buildSignedOrder(tokenId, side, size, price) {
     nonce:         '0',
     feeRateBps:    '0',
     side,
-    signatureType: 0,  // 0 = EOA
+    signatureType: POLY_FUNDER ? 2 : 0,
     signature,
   };
 }
