@@ -1659,20 +1659,79 @@ app.get('/api/real/diagnose', async (_, res) => {
     report.tests.balanceAllowance = { error: e.message };
   }
 
-  // Test 2: parse the funder USDC on-chain (no API needed)
-  if (POLY_FUNDER) {
-    try {
-      const provider = getRpcProvider(POLYGON_RPCS[0]);
-      const USDC     = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
-      const erc20    = new ethers.Contract(USDC, ['function balanceOf(address) view returns (uint256)'], provider);
-      const raw      = await erc20.balanceOf(POLY_FUNDER);
-      report.tests.onChainBalance = {
-        funder:  POLY_FUNDER,
-        usdc:    Number(raw) / 1e6,
-      };
-    } catch (e) {
-      report.tests.onChainBalance = { error: e.message };
+  // Test 2: check USDC on EOA, proxy, and bridged USDC variant
+  try {
+    const provider  = getRpcProvider(POLYGON_RPCS[0]);
+    const USDC_NEW  = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359';  // Native USDC (Circle)
+    const USDC_BRIDGED = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';  // Bridged USDC.e
+    const erc20Abi  = ['function balanceOf(address) view returns (uint256)'];
+    const c1 = new ethers.Contract(USDC_BRIDGED, erc20Abi, provider);
+    const c2 = new ethers.Contract(USDC_NEW,     erc20Abi, provider);
+
+    const checks = {};
+    const eoa = polyWallet.address;
+    checks.EOA = { addr: eoa };
+    try { checks.EOA.usdc_bridged = Number(await c1.balanceOf(eoa)) / 1e6; } catch (e) { checks.EOA.usdc_bridged_err = e.message; }
+    try { checks.EOA.usdc_native  = Number(await c2.balanceOf(eoa)) / 1e6; } catch (e) { checks.EOA.usdc_native_err  = e.message; }
+    try { checks.EOA.code = (await provider.getCode(eoa)) === '0x' ? 'EOA (no code)' : 'contract'; } catch {}
+
+    if (POLY_FUNDER) {
+      checks.FUNDER = { addr: POLY_FUNDER };
+      try { checks.FUNDER.usdc_bridged = Number(await c1.balanceOf(POLY_FUNDER)) / 1e6; } catch (e) { checks.FUNDER.usdc_bridged_err = e.message; }
+      try { checks.FUNDER.usdc_native  = Number(await c2.balanceOf(POLY_FUNDER)) / 1e6; } catch (e) { checks.FUNDER.usdc_native_err  = e.message; }
+      try {
+        const code = await provider.getCode(POLY_FUNDER);
+        checks.FUNDER.code = code === '0x'
+          ? '⚠ NO CONTRACT — этот адрес не задеплоен. Скорее всего, это НЕ твой Polymarket прокси.'
+          : `contract (${code.length} bytes of bytecode) ✓`;
+      } catch (e) { checks.FUNDER.code_err = e.message; }
     }
+
+    report.tests.onChain = checks;
+  } catch (e) {
+    report.tests.onChain = { error: e.message };
+  }
+
+  // Test 3: try POST /auth/api-key — does Polymarket accept this wallet for trading at all?
+  try {
+    const hdrs = await l1Headers('POST', '/auth/api-key');
+    const t0   = Date.now();
+    const r    = await fetch(`${POLY_CLOB}/auth/api-key`, {
+      method: 'POST', headers: hdrs, signal: AbortSignal.timeout(10000),
+    });
+    const txt  = await r.text();
+    let parsed;
+    try { parsed = JSON.parse(txt); } catch { parsed = txt; }
+    report.tests.createApiKey = {
+      url:      `${POLY_CLOB}/auth/api-key`,
+      status:   r.status,
+      ok:       r.ok,
+      ms:       Date.now() - t0,
+      response: parsed,
+      note:     r.status === 400 || r.status === 401
+        ? 'Кошелёк не зарегистрирован в системе Polymarket. Зайди на app.polymarket.com Phantom-ом (EOA), прими ToS, создай ключ через Settings → API Keys.'
+        : (r.ok ? 'Ключ можно создать через API! Перезапиши env vars.' : 'неожиданный ответ'),
+    };
+  } catch (e) {
+    report.tests.createApiKey = { error: e.message };
+  }
+
+  // Test 4: GET /auth/derive-api-key — what key does Polymarket think you should have?
+  try {
+    const hdrs = await l1Headers('GET', '/auth/derive-api-key');
+    const r    = await fetch(`${POLY_CLOB}/auth/derive-api-key`, {
+      method: 'GET', headers: hdrs, signal: AbortSignal.timeout(10000),
+    });
+    const txt  = await r.text();
+    let parsed;
+    try { parsed = JSON.parse(txt); } catch { parsed = txt; }
+    report.tests.deriveApiKey = {
+      status:   r.status,
+      ok:       r.ok,
+      response: parsed,
+    };
+  } catch (e) {
+    report.tests.deriveApiKey = { error: e.message };
   }
 
   res.json(report);
