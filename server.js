@@ -664,29 +664,23 @@ function l2Headers(method, reqPath, body = '') {
   const sig       = crypto.createHmac('sha256', secretBuf).update(msg).digest('base64')
                       .replace(/\+/g, '-').replace(/\//g, '_');
 
-  // ⚠️ POLY_ADDRESS = адрес, который СОЗДАЛ API ключ.
+  // ⚠️ POLY_ADDRESS = адрес, под которым ключ зарегистрирован в БД Polymarket.
   //
-  // Два сценария:
-  // 1) POLY_API_KEY задан вручную через Railway env → ключ создан на polymarket.com
-  //    при подключённом EOA кошельке → POLY_ADDRESS = EOA.
+  // КЛЮЧЕВОЕ ЗНАНИЕ (Polymarket issue #339):
+  // Когда ключ создан через UI app.polymarket.com → Settings → Разработчики,
+  // он регистрируется под PROXY-адресом (Gnosis Safe), а не под EOA.
+  // Это происходит потому, что аккаунт на Polymarket идентифицируется именно
+  // прокси-адресом — он показывается в /settings и используется как owner key'я.
   //
-  // 2) Ключ автодеривован через POST /auth/api-key с L1 от имени фандера (POLY_FUNDER)
-  //    → POLY_ADDRESS = POLY_FUNDER.
+  // → Для browser-wallet юзеров (Phantom/MetaMask) с задеплоенным прокси:
+  //   POLY_ADDRESS = POLY_FUNDER (proxy)
   //
-  // POLY_API_OWNER в env позволяет явно переопределить (для нестандартных сетапов).
+  // → Для plain EOA без прокси:
+  //   POLY_ADDRESS = polyWallet.address (EOA)
+  //
+  // → POLY_API_OWNER в env позволяет явно переопределить (для нестандартных сетапов).
   const explicitOwner = process.env.POLY_API_OWNER;
-  let accountAddress;
-  if (explicitOwner) {
-    // Явный override — самый высокий приоритет
-    accountAddress = explicitOwner;
-  } else if (process.env.POLY_API_KEY) {
-    // Ключ задан вручную (создан через py-clob-client с EOA приватным ключом).
-    // Ключ принадлежит EOA → POLY_ADDRESS = EOA.
-    accountAddress = polyWallet.address;
-  } else {
-    // Автодеривация: L1 создаёт ключ под EOA → L2 тоже EOA.
-    accountAddress = polyWallet.address;
-  }
+  const accountAddress = explicitOwner || POLY_FUNDER || polyWallet.address;
 
   return {
     'Content-Type':    'application/json',
@@ -827,7 +821,7 @@ async function buildSignedOrder(tokenId, side, size, price) {
     nonce:         0n,
     feeRateBps:    0n,
     side:          isBuy ? 0 : 1,
-    signatureType: POLY_FUNDER ? 1 : 0,  // 1 = Polymarket proxy wallet, 0 = plain EOA
+    signatureType: POLY_FUNDER ? 2 : 0,  // 2 = Gnosis Safe proxy, 0 = plain EOA
   };
 
   const signature = await polyWallet.signTypedData(ORDER_DOMAIN, ORDER_TYPES, orderStruct);
@@ -844,7 +838,7 @@ async function buildSignedOrder(tokenId, side, size, price) {
     nonce:         '0',
     feeRateBps:    '0',
     side,
-    signatureType: POLY_FUNDER ? 1 : 0,
+    signatureType: POLY_FUNDER ? 2 : 0,  // 2 = Gnosis Safe proxy (Polymarket browser-wallet flow), 0 = plain EOA
     signature,
   };
 }
@@ -893,11 +887,10 @@ let _balanceFail401Count = 0;
 async function fetchRealBalance() {
   if (!polyWallet || !polyApiCreds) return null;
   try {
-    // POLY_ADDRESS (владелец API ключа) — всегда EOA (polyWallet.address),
-    // если явно не переопределён POLY_API_OWNER.
-    // POLY_FUNDER — это Polymarket proxy контракт, он НЕ является владельцем API ключа.
-    // Баланс USDC запрашиваем от имени того же адреса, что в POLY_ADDRESS L2.
-    const owner   = process.env.POLY_API_OWNER || polyWallet.address;
+    // Деньги и позиции лежат на PROXY-контракте (POLY_FUNDER), а не на EOA.
+    // Также POLY_ADDRESS в L2-заголовке должен совпадать с этим адресом
+    // (см. l2Headers — ключ зарегистрирован под proxy).
+    const owner   = POLY_FUNDER || polyWallet.address;
     const reqPath = `/balance-allowance?asset_type=USDC&owner=${owner}`;
     const hdrs    = l2Headers('GET', reqPath);
     const res     = await fetch(`${POLY_CLOB}${reqPath}`, {
@@ -977,8 +970,8 @@ async function initPolyWallet() {
     polyApiCreds = await getOrCreateApiKey();
     console.log(`[real] API key        : ${polyApiCreds.key}`);
     // Логируем какой адрес будет использован в L2 заголовках
-    const l2Addr = process.env.POLY_API_OWNER || polyWallet.address;
-    console.log(`[real] L2 POLY_ADDRESS: ${l2Addr} (владелец ключа)`);
+    const l2Addr = process.env.POLY_API_OWNER || POLY_FUNDER || polyWallet.address;
+    console.log(`[real] L2 POLY_ADDRESS: ${l2Addr} ${POLY_FUNDER && l2Addr === POLY_FUNDER ? '(proxy = владелец ключа)' : '(EOA)'}`);
     realBalance  = await fetchRealBalance();
     if (realBalance !== null) {
       console.log(`[real] USDC balance   : $${realBalance.toFixed(2)}`);
@@ -1630,9 +1623,9 @@ app.get('/api/real/diagnose', async (_, res) => {
     return res.json(report);
   }
 
-  // Test 1: GET /balance-allowance (L2 HMAC)
+  // Test 1: GET /balance-allowance с PROXY (правильный вариант для UI-keys)
   try {
-    const owner   = process.env.POLY_API_OWNER || polyWallet.address; // EOA = владелец API ключа
+    const owner   = POLY_FUNDER || polyWallet.address;
     const reqPath = `/balance-allowance?asset_type=USDC&owner=${owner}`;
     const hdrs    = l2Headers('GET', reqPath);
     const t0      = Date.now();
@@ -1659,6 +1652,34 @@ app.get('/api/real/diagnose', async (_, res) => {
     };
   } catch (e) {
     report.tests.balanceAllowance = { error: e.message };
+  }
+
+  // Test 1b: same запрос, но временно подменив POLY_ADDRESS на EOA — чтобы было видно
+  // какой адрес Polymarket принимает. Если этот тест проходит, а balanceAllowance — нет,
+  // значит ключ зарегистрирован под EOA, а не под proxy.
+  if (POLY_FUNDER) {
+    try {
+      const savedOwner = process.env.POLY_API_OWNER;
+      process.env.POLY_API_OWNER = polyWallet.address;  // временно
+      const reqPath = `/balance-allowance?asset_type=USDC&owner=${polyWallet.address}`;
+      const hdrs    = l2Headers('GET', reqPath);
+      // восстанавливаем сразу
+      if (savedOwner === undefined) delete process.env.POLY_API_OWNER;
+      else process.env.POLY_API_OWNER = savedOwner;
+      const r   = await fetch(`${POLY_CLOB}${reqPath}`, { method: 'GET', headers: hdrs, signal: AbortSignal.timeout(8000) });
+      const txt = await r.text();
+      let parsed;
+      try { parsed = JSON.parse(txt); } catch { parsed = txt; }
+      report.tests.balanceAllowance_asEOA = {
+        status: r.status, ok: r.ok, response: parsed,
+        sentPolyAddress: hdrs.POLY_ADDRESS,
+        note: r.ok
+          ? 'Ключ зарегистрирован под EOA. Поставь POLY_API_OWNER=<EOA> в env.'
+          : 'И с EOA тоже 401 — ключ либо неверен, либо требует чего-то ещё.',
+      };
+    } catch (e) {
+      report.tests.balanceAllowance_asEOA = { error: e.message };
+    }
   }
 
   // Test 2: check USDC on EOA, proxy, and bridged USDC variant
