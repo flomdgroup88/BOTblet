@@ -756,6 +756,8 @@ async function getClobOrderStatus(orderId) {
  * Must be called AFTER initStrategies() and loadState().
  */
 async function initPolyWallet() {
+  // Диагностика — лог всегда, независимо от условий
+  console.log(`[real] initPolyWallet called. REAL_TRADING=${REAL_TRADING}, POLY_PK_set=${!!POLY_PK}, POLY_FUNDER=${POLY_FUNDER || '(none)'}`);
   if (!REAL_TRADING) {
     console.log('[real] REAL_TRADING disabled — Momentum runs in simulation');
     return;
