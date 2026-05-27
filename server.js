@@ -620,15 +620,18 @@ const CLOB_AUTH_TYPES = {
  *   - POLY_ADDRESS = EOA address (same as signer)
  */
 async function l1Headers(method, reqPath, body = '') {
-  const ts          = String(Math.floor(Date.now() / 1000));
-  const nonce       = 0;
-  const polyAddress = POLY_FUNDER || polyWallet.address;  // Safe/funder or EOA
+  const ts         = String(Math.floor(Date.now() / 1000));
+  const nonce      = 0;
+  // ⚠️ L1 auth MUST use the EOA address (polyWallet.address) — Polymarket does
+  // ecrecover(signature) and compares it to POLY_ADDRESS.
+  // POLY_FUNDER is only used in order signing (maker field), NOT here.
+  const eoaAddress = polyWallet.address;
 
   const sig = await polyWallet.signTypedData(
     CLOB_AUTH_DOMAIN,
     CLOB_AUTH_TYPES,
     {
-      address:   polyAddress,  // "I attest I control THIS wallet" = funder for Safe, EOA otherwise
+      address:   eoaAddress,
       timestamp: ts,
       nonce,
       message:   'This message attests that I control the given wallet',
@@ -636,7 +639,7 @@ async function l1Headers(method, reqPath, body = '') {
   );
   return {
     'Content-Type':   'application/json',
-    'POLY_ADDRESS':   polyAddress,
+    'POLY_ADDRESS':   eoaAddress,
     'POLY_SIGNATURE': sig,
     'POLY_TIMESTAMP': ts,
     'POLY_NONCE':     String(nonce),
@@ -693,7 +696,7 @@ async function getOrCreateApiKey() {
       const body = await r.json();
       const keys = Array.isArray(body) ? body : (body.apiKeys || [body]);
       console.log('[real] existing keys found:', keys.length);
-      if (keys.length > 0 && keys[0].key) return { ...keys[0], address: POLY_FUNDER || polyWallet.address };
+      if (keys.length > 0 && keys[0].key) return { ...keys[0], address: polyWallet.address };
     } else {
       const txt = await r.text().catch(() => '');
       console.warn('[real] GET /auth/api-key failed:', r.status, txt.slice(0, 200));
@@ -711,7 +714,7 @@ async function getOrCreateApiKey() {
     console.log('[real] POST /auth/api-key HTTP', r2.status, txt2.slice(0, 300));
     if (!r2.ok) throw new Error(`create api-key failed: HTTP ${r2.status} — ${txt2}`);
     const creds = JSON.parse(txt2);
-    return { ...creds, address: POLY_FUNDER || polyWallet.address };
+    return { ...creds, address: polyWallet.address };
   } catch (e) {
     console.error('[real] POST /auth/api-key exception:', e.message);
     throw e;
@@ -818,7 +821,9 @@ async function cancelClobOrder(orderId) {
 async function fetchRealBalance() {
   if (!polyWallet || !polyApiCreds) return null;
   try {
-    const reqPath = '/balance-allowance?asset_type=USDC';
+    // If POLY_FUNDER is set, the USDC lives there (Safe/proxy); otherwise it's in the EOA.
+    const owner   = POLY_FUNDER || polyWallet.address;
+    const reqPath = `/balance-allowance?asset_type=USDC&owner=${owner}`;
     const hdrs    = l2Headers('GET', reqPath);
     const res     = await fetch(`${POLY_CLOB}${reqPath}`, {
       method: 'GET', headers: hdrs,
