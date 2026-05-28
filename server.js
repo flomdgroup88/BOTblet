@@ -703,29 +703,47 @@ function _buildBootClient(viemWallet, sigType, funderAddress) {
 /**
  * Place an order on the Polymarket CLOB via V2 SDK.
  * Signature: { tokenId, side, size, price, orderType? }
- * - tokenId: string (Polymarket conditional token ID)
- * - side:    'BUY' | 'SELL'
- * - size:    number (in shares for limit / in USDC for market)
- * - price:   number (0.01..0.99)
+ * - tokenId:   string (Polymarket conditional token ID)
+ * - side:      'BUY' | 'SELL'
+ * - size:      for BUY → USDC to spend; for SELL → shares to sell
+ *              (V2 SDK's `size` field is always shares; we convert internally)
+ * - price:     number (0.01..0.99)
  * - orderType: 'GTC' (default) | 'FOK' | 'FAK' | 'GTD'
  */
 async function placeClobOrder({ tokenId, side, size, price, orderType = 'GTC' }) {
   if (!polyClob)          throw new Error('CLOB client not initialised — wallet/creds missing');
   if (!tokenId)           throw new Error('tokenId is required');
+  if (!price || price < 0.01 || price > 0.99) throw new Error(`invalid price: ${price}`);
+
+  // ── Critical V2 conversion ───────────────────────────────────────────────
+  // V2 SDK's `size` is base units (shares). Our internal convention passes
+  // USDC for BUY orders. Convert: shares = USDC / price.
+  // For SELL we already pass shares, leave as-is.
+  // Round to 2 decimals — Polymarket shares have 2-decimal precision.
+  const sizeShares = side === 'BUY'
+    ? Math.floor((size / price) * 100) / 100    // BUY: USDC → shares
+    : Math.floor(size * 100) / 100;             // SELL: shares as-is
+  if (sizeShares <= 0) throw new Error(`computed size is zero (size=${size}, price=${price})`);
+
+  // Marketable BUY orders have a $1 minimum on Polymarket — verify upfront
+  const dollarValue = sizeShares * price;
+  if (side === 'BUY' && dollarValue < 1.0) {
+    throw new Error(`BUY value $${dollarValue.toFixed(4)} below $1 minimum (raise balance or kellyFrac)`);
+  }
 
   const userOrder = {
     tokenID: tokenId,
     price:   price,
     side:    _mapSide(side),
-    size:    size,
+    size:    sizeShares,
   };
+  console.log(`[real] order request: ${side} ${sizeShares.toFixed(2)} shares @ $${price.toFixed(4)} = $${dollarValue.toFixed(4)} (tokenId=${tokenId.slice(0, 12)}...)`);
 
   try {
     const resp = await polyClob.createAndPostOrder(userOrder, {}, _mapOrderType(orderType));
     if (resp && (resp.error || resp.errorMsg)) {
       throw new Error(resp.errorMsg || resp.error);
     }
-    // V2 response shape: { success, errorMsg, orderID, transactionsHashes, status, takingAmount, makingAmount }
     return {
       orderID:            resp.orderID,
       status:             resp.status,
