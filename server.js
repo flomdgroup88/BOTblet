@@ -745,6 +745,21 @@ async function placeClobOrder({ tokenId, side, size, price, orderType = 'GTC' })
   };
   console.log(`[real] order request: ${side} ${sizeShares} shares @ $${price.toFixed(4)} = $${dollarValue.toFixed(4)} (tokenId=${tokenId.slice(0, 12)}...)`);
 
+  // ── Sync CLOB balance cache before SELL ──────────────────────────────────
+  // After a BUY fills, Polymarket's CLOB cache still shows 0 conditional tokens
+  // until updateBalanceAllowance is called. Without this sync, SELL returns:
+  //   CLOB 400: not enough balance / allowance: balance: 0
+  // We also re-sync COLLATERAL so the cache is fully up to date.
+  if (side === 'SELL') {
+    try {
+      await polyClob.updateBalanceAllowance({ asset_type: 'CONDITIONAL', token_id: tokenId });
+      console.log(`[real] conditional balance synced for tokenId=${tokenId.slice(0, 12)}...`);
+    } catch (syncErr) {
+      // Non-fatal: log and attempt the order anyway
+      console.warn('[real] updateBalanceAllowance (CONDITIONAL) failed — attempting SELL anyway:', syncErr.message);
+    }
+  }
+
   try {
     const resp = await polyClob.createAndPostOrder(userOrder, {}, _mapOrderType(orderType));
     if (resp && (resp.error || resp.errorMsg)) {
