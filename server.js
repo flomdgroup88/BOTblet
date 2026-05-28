@@ -710,34 +710,40 @@ function _buildBootClient(viemWallet, sigType, funderAddress) {
  * - price:     number (0.01..0.99)
  * - orderType: 'GTC' (default) | 'FOK' | 'FAK' | 'GTD'
  */
+// Polymarket order minimums (verified empirically + per docs):
+//   - Marketable BUY orders:   $1 USDC floor (caller's spend)
+//   - Resting limit orders:    5 shares minimum (BUY & SELL)
+// Since SELL orders are ALWAYS resting from our perspective (we own shares
+// already and want to exit them), every SELL must be ≥ 5 shares.
+// To guarantee we can SELL what we BUY, we enforce BUY ≥ 5 shares too.
+const POLYMARKET_MIN_SHARES = 5;
+
 async function placeClobOrder({ tokenId, side, size, price, orderType = 'GTC' }) {
   if (!polyClob)          throw new Error('CLOB client not initialised — wallet/creds missing');
   if (!tokenId)           throw new Error('tokenId is required');
   if (!price || price < 0.01 || price > 0.99) throw new Error(`invalid price: ${price}`);
 
-  // ── Critical V2 conversion ───────────────────────────────────────────────
-  // V2 SDK's `size` is base units (shares). Our internal convention passes
-  // USDC for BUY orders. Convert: shares = USDC / price.
-  // For SELL we already pass shares, leave as-is.
-  // Round to 2 decimals — Polymarket shares have 2-decimal precision.
-  const sizeShares = side === 'BUY'
-    ? Math.floor((size / price) * 100) / 100    // BUY: USDC → shares
-    : Math.floor(size * 100) / 100;             // SELL: shares as-is
-  if (sizeShares <= 0) throw new Error(`computed size is zero (size=${size}, price=${price})`);
+  // ── Convert size to shares ───────────────────────────────────────────────
+  // V2 SDK's `size` field is base units (shares). Our convention:
+  //   BUY  → caller passes USDC, we convert: shares = USDC / price
+  //   SELL → caller passes shares directly
+  // Then enforce 5-share Polymarket minimum either way.
+  let sizeShares = side === 'BUY' ? (size / price) : size;
 
-  // Marketable BUY orders have a $1 minimum on Polymarket — verify upfront
+  // Round UP to 2-decimal precision so we never undershoot the minimum
+  sizeShares = Math.ceil(sizeShares * 100) / 100;
+
+  // Polymarket floor: 5 shares per order
+  if (sizeShares < POLYMARKET_MIN_SHARES) sizeShares = POLYMARKET_MIN_SHARES;
+
   const dollarValue = sizeShares * price;
-  if (side === 'BUY' && dollarValue < 1.0) {
-    throw new Error(`BUY value $${dollarValue.toFixed(4)} below $1 minimum (raise balance or kellyFrac)`);
-  }
-
   const userOrder = {
     tokenID: tokenId,
     price:   price,
     side:    _mapSide(side),
     size:    sizeShares,
   };
-  console.log(`[real] order request: ${side} ${sizeShares.toFixed(2)} shares @ $${price.toFixed(4)} = $${dollarValue.toFixed(4)} (tokenId=${tokenId.slice(0, 12)}...)`);
+  console.log(`[real] order request: ${side} ${sizeShares} shares @ $${price.toFixed(4)} = $${dollarValue.toFixed(4)} (tokenId=${tokenId.slice(0, 12)}...)`);
 
   try {
     const resp = await polyClob.createAndPostOrder(userOrder, {}, _mapOrderType(orderType));
@@ -748,6 +754,8 @@ async function placeClobOrder({ tokenId, side, size, price, orderType = 'GTC' })
       orderID:            resp.orderID,
       status:             resp.status,
       success:            resp.success,
+      actualShares:       sizeShares,   // ← what we actually sent; SELL must use this
+      actualDollarValue:  dollarValue,  // ← real cost (BUY) / proceeds (SELL)
       transactionsHashes: resp.transactionsHashes || [],
       raw:                resp,
     };
@@ -1048,7 +1056,7 @@ function stratOpen(s, ctx, entry, acct, isReal) {
 
   // For real accounts, always use the live wallet balance for sizing (not stale state value)
   const effectiveBalance = isReal && realBalance !== null ? realBalance : acct.balance;
-  const sizeUSDC = sizingByKelly(effectiveBalance, entry.ourProb, entry.polyPrice, s.params.kellyFrac, s.params.maxFrac);
+  let sizeUSDC = sizingByKelly(effectiveBalance, entry.ourProb, entry.polyPrice, s.params.kellyFrac, s.params.maxFrac);
   if (sizeUSDC < 1)                       return;
   if (sizeUSDC > effectiveBalance * 0.95) return;
 
@@ -1059,6 +1067,29 @@ function stratOpen(s, ctx, entry, acct, isReal) {
   if (isRealOrder && !tokenId) {
     console.warn('[real] missing tokenId — skipping real entry');
     return;
+  }
+
+  // ── Real-order sizing: enforce Polymarket 5-share minimum ──────────────────
+  // If Kelly says $1.30 but at price 0.36 that's only 3.6 shares < 5, bump the
+  // trade up to 5 shares so we can SELL it later (every SELL needs ≥5 shares).
+  // This may push the trade above maxFrac but it's required for the position
+  // to be exitable. Skip if even 5 shares would blow >95% of balance.
+  let plannedShares = null;
+  if (isRealOrder) {
+    const kellyShares = sizeUSDC / entry.polyPrice;
+    plannedShares = Math.max(POLYMARKET_MIN_SHARES, Math.ceil(kellyShares * 100) / 100);
+    const requiredUSDC = plannedShares * entry.polyPrice;
+    if (requiredUSDC > effectiveBalance * 0.95) {
+      console.warn(`[real] skipping OPEN — 5-share minimum ($${requiredUSDC.toFixed(2)}) exceeds 95% of balance ($${effectiveBalance.toFixed(2)}). Pop up balance to trade at this price.`);
+      sendTg(
+        `⚠️ <b>Сделка пропущена</b>\n` +
+        `5 shares × ${(entry.polyPrice * 100).toFixed(1)}¢ = $${requiredUSDC.toFixed(2)} — больше 95% твоего баланса $${effectiveBalance.toFixed(2)}.\n` +
+        `Пополни кошелёк или подожди более выгодной цены.`
+      );
+      return;
+    }
+    // Bumped: use the corrected size for both sim accounting and the real order
+    sizeUSDC = requiredUSDC;
   }
 
   const openingBTC = ctx.openingBTC || ctx.curBTC;
@@ -1080,6 +1111,8 @@ function stratOpen(s, ctx, entry, acct, isReal) {
     isReal:             isRealOrder,
     realOrderId:        null,
     realOrderStatus:    isRealOrder ? 'pending' : 'sim',
+    plannedShares:      plannedShares,  // ← exactly what we'll try to BUY (for SELL later)
+    actualShares:       null,           // ← filled after BUY response confirms
   };
   acct.balance    -= sizeUSDC;
   if (isRealOrder) s.pendingReal = true;
@@ -1092,7 +1125,7 @@ function stratOpen(s, ctx, entry, acct, isReal) {
       `🔵 <b>ОТКРЫТА</b> — ${entry.side}\n` +
       `Стратегия: <i>${_tgEsc(s.def.id)}</i>\n` +
       `Цена входа: <b>${(entry.polyPrice * 100).toFixed(1)}¢</b>\n` +
-      `Размер: <b>$${sizeUSDC.toFixed(2)}</b> (${(sizeUSDC / effectiveBalance * 100).toFixed(1)}% от баланса)\n` +
+      `Размер: <b>${plannedShares} shares = $${sizeUSDC.toFixed(2)}</b> (${(sizeUSDC / effectiveBalance * 100).toFixed(1)}% от баланса)\n` +
       `Edge: ${(entry.edge * 100).toFixed(1)}pp\n` +
       `Баланс: $${effectiveBalance.toFixed(2)}`
     );
@@ -1102,8 +1135,9 @@ function stratOpen(s, ctx, entry, acct, isReal) {
         if (acct.open) {
           acct.open.realOrderId     = result.orderID;
           acct.open.realOrderStatus = result.status || 'placed';
+          acct.open.actualShares    = result.actualShares;  // ← critical: what we'll SELL
           saveState();
-          console.log(`[real] BUY placed orderId=${result.orderID} status=${result.status}`);
+          console.log(`[real] BUY placed orderId=${result.orderID} status=${result.status} actualShares=${result.actualShares}`);
         }
       })
       .catch(err => {
@@ -1123,7 +1157,9 @@ function stratOpen(s, ctx, entry, acct, isReal) {
 
 function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
   const o      = acct.open;
-  const shares = o.sizeUSDC / o.polyEntryPrice;
+  // For real orders: use the actual shares we BOUGHT (post-Polymarket-minimum
+  // adjustment), not a recomputed estimate. Falls back gracefully for sim.
+  const shares = o.actualShares || o.plannedShares || (o.sizeUSDC / o.polyEntryPrice);
   let proceeds, won;
 
   if (reason === 'SETTLE') {
@@ -1144,9 +1180,9 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
   if (acct.log.length > 500) acct.log.shift();
   acct.open = null;
   saveState();
-  console.log(`[${s.def.id}] ${o.isReal ? 'REAL' : 'SIM'} CLOSE ${o.side} reason=${reason} pnl=${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
+  console.log(`[${s.def.id}] ${o.isReal ? 'REAL' : 'SIM'} CLOSE ${o.side} reason=${reason} pnl=${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} shares=${shares}`);
 
-  // ── Telegram alert on real position close ───────────────────────────────────
+  // ── Telegram alert on real position close (PRELIMINARY — real PnL confirmed after SELL settles) ──
   if (o.isReal) {
     const emoji   = pnl >= 0 ? '✅' : '🔻';
     const sign    = pnl >= 0 ? '+' : '';
@@ -1155,50 +1191,70 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
       `${emoji} <b>ЗАКРЫТА</b> — ${o.side}\n` +
       `Стратегия: <i>${_tgEsc(s.def.id)}</i>\n` +
       `Причина: <b>${_tgEsc(reason)}</b>\n` +
-      `P&amp;L: <b>${sign}$${pnl.toFixed(2)}</b> (${pctMove}%)\n` +
-      `Размер сделки: $${o.sizeUSDC.toFixed(2)}\n` +
-      `Баланс после: $${acct.balance.toFixed(2)}`
+      `P&amp;L (расчёт): <b>${sign}$${pnl.toFixed(2)}</b> (${pctMove}%)\n` +
+      `Размер: ${shares} shares = $${o.sizeUSDC.toFixed(2)}\n` +
+      `Баланс (модель): $${acct.balance.toFixed(2)}`
     );
   }
 
   // ── Place real SELL order (or wait for on-chain settlement) ─────────────────
   if (o.isReal) {
-    if (reason === 'SETTLE') {
-      // Polymarket auto-redeems winning tokens ~1 min after window close.
-      setTimeout(async () => {
-        const b = await fetchRealBalance();
-        if (b !== null) {
-          realBalance = b;
-          const mom = STRATEGIES.momentum;
-          if (mom && !mom.real.open) {
-            mom.real.balance = b;
-            saveState();
-            console.log(`[real] post-settle balance: $${b.toFixed(2)}`);
+    // After any real close, sync acct.balance to actual on-chain balance.
+    // This catches all the cases where the model diverges from reality:
+    //   - SELL failed (shares stuck) → balance won't grow → acct corrects down
+    //   - SELL filled at better price → balance higher than expected → corrects up
+    //   - SETTLE redeemed → Polymarket auto-converts winning shares to USDC
+    const syncBalanceAfter = (delayMs, label) => setTimeout(async () => {
+      const b = await fetchRealBalance();
+      if (b !== null) {
+        realBalance = b;
+        const mom = STRATEGIES.momentum;
+        if (mom && !mom.real.open) {
+          const before = mom.real.balance;
+          const drift  = b - before;
+          mom.real.balance = b;
+          mom.real.peakBalance = Math.max(mom.real.peakBalance, b);
+          saveState();
+          console.log(`[real] balance sync (${label}): $${before.toFixed(2)} → $${b.toFixed(2)} (drift=${drift >= 0 ? '+' : ''}$${drift.toFixed(2)})`);
+          // If there's meaningful drift from model, tell the user.
+          if (Math.abs(drift) >= 0.05) {
+            sendTg(
+              `🔄 <b>Баланс сверен</b>\n` +
+              `Модель: $${before.toFixed(2)}\n` +
+              `Реально на CLOB: <b>$${b.toFixed(2)}</b>\n` +
+              `Расхождение: ${drift >= 0 ? '+' : ''}$${drift.toFixed(2)}`
+            );
           }
         }
-      }, 90_000); // 90 s after window close
+      }
+    }, delayMs);
+
+    if (reason === 'SETTLE') {
+      // Polymarket auto-redeems winning tokens ~1 min after window close.
+      syncBalanceAfter(90_000, 'post-settle');
     } else if (o.tokenId && o.realOrderId && exitPolyPrice > 0.01) {
       // Early exit (TP / SL / FLIP / ADVERSE): sell shares back on CLOB.
-      const sellPrice = Math.max(0.01, parseFloat((exitPolyPrice * 0.995).toFixed(4)));
+      // Use a slightly-below-market price so it's marketable (executes against
+      // the best bid immediately) but doesn't give away too much spread.
+      const sellPrice = Math.max(0.01, parseFloat((exitPolyPrice * 0.99).toFixed(4)));
       placeClobOrder({ tokenId: o.tokenId, side: 'SELL', size: shares, price: sellPrice })
         .then(result => {
-          console.log(`[real] SELL placed orderId=${result.orderID} reason=${reason} price=${sellPrice}`);
-          setTimeout(async () => {
-            const b = await fetchRealBalance();
-            if (b !== null) {
-              realBalance = b;
-              const mom = STRATEGIES.momentum;
-              if (mom && !mom.real.open) { mom.real.balance = b; saveState(); }
-            }
-          }, 10_000);
+          console.log(`[real] SELL placed orderId=${result.orderID} reason=${reason} price=${sellPrice} shares=${result.actualShares}`);
+          syncBalanceAfter(8_000, 'post-SELL');
         })
         .catch(err => {
           console.error(`[real] SELL order FAILED (${reason}):`, err.message);
+          sendTg(
+            `⚠️ <b>SELL не прошёл</b> (${_tgEsc(reason)})\n` +
+            `<code>${_tgEsc(err.message)}</code>\n` +
+            `Позиция осталась на CLOB. Жду SETTLE через ~5 минут — там реальный P&amp;L.`
+          );
+          // Wait for the market to settle, then reconcile from on-chain balance.
+          syncBalanceAfter(Math.max(60_000, o.expiryTime + 90_000 - Date.now()), 'post-SETTLE-fallback');
         });
     } else if (o.tokenId && !o.realOrderId) {
-      // BUY order was placed but hasn't confirmed yet — attempt cancel by querying open orders
+      // BUY order was placed but hasn't confirmed yet — wait then cancel
       console.warn('[real] closing before BUY order confirmed — will cancel once orderId is known');
-      // Poll for orderId for up to 10s then cancel
       const waitAndCancel = async () => {
         for (let i = 0; i < 10; i++) {
           await new Promise(r => setTimeout(r, 1000));
@@ -1207,6 +1263,7 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
         console.warn('[real] BUY orderId never arrived — could not cancel');
       };
       waitAndCancel().catch(e => console.error('[real] waitAndCancel error:', e.message));
+      syncBalanceAfter(15_000, 'post-cancel');
     }
   }
 }
