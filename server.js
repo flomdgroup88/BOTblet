@@ -1057,7 +1057,9 @@ function stratOpen(s, ctx, entry, acct, isReal) {
   // For real accounts, always use the live wallet balance for sizing (not stale state value)
   const effectiveBalance = isReal && realBalance !== null ? realBalance : acct.balance;
   let sizeUSDC = sizingByKelly(effectiveBalance, entry.ourProb, entry.polyPrice, s.params.kellyFrac, s.params.maxFrac);
-  if (sizeUSDC < 1)                       return;
+  // For sim: reject tiny sizes immediately. For real: check AFTER the 5-share
+  // bump below, so a $0.94 Kelly still becomes $3.03 (5 shares × 60.5¢) and passes.
+  if (!isReal && sizeUSDC < 1)            return;
   if (sizeUSDC > effectiveBalance * 0.95) return;
 
   const isRealOrder = isReal && s.def.id === 'momentum' && !!polyWallet && !!polyApiCreds;
@@ -1079,6 +1081,8 @@ function stratOpen(s, ctx, entry, acct, isReal) {
     const kellyShares = sizeUSDC / entry.polyPrice;
     plannedShares = Math.max(POLYMARKET_MIN_SHARES, Math.ceil(kellyShares * 100) / 100);
     const requiredUSDC = plannedShares * entry.polyPrice;
+    // Apply the < $1 guard AFTER bump (edge case: very low price + tiny balance)
+    if (requiredUSDC < 1) return;
     if (requiredUSDC > effectiveBalance * 0.95) {
       console.warn(`[real] skipping OPEN — 5-share minimum ($${requiredUSDC.toFixed(2)}) exceeds 95% of balance ($${effectiveBalance.toFixed(2)}). Pop up balance to trade at this price.`);
       sendTg(
@@ -1143,11 +1147,12 @@ function stratOpen(s, ctx, entry, acct, isReal) {
       .catch(err => {
         console.error('[real] BUY order FAILED:', err.message);
         sendTg(`❌ <b>BUY order failed</b>\n<code>${_tgEsc(err.message)}</code>\nПозиция откатилась.`);
+        // Always reset pendingReal — even if acct.open was already cleared
+        s.pendingReal = false;
         // Rollback: refund balance and clear the position
         if (acct.open) {
           acct.balance    += acct.open.sizeUSDC;
           acct.open        = null;
-          s.pendingReal    = false;
           saveState();
           console.warn('[real] position rolled back due to order failure');
         }
