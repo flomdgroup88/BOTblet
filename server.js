@@ -52,6 +52,49 @@ const POLY_CHAIN_ID = 137;
 //   3 = POLY_1271        — smart contract wallets / vaults (EIP-1271)
 const SIG_TYPE      = parseInt(process.env.SIGNATURE_TYPE || '0', 10);
 
+// ─── TELEGRAM NOTIFICATIONS ───────────────────────────────────────────────────
+// Set TELEGRAM_BOT_TOKEN (from @BotFather) and TELEGRAM_CHAT_ID (from
+// https://api.telegram.org/bot<TOKEN>/getUpdates) to enable real-trade alerts.
+// Notifications fire on: startup, real-order open, real-order close, auth fail.
+const TG_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+const TG_CHAT  = (process.env.TELEGRAM_CHAT_ID   || '').trim();
+const TG_ON    = !!(TG_TOKEN && TG_CHAT);
+
+/**
+ * Send a Telegram message. Silent fail-safe — never throws, never blocks the
+ * caller. Returns true on success, false on error or if Telegram is disabled.
+ */
+async function sendTg(text) {
+  if (!TG_ON) return false;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        chat_id:                  TG_CHAT,
+        text:                     text,
+        parse_mode:               'HTML',
+        disable_web_page_preview: true,
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      console.warn(`[tg] HTTP ${r.status}: ${txt.slice(0, 200)}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.warn('[tg] send error:', e.message);
+    return false;
+  }
+}
+
+/** HTML-escape user-supplied values before embedding in Telegram messages. */
+function _tgEsc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 // ─── STATE ───────────────────────────────────────────────────────────────────
 let ticks        = [];   // { time, price, qty, isBuyerMaker }
 let cvd          = 0;
@@ -834,14 +877,22 @@ async function initPolyWallet() {
         mom.real.peakBalance = Math.max(mom.real.peakBalance || 0, realBalance);
         saveState();
       }
+      sendTg(
+        `✅ <b>Бот запущен</b>\n` +
+        `Кошелёк: <code>${_tgEsc(polyWallet.address)}</code>\n` +
+        `Баланс USDC: <b>$${realBalance.toFixed(2)}</b>\n` +
+        `Реальная торговля: <b>включена</b>`
+      );
     } else {
       console.warn('[real] ⚠️  L2 auth or balance fetch failed — see prior logs');
       console.warn('[real] If this persists: check that POLY_PRIVATE_KEY matches the wallet you used to log into Polymarket UI');
       console.warn('[real] and that SIGNATURE_TYPE matches your account type (0=EOA, 1=Magic/email, 2=Phantom+Safe, 3=smart wallet)');
+      sendTg(`⚠️ <b>Бот запущен, но auth/balance не работает</b>\nПроверь логи на Railway`);
     }
   } catch (e) {
     console.error('[real] init failed:', e.message);
     if (e.stack) console.error(e.stack.split('\n').slice(0, 5).join('\n'));
+    sendTg(`❌ <b>Бот не смог запуститься</b>\n<code>${_tgEsc(e.message)}</code>`);
     polyWallet   = null;
     polyClob     = null;
     polyApiCreds = null;
@@ -1019,6 +1070,14 @@ function stratOpen(s, ctx, entry, acct, isReal) {
 
   // ── Place real BUY order on Polymarket CLOB (async, Momentum only) ──────────
   if (isRealOrder) {
+    sendTg(
+      `🔵 <b>ОТКРЫТА</b> — ${entry.side}\n` +
+      `Стратегия: <i>${_tgEsc(s.def.id)}</i>\n` +
+      `Цена входа: <b>${(entry.polyPrice * 100).toFixed(1)}¢</b>\n` +
+      `Размер: <b>$${sizeUSDC.toFixed(2)}</b> (${(sizeUSDC / effectiveBalance * 100).toFixed(1)}% от баланса)\n` +
+      `Edge: ${(entry.edge * 100).toFixed(1)}pp\n` +
+      `Баланс: $${effectiveBalance.toFixed(2)}`
+    );
     placeClobOrder({ tokenId, side: 'BUY', size: sizeUSDC, price: entry.polyPrice })
       .then(result => {
         s.pendingReal = false;
@@ -1031,6 +1090,7 @@ function stratOpen(s, ctx, entry, acct, isReal) {
       })
       .catch(err => {
         console.error('[real] BUY order FAILED:', err.message);
+        sendTg(`❌ <b>BUY order failed</b>\n<code>${_tgEsc(err.message)}</code>\nПозиция откатилась.`);
         // Rollback: refund balance and clear the position
         if (acct.open) {
           acct.balance    += acct.open.sizeUSDC;
@@ -1067,6 +1127,21 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
   acct.open = null;
   saveState();
   console.log(`[${s.def.id}] ${o.isReal ? 'REAL' : 'SIM'} CLOSE ${o.side} reason=${reason} pnl=${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
+
+  // ── Telegram alert on real position close ───────────────────────────────────
+  if (o.isReal) {
+    const emoji   = pnl >= 0 ? '✅' : '🔻';
+    const sign    = pnl >= 0 ? '+' : '';
+    const pctMove = ((proceeds / o.sizeUSDC - 1) * 100).toFixed(1);
+    sendTg(
+      `${emoji} <b>ЗАКРЫТА</b> — ${o.side}\n` +
+      `Стратегия: <i>${_tgEsc(s.def.id)}</i>\n` +
+      `Причина: <b>${_tgEsc(reason)}</b>\n` +
+      `P&amp;L: <b>${sign}$${pnl.toFixed(2)}</b> (${pctMove}%)\n` +
+      `Размер сделки: $${o.sizeUSDC.toFixed(2)}\n` +
+      `Баланс после: $${acct.balance.toFixed(2)}`
+    );
+  }
 
   // ── Place real SELL order (or wait for on-chain settlement) ─────────────────
   if (o.isReal) {
@@ -1461,6 +1536,23 @@ app.post('/api/real/cancel', async (_, res) => {
   res.json({ ok: true, cancelledOrderId: mom.real.open.realOrderId });
 });
 
+// GET /api/tg/test — send a test message to verify Telegram integration
+app.get('/api/tg/test', async (_, res) => {
+  if (!TG_ON) {
+    return res.json({
+      ok: false,
+      reason: 'Telegram disabled. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars on Railway.',
+    });
+  }
+  const sent = await sendTg(
+    `🧪 <b>Тестовое сообщение</b>\n` +
+    `Время: ${new Date().toISOString()}\n` +
+    `Кошелёк: <code>${_tgEsc(polyWallet?.address || 'not initialized')}</code>\n` +
+    `Баланс: ${realBalance !== null ? `$${realBalance.toFixed(2)}` : 'n/a'}`
+  );
+  res.json({ ok: sent });
+});
+
 // GET /api/real/reinit — re-run wallet initialization (без перезапуска контейнера).
 // Полезно после смены env vars в Railway. Заменил собой старый /redetect, т.к.
 // V2 SDK сам управляет правильной комбинацией auth — нечего "детектить".
@@ -1509,6 +1601,7 @@ app.get('/api/real/diagnose', async (_, res) => {
       POLY_API_SECRET: process.env.POLY_API_SECRET ? `set (${process.env.POLY_API_SECRET.length} chars)` : 'not set',
       POLY_PASSPHRASE: process.env.POLY_PASSPHRASE ? `set (${process.env.POLY_PASSPHRASE.length} chars)` : 'not set',
       SIGNATURE_TYPE:  SIG_TYPE,
+      TELEGRAM:        TG_ON ? `enabled (chat ${TG_CHAT.slice(0,4)}…)` : 'disabled (set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)',
     },
     wallet:           polyWallet ? polyWallet.address : null,
     walletReady:      !!(polyWallet && polyClob),
