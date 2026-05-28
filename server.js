@@ -507,6 +507,39 @@ function parseEventMarket(ev) {
 }
 
 async function fetchClobMidpoint(tokenId) {
+  // Polymarket's `/midpoint` endpoint returns (bid + ask) / 2. When the book
+  // has limit orders sitting at 0.01 and 0.99 (which Polymarket sometimes
+  // seeds itself for thin markets), that midpoint becomes 0.50 — even though
+  // the *real* market (last trades, mid of the tight inner book) is at e.g.
+  // 0.27. The bot then trades on stale 50/50 forever.
+  //
+  // Fix: pull the actual orderbook and compute midpoint from the BEST bid
+  // and BEST ask (the inner quotes — what you'd actually trade against).
+  // Fall back to /midpoint if the book is empty (shouldn't happen on active
+  // markets but keeps us safe).
+  try {
+    const book = await fetchClobBook(tokenId);
+    const bestBid = (Array.isArray(book.bids) && book.bids.length)
+      ? Math.max(...book.bids.map(o => parseFloat(o.price)).filter(v => !isNaN(v)))
+      : null;
+    const bestAsk = (Array.isArray(book.asks) && book.asks.length)
+      ? Math.min(...book.asks.map(o => parseFloat(o.price)).filter(v => !isNaN(v)))
+      : null;
+
+    if (bestBid !== null && bestAsk !== null) {
+      // Sanity check: spread should not be insanely wide. If bid≈0 and ask≈1,
+      // the inner quotes are degenerate — treat the book as effectively empty
+      // and fall through to the midpoint endpoint.
+      const spread = bestAsk - bestBid;
+      if (spread < 0.50) return (bestBid + bestAsk) / 2;
+    } else if (bestBid !== null) {
+      return bestBid;
+    } else if (bestAsk !== null) {
+      return bestAsk;
+    }
+  } catch (_) { /* fall through to /midpoint */ }
+
+  // Fallback: original /midpoint endpoint
   const res = await fetch(`${POLY_CLOB}/midpoint?token_id=${encodeURIComponent(tokenId)}`, { signal: AbortSignal.timeout(5000) });
   if (!res.ok) throw new Error('clob HTTP ' + res.status);
   const d = await res.json();
@@ -1031,6 +1064,19 @@ const STRAT_MOMENTUM = {
 
 const STRAT_DEFINITIONS = [STRAT_MOMENTUM];
 
+// ─── REAL-TRADING RISK CONTROLS ──────────────────────────────────────────────
+// These guards exist to prevent the bot from spamming trades on dead markets
+// where one side has already won and the loser-token trades at 1-5¢. On those
+// extreme prices our edge calculation looks huge (model says "still 50/50",
+// market knows the answer is 99/1), but ADVERSE/SL triggers instantly because
+// any micro-move is a huge % of a 2¢ token. Result: 6 burned trades in 11 s.
+const REAL_MIN_PRICE         = 0.10;     // Skip if either side < 10¢ — market has decided
+const REAL_MAX_PRICE         = 0.90;     // Skip if our entry side > 90¢ — bad RR even when right
+const REAL_MIN_MS_TO_END     = 45_000;   // Need ≥45s left in window — else no time to play out
+const REAL_COOLDOWN_MS       = 20_000;   // Wait ≥20s after any real close before opening again
+const REAL_DAILY_LOSS_CAP    = parseFloat(process.env.REAL_DAILY_LOSS_CAP || '3');  // USD; -$3 default
+                                                                                    // After cap is hit, real autodisables until next UTC day
+
 function initStrategies() {
   for (const def of STRAT_DEFINITIONS) {
     STRATEGIES[def.id] = {
@@ -1040,7 +1086,12 @@ function initStrategies() {
       demo: { balance: 1000, peakBalance: 1000, open: null, log: [] },
       real: { balance: 1000, peakBalance: 1000, open: null, log: [] },
       params:       { ...def.defaults },
-      pendingReal:  false,   // true while a real BUY order is in-flight
+      pendingReal:           false,    // true while a real BUY order is in-flight
+      lastRealCloseTime:     0,        // epoch ms — for cooldown enforcement
+      lastRealClosedWindow:  null,     // window slug we last closed in — one-trade-per-window
+      realDailyLossDate:     null,     // 'YYYY-MM-DD' (UTC) — bookkeeping for the daily cap
+      realDailyLossAmount:   0,        // running USD loss for the current UTC day
+      realDailyAutoDisabled: false,    // user must re-enable real after the cap fires
     };
   }
 }
@@ -1084,6 +1135,58 @@ function stratOpen(s, ctx, entry, acct, isReal) {
   if (isRealOrder && !tokenId) {
     console.warn('[real] missing tokenId — skipping real entry');
     return;
+  }
+
+  // ── REAL-TRADING RISK CONTROLS ─────────────────────────────────────────────
+  // Each guard below applies ONLY to real orders — demo keeps trading
+  // unhindered so we still collect statistics.
+  if (isRealOrder) {
+    // Reset daily-loss bucket if we've rolled into a new UTC day.
+    const utcToday = new Date().toISOString().slice(0, 10);
+    if (s.realDailyLossDate !== utcToday) {
+      s.realDailyLossDate     = utcToday;
+      s.realDailyLossAmount   = 0;
+      s.realDailyAutoDisabled = false;
+    }
+
+    // [Guard E] Daily-loss circuit-breaker: once total real losses today
+    // exceed REAL_DAILY_LOSS_CAP, autodisable real until the user flips it
+    // back on (or until UTC midnight rolls over).
+    if (s.realDailyAutoDisabled) {
+      // Silent skip — TG warning was sent when the breaker fired.
+      return;
+    }
+
+    // [Guard A] Skip extreme prices. When one side trades ≤ 10¢, the market
+    // has effectively decided the outcome. Our model still says "50/50" so
+    // edge looks gigantic (+50pp), but it's mathematical artifact — the
+    // market knows something our predictor doesn't (e.g. window almost over,
+    // BTC already 100¢ in the other direction). On 2¢ tokens any micro-move
+    // is a huge % swing, so ADVERSE/SL triggers within 1 second and we
+    // spam-trade ourselves to zero. This single guard would have blocked
+    // all 6 burned trades from window 1779977100.
+    const oppositePrice = entry.side === 'UP' ? ctx.polyDn : ctx.polyUp;
+    if (entry.polyPrice < REAL_MIN_PRICE || entry.polyPrice > REAL_MAX_PRICE
+        || oppositePrice < REAL_MIN_PRICE || oppositePrice > REAL_MAX_PRICE) {
+      console.log(`[real] SKIP extreme price — ${entry.side}=${(entry.polyPrice*100).toFixed(1)}¢ / opp=${(oppositePrice*100).toFixed(1)}¢ (market already decided)`);
+      return;
+    }
+
+    // [Guard D] Need enough time left in the window. Less than 45s and SL/TP
+    // won't get a chance to work out — the position will just expire.
+    if (ctx.msToEnd < REAL_MIN_MS_TO_END) {
+      console.log(`[real] SKIP — only ${Math.round(ctx.msToEnd/1000)}s left in window, need ≥${REAL_MIN_MS_TO_END/1000}s`);
+      return;
+    }
+
+    // [Guard C] Cooldown after any real close. Even across windows, give a
+    // 20-second buffer so a stuck SELL or a wallet-balance sync can complete
+    // before we touch another trade.
+    const sinceClose = Date.now() - (s.lastRealCloseTime || 0);
+    if (sinceClose < REAL_COOLDOWN_MS) {
+      console.log(`[real] SKIP — cooldown, ${Math.round((REAL_COOLDOWN_MS - sinceClose)/1000)}s remaining`);
+      return;
+    }
   }
 
   // ── Real-order sizing: enforce Polymarket 5-share minimum ──────────────────
@@ -1201,6 +1304,34 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
   acct.open = null;
   saveState();
   console.log(`[${s.def.id}] ${o.isReal ? 'REAL' : 'SIM'} CLOSE ${o.side} reason=${reason} pnl=${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} shares=${shares}`);
+
+  // ── Update real-trade tracking for the next-entry guards ──────────────────
+  if (o.isReal) {
+    s.lastRealCloseTime    = Date.now();
+    s.lastRealClosedWindow = o.marketSlug || ctx.win.slug;
+
+    // Daily-loss bucket. Reset if UTC day changed, then accumulate.
+    const utcToday = new Date().toISOString().slice(0, 10);
+    if (s.realDailyLossDate !== utcToday) {
+      s.realDailyLossDate     = utcToday;
+      s.realDailyLossAmount   = 0;
+      s.realDailyAutoDisabled = false;
+    }
+    if (pnl < 0) s.realDailyLossAmount += Math.abs(pnl);
+
+    // Trip the breaker if we've passed the daily cap.
+    if (s.realDailyLossAmount >= REAL_DAILY_LOSS_CAP && !s.realDailyAutoDisabled) {
+      s.realDailyAutoDisabled = true;
+      saveState();
+      console.warn(`[real] DAILY LOSS CAP HIT: $${s.realDailyLossAmount.toFixed(2)} ≥ $${REAL_DAILY_LOSS_CAP} — real auto-disabled for today`);
+      sendTg(
+        `🛑 <b>Дневной лимит потерь</b>\n` +
+        `Сегодня минус: <b>-$${s.realDailyLossAmount.toFixed(2)}</b> (лимит $${REAL_DAILY_LOSS_CAP})\n` +
+        `Реальная торговля автоматически отключена до завтра.\n` +
+        `Включи вручную если хочешь раньше.`
+      );
+    }
+  }
 
   // ── Telegram alert on real position close (PRELIMINARY — real PnL confirmed after SELL settles) ──
   if (o.isReal) {
