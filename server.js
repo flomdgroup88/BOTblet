@@ -9,6 +9,15 @@ const crypto   = require('crypto');   // built-in, for HMAC-SHA256
 const fs       = require('fs');
 const path     = require('path');
 
+// ─── POLYMARKET CLOB V2 SDK ─────────────────────────────────────────────────
+// CLOB V1 was deprecated April 28, 2026. py-clob-client/clob-client (V1) are archived.
+// V2 SDK handles all auth (L1 EIP-712 + L2 HMAC), order signing (new struct with
+// timestamp/metadata/builder), and balance sync (/balance-allowance/update).
+const { ClobClient, Chain, Side: V2Side, OrderType: V2OrderType, SignatureTypeV2, ApiError } = require('@polymarket/clob-client-v2');
+const { createWalletClient, http } = require('viem');
+const { privateKeyToAccount } = require('viem/accounts');
+const { polygon } = require('viem/chains');
+
 // ─── CONFIG ─────────────────────────────────────────────────────────────────
 const PORT             = process.env.PORT || 3000;
 const STATE_FILE       = path.join(__dirname, 'state.json');
@@ -25,21 +34,22 @@ const POLYGON_RPCS     = [
 ];
 const CHAINLINK_ABI    = ['function latestAnswer() view returns (int256)'];
 
-// ─── REAL TRADING CONFIG ──────────────────────────────────────────────────────
+// ─── REAL TRADING CONFIG (CLOB V2) ────────────────────────────────────────────
 // To enable: set REAL_TRADING=true and POLY_PRIVATE_KEY=0x... in Railway env vars
-// Optionally set POLY_API_KEY + POLY_API_SECRET + POLY_PASSPHRASE to skip key derivation
+// V2 SDK auto-derives API credentials — env-set POLY_API_KEY/SECRET/PASSPHRASE
+// are honored if present, otherwise SDK calls createOrDeriveApiKey internally.
 const REAL_TRADING  = ['true','1','yes'].includes((process.env.REAL_TRADING || '').toLowerCase().trim());
 const POLY_PK       = process.env.POLY_PRIVATE_KEY || '';
 const POLY_FUNDER   = process.env.POLY_FUNDER_ADDRESS || '';
 // Polymarket CTF Exchange contract on Polygon mainnet (settles all prediction markets)
-// ✅ FIX: updated to current contract address (was: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E)
 const CTF_EXCHANGE  = '0xE111180000d2663C0091e4f400237545B87B996B';
 const POLY_CHAIN_ID = 137;
-// Signature type — set via SIGNATURE_TYPE env var:
-//   0 = EOA (plain MetaMask, no proxy)
-//   1 = POLY_PROXY (MetaMask + Polymarket proxy wallet created via website)
-//   2 = GNOSIS_SAFE (existing Gnosis Safe users)
-//   3 = POLY_1271  (new deposit wallet, recommended for fresh API setups)
+// Signature type (V2 SDK uses the same numeric scheme as V1):
+//   0 = EOA              — plain MetaMask/Phantom, no Polymarket proxy
+//   1 = POLY_PROXY       — EOA owning a Polymarket Proxy wallet (Magic/email login)
+//   2 = POLY_GNOSIS_SAFE — EOA owning a Polymarket Gnosis Safe (Phantom/MetaMask
+//                          users who deposited via Polymarket UI → Safe deployed)
+//   3 = POLY_1271        — smart contract wallets / vaults (EIP-1271)
 const SIG_TYPE      = parseInt(process.env.SIGNATURE_TYPE || '0', 10);
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
@@ -566,520 +576,201 @@ async function refreshChainlinkPrice() {
 // Only active when REAL_TRADING=true and POLY_PRIVATE_KEY is set.
 // Only the Momentum strategy places real orders; all others stay in simulation.
 
-let polyWallet         = null;   // ethers.Wallet derived from POLY_PRIVATE_KEY
-let polyApiCreds       = null;   // { key, secret, passphrase, address }
+let polyWallet         = null;   // ethers.Wallet (kept for .address access in shared code paths)
+let polyClob           = null;   // V2 ClobClient instance, fully authenticated (L1+L2)
+let polyApiCreds       = null;   // { key, secret, passphrase } — exposed in /api/real/diagnose
 let realBalance        = null;   // latest USDC balance fetched from CLOB
-let _workingPolyAddress = null;  // address that actually authenticates against CLOB (set by autodetectAuth)
+let _workingPolyAddress = null;  // kept for /api/real/diagnose UI (now always == polyWallet.address with V2)
 
-/** EIP-712 domain for CTF Exchange order signing */
-const ORDER_DOMAIN = {
-  name:              'Polymarket CTF Exchange',
-  version:           '1',
-  chainId:           POLY_CHAIN_ID,
-  verifyingContract: CTF_EXCHANGE,
-};
-
-/** EIP-712 types — must match the CTF Exchange contract exactly */
-const ORDER_TYPES = {
-  Order: [
-    { name: 'salt',          type: 'uint256' },
-    { name: 'maker',         type: 'address' },
-    { name: 'signer',        type: 'address' },
-    { name: 'taker',         type: 'address' },
-    { name: 'tokenId',       type: 'uint256' },
-    { name: 'makerAmount',   type: 'uint256' },
-    { name: 'takerAmount',   type: 'uint256' },
-    { name: 'expiration',    type: 'uint256' },
-    { name: 'nonce',         type: 'uint256' },
-    { name: 'feeRateBps',    type: 'uint256' },
-    { name: 'side',          type: 'uint8'   },
-    { name: 'signatureType', type: 'uint8'   },
-  ],
-};
+// ═══════════════════════════════════════════════════════════════════════════
+// POLYMARKET CLOB V2 INTEGRATION
+// ═══════════════════════════════════════════════════════════════════════════
+// CLOB V2 went live April 28, 2026; V1 SDKs were archived May 11, 2026.
+// The /balance-allowance, /order, /auth/* endpoints exist on V2 too but the
+// underlying validation (order struct, EIP-712 signing for orders, balance
+// sync) is different. The official V2 SDK handles all of this.
+//
+// What we delegate to the SDK:
+//   - L1 auth (EIP-712 signTypedData on ClobAuthDomain)
+//   - L2 auth (HMAC-SHA256, base64url, timestamp+method+path+body)
+//   - API key derivation (createOrDeriveApiKey)
+//   - Order struct construction (new V2 fields: timestamp, metadata, builder)
+//   - Order signing (EIP-712 with V2 domain version)
+//   - /balance-allowance and /balance-allowance/update (sync on-chain balance)
+//   - /order POST (place) and DELETE (cancel)
+//
+// What we still own:
+//   - Wallet/account setup from POLY_PRIVATE_KEY
+//   - Polling balance every 30s
+//   - Translating between bot strategy events and CLOB orders
+// ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * EIP-712 domain and types for Polymarket CLOB L1 authentication.
- * Must match the official clob-client exactly.
+ * Map our string side ("BUY"/"SELL") to V2 SDK Side enum.
  */
-const CLOB_AUTH_DOMAIN = {
-  name:    'ClobAuthDomain',
-  version: '1',
-  chainId: POLY_CHAIN_ID,   // 137
-};
-
-const CLOB_AUTH_TYPES = {
-  ClobAuth: [
-    { name: 'address',   type: 'address' },
-    { name: 'timestamp', type: 'string'  },
-    { name: 'nonce',     type: 'uint256' },  // must be uint256 per official Polymarket docs
-    { name: 'message',   type: 'string'  },
-  ],
-};
-
-/**
- * L1 auth headers (EIP-712 signTypedData on ClobAuthDomain).
- * Required for: creating / fetching API keys via /auth/api-key.
- *
- * For Gnosis Safe / proxy wallets (POLY_FUNDER set):
- *   - POLY_ADDRESS = funder (Safe/proxy) address
- *   - EIP-712 address value = signing EOA address
- *   - Signature = from EOA
- * For plain EOA:
- *   - POLY_ADDRESS = EOA address (same as signer)
- */
-async function l1Headers(method, reqPath, body = '') {
-  const ts         = String(Math.floor(Date.now() / 1000));
-  const nonce      = 0;
-  // L1 auth: POLY_ADDRESS = EOA (адрес, который реально подписывает).
-  // Polymarket делает ecrecover(signature) и сравнивает с POLY_ADDRESS —
-  // если передать FUNDER вместо EOA, получим 401 "Invalid L1 Request headers".
-  const eoaAddress = polyWallet.address;
-
-  const sig = await polyWallet.signTypedData(
-    CLOB_AUTH_DOMAIN,
-    CLOB_AUTH_TYPES,
-    {
-      address:   eoaAddress,
-      timestamp: ts,
-      nonce,
-      message:   'This message attests that I control the given wallet',
-    }
-  );
-  return {
-    'Content-Type':   'application/json',
-    'POLY_ADDRESS':   eoaAddress,
-    'POLY_SIGNATURE': sig,
-    'POLY_TIMESTAMP': ts,
-    'POLY_NONCE':     String(nonce),
-  };
+function _mapSide(side) {
+  return side === 'BUY' ? V2Side.BUY : V2Side.SELL;
 }
 
 /**
- * L2 auth headers (HMAC-SHA256).
- * Required for: placing orders, cancelling, querying balance, etc.
+ * Map our string orderType ("GTC"/"FOK"/"FAK"/"GTD") to V2 SDK OrderType enum.
  */
-function l2Headers(method, reqPath, body = '') {
-  const ts        = String(Math.floor(Date.now() / 1000));
-  const msg       = ts + method + reqPath + (body || '');
-  // ── СЕКРЕТ: Polymarket отдаёт secret в URL-safe base64 (символы - и _).
-  //    Buffer.from(..., 'base64') их не понимает → нужен пре-replace.
-  const secret64  = polyApiCreds.secret.replace(/-/g, '+').replace(/_/g, '/');
-  const secretBuf = Buffer.from(secret64, 'base64');
-  // ── ПОДПИСЬ: ОБЯЗАТЕЛЬНО URL-safe base64 на выходе.
-  //    Официальный clob-client (TS) и py-clob-client делают именно так:
-  //    digest base64 → replace('+', '-') → replace('/', '_').  '=' остаётся.
-  //    Без этого сервер вернёт 401 "Invalid api key" на КАЖДОМ L2-запросе.
-  const sig       = crypto.createHmac('sha256', secretBuf).update(msg).digest('base64')
-                      .replace(/\+/g, '-').replace(/\//g, '_');
-
-  // POLY_ADDRESS resolution priority:
-  //   1) _workingPolyAddress — установлено autodetectAuth(), уже доказало что работает
-  //   2) POLY_API_OWNER env — явный override
-  //   3) POLY_FUNDER — для proxy/UI-keys
-  //   4) EOA — fallback
-  const accountAddress = _workingPolyAddress
-                       || process.env.POLY_API_OWNER
-                       || POLY_FUNDER
-                       || polyWallet.address;
-
-  return {
-    'Content-Type':    'application/json',
-    'POLY_ADDRESS':    accountAddress,
-    'POLY_SIGNATURE':  sig,
-    'POLY_TIMESTAMP':  ts,
-    'POLY_NONCE':      '0',
-    'POLY_API_KEY':    polyApiCreds.key,
-    'POLY_PASSPHRASE': polyApiCreds.passphrase,
-  };
+function _mapOrderType(t) {
+  return V2OrderType[t] || V2OrderType.GTC;
 }
 
 /**
- * Автоматически определяет рабочую комбинацию (API credentials × POLY_ADDRESS)
- * Перебирает все варианты, останавливается на первом, который вернёт 200 от
- * /balance-allowance. Сохраняет результат в polyApiCreds и _workingPolyAddress.
- *
- * Возвращает массив попыток для отчёта в логи и /api/real/diagnose.
+ * Resolve the SignatureTypeV2 to use. Honors SIG_TYPE env var; if 0 and
+ * POLY_FUNDER is set, upgrades to POLY_GNOSIS_SAFE (most common case for
+ * Phantom/MetaMask users who connected via Polymarket UI).
  */
-async function autodetectAuth() {
-  console.log('[real] autodetectAuth: searching working CLOB credentials + POLY_ADDRESS...');
-  const attempts = [];
-  const EOA      = polyWallet.address;
-  const FUNDER   = POLY_FUNDER || null;
+function _resolveSigType() {
+  if ([0, 1, 2, 3].includes(SIG_TYPE)) {
+    // Auto-upgrade plain EOA to Gnosis Safe when funder is set (proxy detected)
+    if (SIG_TYPE === 0 && POLY_FUNDER) return SignatureTypeV2.POLY_GNOSIS_SAFE;
+    return SIG_TYPE;
+  }
+  return POLY_FUNDER ? SignatureTypeV2.POLY_GNOSIS_SAFE : SignatureTypeV2.EOA;
+}
 
-  // Source 1: env credentials (если заданы)
-  const envCreds = (process.env.POLY_API_KEY && process.env.POLY_API_SECRET && process.env.POLY_PASSPHRASE)
-    ? {
-        key:        process.env.POLY_API_KEY,
-        secret:     process.env.POLY_API_SECRET,
-        passphrase: process.env.POLY_PASSPHRASE,
-        source:     'env',
-      }
-    : null;
+/**
+ * Build the viem walletClient that V2 SDK uses for L1 signing.
+ * Note: V2 SDK uses viem internally; we keep `polyWallet` (ethers) for the
+ * address property and any code paths that haven't been migrated.
+ */
+function _buildViemWallet(pkHex) {
+  const account = privateKeyToAccount(pkHex);
+  return createWalletClient({ account, chain: polygon, transport: http() });
+}
 
-  // Source 2: derived credentials (запрашиваем у Polymarket)
-  let derivedCreds = null;
+/**
+ * Create a fully-configured V2 ClobClient (L1 only, no creds yet).
+ * Used to bootstrap creds via createOrDeriveApiKey.
+ */
+function _buildBootClient(viemWallet, sigType, funderAddress) {
+  return new ClobClient({
+    host:          POLY_CLOB,
+    chain:         Chain.POLYGON,
+    signer:        viemWallet,
+    signatureType: sigType,
+    funderAddress: funderAddress || undefined,
+  });
+}
+
+/**
+ * Place an order on the Polymarket CLOB via V2 SDK.
+ * Signature: { tokenId, side, size, price, orderType? }
+ * - tokenId: string (Polymarket conditional token ID)
+ * - side:    'BUY' | 'SELL'
+ * - size:    number (in shares for limit / in USDC for market)
+ * - price:   number (0.01..0.99)
+ * - orderType: 'GTC' (default) | 'FOK' | 'FAK' | 'GTD'
+ */
+async function placeClobOrder({ tokenId, side, size, price, orderType = 'GTC' }) {
+  if (!polyClob)          throw new Error('CLOB client not initialised — wallet/creds missing');
+  if (!tokenId)           throw new Error('tokenId is required');
+
+  const userOrder = {
+    tokenID: tokenId,
+    price:   price,
+    side:    _mapSide(side),
+    size:    size,
+  };
+
   try {
-    const hdrs = await l1Headers('GET', '/auth/derive-api-key');
-    const r    = await fetch(`${POLY_CLOB}/auth/derive-api-key`, { method: 'GET', headers: hdrs, signal: AbortSignal.timeout(10000) });
-    if (r.ok) {
-      const d = await r.json();
-      if (d.apiKey && d.secret && d.passphrase) {
-        derivedCreds = { key: d.apiKey, secret: d.secret, passphrase: d.passphrase, source: 'derived' };
-        console.log(`[real] derived creds: ${derivedCreds.key.slice(0,8)}...`);
-      }
-    } else {
-      console.warn('[real] derive-api-key failed:', r.status);
+    const resp = await polyClob.createAndPostOrder(userOrder, {}, _mapOrderType(orderType));
+    if (resp && (resp.error || resp.errorMsg)) {
+      throw new Error(resp.errorMsg || resp.error);
     }
-  } catch (e) {
-    console.warn('[real] derive-api-key exception:', e.message);
-  }
-
-  // Кандидаты адресов для POLY_ADDRESS в HMAC-заголовках
-  const addressCandidates = [];
-  if (FUNDER) addressCandidates.push({ label: 'FUNDER (proxy)', addr: FUNDER });
-  addressCandidates.push({ label: 'EOA', addr: EOA });
-
-  // Кандидаты credentials
-  const credCandidates = [];
-  if (envCreds)     credCandidates.push(envCreds);
-  if (derivedCreds && (!envCreds || derivedCreds.key !== envCreds.key)) credCandidates.push(derivedCreds);
-
-  if (credCandidates.length === 0) {
-    console.error('[real] no credentials available — neither env nor derive worked');
-    return { ok: false, attempts: [{ note: 'no credentials' }] };
-  }
-
-  // Owner для balance-allowance URL — пробуем оба варианта
-  const ownerCandidates = FUNDER ? [FUNDER, EOA] : [EOA];
-
-  // Перебираем все комбинации
-  for (const creds of credCandidates) {
-    for (const addrCand of addressCandidates) {
-      for (const owner of ownerCandidates) {
-        const ts      = String(Math.floor(Date.now() / 1000));
-        const reqPath = `/balance-allowance?asset_type=USDC&owner=${owner}`;
-        const msg     = ts + 'GET' + reqPath;
-        const sec64   = creds.secret.replace(/-/g, '+').replace(/_/g, '/');
-        const sig     = crypto.createHmac('sha256', Buffer.from(sec64, 'base64'))
-                              .update(msg).digest('base64')
-                              .replace(/\+/g, '-').replace(/\//g, '_');
-
-        try {
-          const r = await fetch(`${POLY_CLOB}${reqPath}`, {
-            method: 'GET',
-            headers: {
-              'POLY_ADDRESS':    addrCand.addr,
-              'POLY_SIGNATURE':  sig,
-              'POLY_TIMESTAMP':  ts,
-              'POLY_API_KEY':    creds.key,
-              'POLY_PASSPHRASE': creds.passphrase,
-            },
-            signal: AbortSignal.timeout(8000),
-          });
-          const txt = await r.text();
-          const attempt = {
-            creds:       `${creds.source} (${creds.key.slice(0,8)}...)`,
-            polyAddress: `${addrCand.label} ${addrCand.addr.slice(0,8)}...`,
-            urlOwner:    `${owner.slice(0,8)}...`,
-            status:      r.status,
-            ok:          r.ok,
-          };
-          attempts.push(attempt);
-
-          if (r.ok) {
-            // ПОБЕДА. Запоминаем и выходим.
-            polyApiCreds = {
-              key:        creds.key,
-              secret:     creds.secret,
-              passphrase: creds.passphrase,
-              address:    polyWallet.address,
-              source:     creds.source,
-            };
-            _workingPolyAddress = addrCand.addr;
-            const balance = parseFloat(JSON.parse(txt).balance || '0') / (creds.source === 'derived' ? 1e6 : 1);
-            console.log(`[real] ✅ FOUND WORKING AUTH: creds=${creds.source} (${creds.key.slice(0,8)}...), POLY_ADDRESS=${addrCand.label}, urlOwner=${owner.slice(0,8)}...`);
-            console.log(`[real] ✅ balance response: ${txt.slice(0,200)}`);
-            return { ok: true, attempts, working: attempt };
-          } else {
-            console.warn(`[real] ❌ ${creds.source} key + ${addrCand.label} + owner=${owner.slice(0,8)}... → ${r.status}`);
-          }
-        } catch (e) {
-          attempts.push({ creds: creds.source, polyAddress: addrCand.label, error: e.message });
-        }
-      }
-    }
-  }
-
-  console.error('[real] autodetectAuth: НИ ОДНА комбинация не сработала. Все варианты — 401.');
-  return { ok: false, attempts };
-}
-
-
-/**
- * Fetch or create an API key pair for the current wallet.
- * If POLY_API_KEY / POLY_API_SECRET / POLY_PASSPHRASE are set in env,
- * they are used directly (skip on-chain derivation).
- */
-async function getOrCreateApiKey() {
-  if (process.env.POLY_API_KEY && process.env.POLY_API_SECRET && process.env.POLY_PASSPHRASE) {
-    console.log('[real] using pre-configured API credentials from env');
+    // V2 response shape: { success, errorMsg, orderID, transactionsHashes, status, takingAmount, makingAmount }
     return {
-      key:        process.env.POLY_API_KEY,
-      secret:     process.env.POLY_API_SECRET,
-      passphrase: process.env.POLY_PASSPHRASE,
-      address:    polyWallet.address,
+      orderID:            resp.orderID,
+      status:             resp.status,
+      success:            resp.success,
+      transactionsHashes: resp.transactionsHashes || [],
+      raw:                resp,
     };
-  }
-
-  // ✅ FIX: use /auth/derive-api-key (correct derive endpoint per docs)
-  // /auth/api-key GET is not the documented derive endpoint — that's /auth/derive-api-key
-  try {
-    console.log('[real] GET /auth/derive-api-key ...');
-    const hdrs = await l1Headers('GET', '/auth/derive-api-key');
-    console.log('[real] L1 headers built, POLY_ADDRESS=', hdrs['POLY_ADDRESS']);
-    const r    = await fetch(`${POLY_CLOB}/auth/derive-api-key`, { method: 'GET', headers: hdrs, signal: AbortSignal.timeout(10000) });
-    console.log('[real] GET /auth/derive-api-key HTTP', r.status);
-    if (r.ok) {
-      const body = await r.json();
-      const keys = Array.isArray(body) ? body : (body.apiKeys || [body]);
-      console.log('[real] existing keys found:', keys.length);
-      if (keys.length > 0) {
-        const k = keys[0];
-        // Polymarket может возвращать apiKey или key — нормализуем в key
-        const normalized = {
-          key:        k.key        || k.apiKey    || k.api_key    || '',
-          secret:     k.secret     || k.apiSecret || k.api_secret || '',
-          passphrase: k.passphrase || k.passPhrase || '',
-          address:    polyWallet.address,
-        };
-        if (normalized.key && normalized.secret && normalized.passphrase) {
-          console.log('[real] existing key normalized, key prefix:', normalized.key.slice(0, 8));
-          return normalized;
-        }
-        console.warn('[real] GET returned key but fields missing:', JSON.stringify(k).slice(0, 200));
-      }
-    } else if (r.status === 405) {
-      console.log('[real] GET /auth/derive-api-key → 405 (not supported), skipping to POST');
-    } else {
-      const txt = await r.text().catch(() => '');
-      console.warn('[real] GET /auth/api-key failed:', r.status, txt.slice(0, 200));
-    }
   } catch (e) {
-    console.warn('[real] GET /auth/api-key exception:', e.message);
-  }
-
-  // Create a fresh key pair (POST)
-  console.log('[real] POST /auth/api-key (creating new key)...');
-  try {
-    const hdrs = await l1Headers('POST', '/auth/api-key');
-    const r2   = await fetch(`${POLY_CLOB}/auth/api-key`, { method: 'POST', headers: hdrs, signal: AbortSignal.timeout(10000) });
-    const txt2 = await r2.text();
-    console.log('[real] POST /auth/api-key HTTP', r2.status, txt2.slice(0, 300));
-    if (!r2.ok) {
-      if (r2.status === 400) {
-        throw new Error(
-          `Wallet ${polyWallet.address} is not registered on Polymarket (HTTP 400). ` +
-          'Fix: go to app.polymarket.com → Settings → API Keys → Create, ' +
-          'then add POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE to Railway env vars.'
-        );
-      }
-      throw new Error(`create api-key failed: HTTP ${r2.status} — ${txt2}`);
+    if (e instanceof ApiError) {
+      throw new Error(`CLOB ${e.status}: ${e.message}`);
     }
-    const raw2 = JSON.parse(txt2);
-    console.log('[real] POST /auth/api-key response fields:', Object.keys(raw2).join(','));
-    // Polymarket возвращает apiKey (не key) — нормализуем
-    const creds = {
-      key:        raw2.key        || raw2.apiKey    || raw2.api_key    || '',
-      secret:     raw2.secret     || raw2.apiSecret || raw2.api_secret || '',
-      passphrase: raw2.passphrase || raw2.passPhrase || '',
-      address:    polyWallet.address,
-    };
-    if (!creds.key || !creds.secret || !creds.passphrase) {
-      throw new Error(`POST /auth/api-key returned incomplete creds. Fields: ${Object.keys(raw2).join(',')}. ` +
-        'Fix: set POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE in Railway env vars manually ' +
-        '(go to app.polymarket.com → Settings → API Keys → Create).');
-    }
-    console.log('[real] new API key created, prefix:', creds.key.slice(0, 8));
-    return creds;
-  } catch (e) {
-    console.error('[real] POST /auth/api-key exception:', e.message);
     throw e;
   }
 }
 
-/**
- * Build and EIP-712 sign a Polymarket CTF order.
- *
- * @param {string}       tokenId   clobTokenId for the outcome
- * @param {'BUY'|'SELL'} side
- * @param {number}       size      BUY → USDC to spend; SELL → shares to sell
- * @param {number}       price     price per share (0–1), e.g. 0.55
- */
-async function buildSignedOrder(tokenId, side, size, price) {
-  const isBuy = side === 'BUY';
-  const MICRO = 1_000_000; // USDC and conditional tokens both use 6 decimal places
-
-  // BUY:  maker gives USDC (makerAmount),  taker gives shares (takerAmount)
-  // SELL: maker gives shares (makerAmount), taker gives USDC  (takerAmount)
-  const makerAmount = isBuy
-    ? BigInt(Math.round(size * MICRO))               // USDC to spend
-    : BigInt(Math.round(size * MICRO));               // shares to sell
-  const takerAmount = isBuy
-    ? BigInt(Math.round((size / price) * MICRO))     // shares to receive
-    : BigInt(Math.round((size * price) * MICRO));    // USDC to receive
-
-  const salt = BigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER));
-
-  const orderStruct = {
-    salt,
-    maker:         POLY_FUNDER || polyWallet.address,  // сейф, где лежат деньги
-    signer:        polyWallet.address,                 // EOA, которым подписываем
-    taker:         '0x0000000000000000000000000000000000000000',
-    tokenId:       BigInt(tokenId),
-    makerAmount,
-    takerAmount,
-    expiration:    0n,
-    nonce:         0n,
-    feeRateBps:    0n,
-    side:          isBuy ? 0 : 1,
-    // ✅ FIX: use SIG_TYPE from env instead of hardcoded POLY_FUNDER ? 2 : 0
-    // (was wrong: type 2 = Gnosis Safe, but MetaMask+proxy needs 1, deposit wallet needs 3)
-    signatureType: SIG_TYPE,
-  };
-
-  const signature = await polyWallet.signTypedData(ORDER_DOMAIN, ORDER_TYPES, orderStruct);
-
-  return {
-    salt:          salt.toString(),
-    maker:         (POLY_FUNDER || polyWallet.address),  // та же замена
-    signer:        polyWallet.address,
-    taker:         '0x0000000000000000000000000000000000000000',
-    tokenId:       tokenId.toString(),
-    makerAmount:   makerAmount.toString(),
-    takerAmount:   takerAmount.toString(),
-    expiration:    '0',
-    nonce:         '0',
-    feeRateBps:    '0',
-    side,
-    // ✅ FIX: use SIG_TYPE from env (same as orderStruct above)
-    signatureType: SIG_TYPE,
-    signature,
-  };
-}
-
-/**
- * Place an order on the Polymarket CLOB.
- * @param {{ tokenId, side, size, price, orderType? }} opts
- * @returns {{ orderID, status, ... }}
- */
-async function placeClobOrder({ tokenId, side, size, price, orderType = 'GTC' }) {
-  if (!polyWallet || !polyApiCreds) throw new Error('wallet not initialised');
-  if (!tokenId)                     throw new Error('tokenId is required');
-
-  const signedOrder = await buildSignedOrder(tokenId, side, size, price);
-  // owner must match POLY_ADDRESS in L2 headers (proxy address if using Gnosis Safe / funder, else EOA)
-  const ownerAddr   = process.env.POLY_API_OWNER || POLY_FUNDER || polyWallet.address;
-  const body        = JSON.stringify({ order: signedOrder, owner: ownerAddr, orderType });
-  const hdrs        = l2Headers('POST', '/order', body);
-
-  const res  = await fetch(`${POLY_CLOB}/order`, {
-    method: 'POST', headers: hdrs, body,
-    signal: AbortSignal.timeout(12000),
-  });
-  const data = await res.json().catch(() => ({}));
-
-  if (!res.ok || data.error || data.errorCode) {
-    throw new Error(data.errorMsg || data.error || data.errorCode || `HTTP ${res.status}`);
-  }
-  return data;  // { orderID, status, transactionsHashes?, ... }
-}
-
 /** Cancel an open order by ID. Safe to call even if already filled. */
 async function cancelClobOrder(orderId) {
-  if (!polyWallet || !polyApiCreds || !orderId) return;
+  if (!polyClob || !orderId) return;
   try {
-    // Correct endpoint: DELETE /order/{order_id} (path param, no body)
-    const reqPath = `/order/${orderId}`;
-    const hdrs    = l2Headers('DELETE', reqPath);
-    const res     = await fetch(`${POLY_CLOB}${reqPath}`, {
-      method: 'DELETE', headers: hdrs,
-      signal: AbortSignal.timeout(8000),
-    });
-    console.log(`[real] cancel orderId=${orderId} HTTP ${res.status}`);
-  } catch (e) { console.error('[real] cancel error:', e.message); }
-}
-
-/** Fetch real USDC balance from the CLOB API. */
-let _balanceFail401Count = 0;
-async function fetchRealBalance() {
-  if (!polyWallet || !polyApiCreds) return null;
-  try {
-    // Деньги и позиции лежат на PROXY-контракте (POLY_FUNDER), а не на EOA.
-    // Также POLY_ADDRESS в L2-заголовке должен совпадать с этим адресом
-    // (см. l2Headers — ключ зарегистрирован под proxy).
-    const owner   = POLY_FUNDER || polyWallet.address;
-    const reqPath = `/balance-allowance?asset_type=USDC&owner=${owner}`;
-    const hdrs    = l2Headers('GET', reqPath);
-    const res     = await fetch(`${POLY_CLOB}${reqPath}`, {
-      method: 'GET', headers: hdrs,
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      console.warn(`[real] balance-allowance HTTP ${res.status}: ${txt.slice(0, 200)}`);
-      if (res.status === 401) {
-        _balanceFail401Count++;
-        console.warn(`[real] 401 count=${_balanceFail401Count}. API key prefix: "${(polyApiCreds.key || '').slice(0,8)}..."`);
-        console.warn('[real] Если ключ не работает → добавь POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE в Railway env vars');
-        console.warn('[real] (app.polymarket.com → Settings → API Keys → Create)');
-        // После 3 неудач — пробуем переполучить ключ
-        if (_balanceFail401Count >= 3 && !process.env.POLY_API_KEY) {
-          _balanceFail401Count = 0;
-          console.log('[real] Попытка переполучить API key...');
-          try {
-            polyApiCreds = await getOrCreateApiKey();
-            console.log('[real] Новый ключ получен, prefix:', polyApiCreds.key.slice(0, 8));
-          } catch (e) {
-            console.error('[real] Не удалось переполучить ключ:', e.message);
-          }
-        }
-      }
-      return null;
-    }
-    _balanceFail401Count = 0;
-    const d = await res.json();
-    // Polymarket может возвращать разные поля
-    const b = parseFloat(d.balance ?? d.USDC ?? d.usdc ?? d.availableBalance ?? 0);
-    console.log(`[real] USDC balance fetched: $${b.toFixed(2)} (fields: ${Object.keys(d).join(',')})`);
-    return isNaN(b) ? null : b;
+    const resp = await polyClob.cancelOrder({ orderID: orderId });
+    console.log(`[real] cancel orderId=${orderId} →`, JSON.stringify(resp).slice(0, 200));
   } catch (e) {
-    console.warn('[real] fetchRealBalance error:', e.message);
-    return null;
+    console.error('[real] cancel error:', e.message);
   }
 }
 
 /** Get the status of a specific order. */
 async function getClobOrderStatus(orderId) {
-  if (!polyWallet || !polyApiCreds || !orderId) return null;
+  if (!polyClob || !orderId) return null;
   try {
-    const reqPath = `/order/${orderId}`;
-    const hdrs    = l2Headers('GET', reqPath);
-    const res     = await fetch(`${POLY_CLOB}${reqPath}`, {
-      method: 'GET', headers: hdrs,
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!res.ok) return null;
-    return res.json();
-  } catch (_) { return null; }
+    return await polyClob.getOrder(orderId);
+  } catch (e) {
+    return null;
+  }
 }
 
 /**
- * Boot: initialise wallet, derive API creds, sync real USDC balance.
+ * Fetch real USDC balance from the CLOB API via V2 SDK.
+ * Returns balance in dollars (number) or null on error.
+ *
+ * V2 introduced /balance-allowance/update — if /balance-allowance returns 0
+ * but wallet actually has funds on-chain, the CLOB cache is stale; calling
+ * updateBalanceAllowance forces re-sync. This is critical right after a
+ * deposit / approve.
+ */
+let _balanceUpdateAttempted = false;
+async function fetchRealBalance() {
+  if (!polyClob) return null;
+  try {
+    const res = await polyClob.getBalanceAllowance({ asset_type: 'COLLATERAL' });
+    // res = { balance: "13021947", allowance: "...", asset_address: "0x..." }
+    const balanceRaw = parseFloat(res?.balance || '0');
+    const balance    = balanceRaw / 1e6;  // USDC has 6 decimals
+    console.log(`[real] balance fetched: $${balance.toFixed(4)} (raw=${res?.balance}, allowance=${res?.allowance})`);
+
+    // If balance == 0 but we expect funds, try updateBalanceAllowance once.
+    // This is the V2-specific "sync cache" call.
+    if (balance === 0 && !_balanceUpdateAttempted) {
+      _balanceUpdateAttempted = true;
+      console.log('[real] balance==0, calling updateBalanceAllowance to sync cache...');
+      try {
+        await polyClob.updateBalanceAllowance({ asset_type: 'COLLATERAL' });
+        const res2  = await polyClob.getBalanceAllowance({ asset_type: 'COLLATERAL' });
+        const bal2  = parseFloat(res2?.balance || '0') / 1e6;
+        console.log(`[real] after updateBalanceAllowance: $${bal2.toFixed(4)}`);
+        return isNaN(bal2) ? null : bal2;
+      } catch (e) {
+        console.warn('[real] updateBalanceAllowance failed:', e.message);
+      }
+    }
+
+    return isNaN(balance) ? null : balance;
+  } catch (e) {
+    if (e instanceof ApiError) {
+      console.warn(`[real] balance-allowance HTTP ${e.status}: ${e.message}`);
+    } else {
+      console.warn('[real] fetchRealBalance error:', e.message);
+    }
+    return null;
+  }
+}
+
+/**
+ * Boot: initialise wallet, derive API creds via V2 SDK, sync real USDC balance.
  * Must be called AFTER initStrategies() and loadState().
  */
 async function initPolyWallet() {
-  // Диагностика — лог всегда, независимо от условий
-  console.log(`[real] initPolyWallet called. REAL_TRADING=${REAL_TRADING}, POLY_PK_set=${!!POLY_PK}, POLY_FUNDER=${POLY_FUNDER || '(none)'}`);
+  console.log(`[real] initPolyWallet called. REAL_TRADING=${REAL_TRADING}, POLY_PK_set=${!!POLY_PK}, POLY_FUNDER=${POLY_FUNDER || '(none)'}, SIG_TYPE=${SIG_TYPE}`);
   if (!REAL_TRADING) {
     console.log('[real] REAL_TRADING disabled — real account runs without on-chain orders');
     return;
@@ -1089,33 +780,54 @@ async function initPolyWallet() {
     return;
   }
   try {
-    // Validate private key format before creating wallet
     const pkNorm = POLY_PK.startsWith('0x') ? POLY_PK : '0x' + POLY_PK;
-    polyWallet   = new ethers.Wallet(pkNorm);
+
+    // Keep ethers Wallet for .address access in shared code paths (chainlink, etc.)
+    polyWallet = new ethers.Wallet(pkNorm);
+    _workingPolyAddress = polyWallet.address;
     console.log(`[real] wallet address : ${polyWallet.address}`);
     if (POLY_FUNDER) console.log(`[real] funder address : ${POLY_FUNDER}`);
-    polyApiCreds = await getOrCreateApiKey();
-    console.log(`[real] API key (initial): ${polyApiCreds.key}`);
 
-    // ─── AUTO-DETECT WORKING AUTH ────────────────────────────────────────────
-    // Перебираем все комбинации (env-keys + EOA, env-keys + FUNDER, derived + EOA,
-    // derived + FUNDER) пока не найдём ту, что даёт 200 от /balance-allowance.
-    // Результат записывается в polyApiCreds и _workingPolyAddress.
-    const auto = await autodetectAuth();
-    if (auto.ok) {
-      console.log(`[real] ✅ AUTH WORKING — все последующие запросы будут идти с этим набором`);
-      console.log(`[real] active creds source: ${polyApiCreds.source || 'env'}`);
-      console.log(`[real] active POLY_ADDRESS: ${_workingPolyAddress}`);
+    // viem walletClient — required by V2 SDK
+    const viemWallet = _buildViemWallet(pkNorm);
+    const sigType    = _resolveSigType();
+    const funderAddr = POLY_FUNDER || polyWallet.address;
+    console.log(`[real] resolved sigType: ${sigType} (${SignatureTypeV2[sigType]}), funder: ${funderAddr}`);
+
+    // ─── Step 1: bootstrap client (L1 only, no creds) ────────────────────────
+    const bootClient = _buildBootClient(viemWallet, sigType, funderAddr);
+
+    // ─── Step 2: get creds (env-provided OR derive via L1) ───────────────────
+    let creds;
+    if (process.env.POLY_API_KEY && process.env.POLY_API_SECRET && process.env.POLY_PASSPHRASE) {
+      creds = {
+        key:        process.env.POLY_API_KEY,
+        secret:     process.env.POLY_API_SECRET,
+        passphrase: process.env.POLY_PASSPHRASE,
+      };
+      console.log(`[real] using env-set API key: ${creds.key.slice(0, 8)}...`);
     } else {
-      console.error('[real] ❌ AUTO-DETECT НЕ НАШЁЛ РАБОЧУЮ КОМБИНАЦИЮ. Реальная торговля невозможна.');
-      console.error('[real] Все попытки:');
-      auto.attempts.forEach((a, i) => console.error(`  ${i+1}. ${JSON.stringify(a)}`));
-      console.error('[real] Возможные причины: гео-блок Railway IP / EOA не зарегистрирован на Polymarket / необходимо подписать ToS через UI');
+      console.log('[real] no env creds — deriving via V2 SDK createOrDeriveApiKey...');
+      creds = await bootClient.createOrDeriveApiKey();
+      console.log(`[real] derived API key: ${creds.key.slice(0, 8)}...`);
     }
-    realBalance  = await fetchRealBalance();
+    polyApiCreds = creds;
+
+    // ─── Step 3: build fully-authenticated client ────────────────────────────
+    polyClob = new ClobClient({
+      host:          POLY_CLOB,
+      chain:         Chain.POLYGON,
+      signer:        viemWallet,
+      creds,
+      signatureType: sigType,
+      funderAddress: funderAddr,
+      throwOnError:  true,  // surface ApiError instead of returning {error,status}
+    });
+
+    // ─── Step 4: smoke test L2 auth ──────────────────────────────────────────
+    realBalance = await fetchRealBalance();
     if (realBalance !== null) {
-      console.log(`[real] USDC balance   : $${realBalance.toFixed(2)}`);
-      // Sync Momentum real account balance with actual wallet balance
+      console.log(`[real] ✅ AUTH WORKING. USDC balance: $${realBalance.toFixed(2)}`);
       const mom = STRATEGIES.momentum;
       if (mom && realBalance > 0) {
         mom.real.balance     = realBalance;
@@ -1123,15 +835,17 @@ async function initPolyWallet() {
         saveState();
       }
     } else {
-      console.warn('[real] could not fetch USDC balance — check API creds');
-      // Don't throw here; wallet is still usable for order signing even if balance fetch fails.
-      // The balance will be retried every 30 s by the periodic refresh.
+      console.warn('[real] ⚠️  L2 auth or balance fetch failed — see prior logs');
+      console.warn('[real] If this persists: check that POLY_PRIVATE_KEY matches the wallet you used to log into Polymarket UI');
+      console.warn('[real] and that SIGNATURE_TYPE matches your account type (0=EOA, 1=Magic/email, 2=Phantom+Safe, 3=smart wallet)');
     }
   } catch (e) {
     console.error('[real] init failed:', e.message);
-    polyWallet   = null;   // stay in sim if anything goes wrong
+    if (e.stack) console.error(e.stack.split('\n').slice(0, 5).join('\n'));
+    polyWallet   = null;
+    polyClob     = null;
     polyApiCreds = null;
-    throw e;   // propagate so retry logic knows
+    throw e;
   }
 }
 
@@ -1156,17 +870,12 @@ async function initPolyWalletWithRetry(attempt = 1) {
 // Polymarket auto-cancels all open orders if no heartbeat is received for ~30s.
 // We send one every 15 seconds when real trading is active and a position is open.
 setInterval(async () => {
-  if (!REAL_TRADING || !polyWallet || !polyApiCreds) return;
+  if (!REAL_TRADING || !polyClob) return;
   const hasOpenPosition = Object.values(STRATEGIES).some(s => s.real.open?.isReal);
   if (!hasOpenPosition) return;
   try {
-    const hdrs = l2Headers('POST', '/heartbeat');
-    const res  = await fetch(`${POLY_CLOB}/heartbeat`, {
-      method: 'POST', headers: hdrs,
-      body: JSON.stringify({}),
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) console.warn('[real] heartbeat failed HTTP', res.status);
+    const resp = await polyClob.postHeartbeat();
+    if (resp && resp.error_msg) console.warn('[real] heartbeat error:', resp.error_msg);
   } catch (e) { console.warn('[real] heartbeat error:', e.message); }
 }, 15_000);
 setInterval(async () => {
@@ -1752,20 +1461,28 @@ app.post('/api/real/cancel', async (_, res) => {
   res.json({ ok: true, cancelledOrderId: mom.real.open.realOrderId });
 });
 
-// GET /api/real/redetect — manually re-run autodetectAuth (без рестарта).
-// Полезно после смены env vars в Railway, чтобы не ждать передеплой.
-app.get('/api/real/redetect', async (_, res) => {
-  if (!polyWallet) return res.status(400).json({ error: 'polyWallet not initialized' });
-  _workingPolyAddress = null;  // сбрасываем
-  const result = await autodetectAuth();
-  res.json({
-    ok:                  result.ok,
-    workingPolyAddress:  _workingPolyAddress,
-    activeApiKey:        polyApiCreds?.key,
-    activeCredsSource:   polyApiCreds?.source,
-    attempts:            result.attempts,
-  });
+// GET /api/real/reinit — re-run wallet initialization (без перезапуска контейнера).
+// Полезно после смены env vars в Railway. Заменил собой старый /redetect, т.к.
+// V2 SDK сам управляет правильной комбинацией auth — нечего "детектить".
+app.get('/api/real/reinit', async (_, res) => {
+  try {
+    polyClob = null;
+    polyApiCreds = null;
+    realBalance = null;
+    await initPolyWallet();
+    res.json({
+      ok:           !!polyClob,
+      wallet:       polyWallet ? polyWallet.address : null,
+      activeApiKey: polyApiCreds?.key || null,
+      balance:      realBalance,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
+
+// Backward-compat alias for the old /redetect path
+app.get('/api/real/redetect', (req, res) => res.redirect(307, '/api/real/reinit'));
 
 // POST /api/real/close-now — immediately close real position at current mid price
 app.post('/api/real/close-now', async (_, res) => {
@@ -1778,264 +1495,169 @@ app.post('/api/real/close-now', async (_, res) => {
   res.json({ ok: true, exitPrice: midPrice });
 });
 
-// GET /api/real/diagnose — detailed CLOB connectivity check
-// Open this in your browser after deploy to see what's actually happening
+// GET /api/real/diagnose — comprehensive diagnostic of the V2 auth stack.
+// Open this in your browser after deploy to see what's actually happening.
 app.get('/api/real/diagnose', async (_, res) => {
   const report = {
     timestamp:    new Date().toISOString(),
+    sdkVersion:   'CLOB V2 (@polymarket/clob-client-v2)',
     env: {
-      REAL_TRADING:      REAL_TRADING,
-      POLY_PRIVATE_KEY:  POLY_PK ? `set (${POLY_PK.length} chars)` : 'NOT SET',
-      POLY_FUNDER:       POLY_FUNDER || 'not set',
-      POLY_API_KEY:      process.env.POLY_API_KEY ? `${process.env.POLY_API_KEY.slice(0,8)}...` : 'not set',
-      POLY_API_SECRET:   process.env.POLY_API_SECRET ? `set (${process.env.POLY_API_SECRET.length} chars)` : 'not set',
-      POLY_PASSPHRASE:   process.env.POLY_PASSPHRASE ? `set (${process.env.POLY_PASSPHRASE.length} chars)` : 'not set',
-      POLY_API_OWNER:    process.env.POLY_API_OWNER || 'not set',
+      REAL_TRADING:    REAL_TRADING,
+      POLY_PRIVATE_KEY: POLY_PK ? `set (${POLY_PK.length} chars)` : 'NOT SET',
+      POLY_FUNDER:     POLY_FUNDER || 'not set',
+      POLY_API_KEY:    process.env.POLY_API_KEY ? `${process.env.POLY_API_KEY.slice(0,8)}...` : 'not set (will derive)',
+      POLY_API_SECRET: process.env.POLY_API_SECRET ? `set (${process.env.POLY_API_SECRET.length} chars)` : 'not set',
+      POLY_PASSPHRASE: process.env.POLY_PASSPHRASE ? `set (${process.env.POLY_PASSPHRASE.length} chars)` : 'not set',
+      SIGNATURE_TYPE:  SIG_TYPE,
     },
-    wallet:              polyWallet ? polyWallet.address : null,
-    walletReady:         !!(polyWallet && polyApiCreds),
-    activeApiKey:        polyApiCreds ? polyApiCreds.key : null,
-    activeCredsSource:   polyApiCreds ? (polyApiCreds.source || 'env') : null,
-    workingPolyAddress:  _workingPolyAddress || '(not detected — no working combination)',
+    wallet:           polyWallet ? polyWallet.address : null,
+    walletReady:      !!(polyWallet && polyClob),
+    activeApiKey:     polyApiCreds ? polyApiCreds.key : null,
     tests: {},
   };
 
-  if (!polyWallet || !polyApiCreds) {
-    report.error = 'wallet/creds not initialized — check Railway env vars';
-    return res.json(report);
-  }
-
-  // ─── ТЕСТ ДОСТУПНОСТИ POLYMARKET ИЗ RAILWAY ─────────────────────────────
-  // Стучимся в публичные endpoints без auth. Если они отвечают — геоблока нет,
-  // проблема в нашем auth flow. Если не отвечают — Railway IP заблокирован Polymarket.
+  // ─── PUBLIC ENDPOINTS (no auth — proves reachability / no geo-block) ────────
   try {
     const t0   = Date.now();
     const r    = await fetch(`${POLY_CLOB}/markets?limit=1`, { method: 'GET', signal: AbortSignal.timeout(8000) });
     const ms   = Date.now() - t0;
-    const txt  = await r.text();
     let parsed = null;
-    try { parsed = JSON.parse(txt); } catch {}
+    try { parsed = await r.json(); } catch {}
     report.tests.publicClob = {
-      url:     `${POLY_CLOB}/markets?limit=1`,
       status:  r.status,
       ok:      r.ok,
       ms,
       hasData: !!(parsed && (parsed.data || parsed.length || parsed.markets)),
-      preview: typeof parsed === 'object' ? Object.keys(parsed || {}).slice(0,5).join(',') : txt.slice(0, 100),
-      verdict: r.ok
-        ? '✅ Публичный CLOB доступен с Railway. Значит геоблока нет → проблема в auth (аккаунте/регистрации).'
-        : `❌ Публичный CLOB не отвечает (${r.status}). Возможен геоблок Railway IP.`,
+      verdict: r.ok ? '✅ Публичный CLOB доступен → не геоблок' : `❌ CLOB ${r.status} — возможен геоблок`,
     };
   } catch (e) {
-    report.tests.publicClob = {
-      error:   e.message,
-      verdict: '❌ Не смогли достучаться до публичного CLOB. Геоблок Railway IP вероятен.',
-    };
+    report.tests.publicClob = { error: e.message, verdict: '❌ network error' };
   }
 
-  // Дополнительно — проверим data-api (другой хост Polymarket)
-  try {
-    const r    = await fetch(`https://data-api.polymarket.com/value?user=${POLY_FUNDER || polyWallet.address}`, {
-      method: 'GET', signal: AbortSignal.timeout(8000),
-    });
-    const txt  = await r.text();
-    let parsed; try { parsed = JSON.parse(txt); } catch { parsed = txt.slice(0, 200); }
-    report.tests.dataApi = {
-      url:     `https://data-api.polymarket.com/value?user=${POLY_FUNDER ? 'FUNDER' : 'EOA'}`,
-      status:  r.status,
-      ok:      r.ok,
-      response: parsed,
-      verdict: r.ok ? '✅ data-api Polymarket видит твой аккаунт.' : '❌ data-api недоступен.',
-    };
-  } catch (e) {
-    report.tests.dataApi = { error: e.message };
-  }
-
-  // ─── РЕШАЮЩИЙ ТЕСТ ────────────────────────────────────────────────────────
-  // Берём credentials, которые Polymarket САМ возвращает для текущего EOA через
-  // GET /auth/derive-api-key (на 100% принадлежат этому EOA), и делаем balance-allowance
-  // с ними. Если этот тест пройдёт, а balanceAllowance с env-ключами — нет, значит
-  // ключи в env принадлежат ДРУГОМУ кошельку.
-  try {
-    // 1. derive credentials от текущего EOA
-    const l1 = await l1Headers('GET', '/auth/derive-api-key');
-    const r1 = await fetch(`${POLY_CLOB}/auth/derive-api-key`, { method: 'GET', headers: l1, signal: AbortSignal.timeout(10000) });
-    const derived = await r1.json();
-
-    if (!derived.apiKey) {
-      report.tests.derivedKeyTest = { skipped: true, reason: 'derive failed', response: derived };
-    } else {
-      // 2. вручную собираем L2 headers с derived креденшалами для balance-allowance
-      const ts      = String(Math.floor(Date.now() / 1000));
-      const reqPath = `/balance-allowance?asset_type=USDC&owner=${polyWallet.address}`;
-      const msg     = ts + 'GET' + reqPath;
-      const sec64   = derived.secret.replace(/-/g, '+').replace(/_/g, '/');
-      const sig     = crypto.createHmac('sha256', Buffer.from(sec64, 'base64'))
-                            .update(msg).digest('base64')
-                            .replace(/\+/g, '-').replace(/\//g, '_');
-
-      const r2 = await fetch(`${POLY_CLOB}${reqPath}`, {
-        method: 'GET',
-        headers: {
-          'POLY_ADDRESS':    polyWallet.address,
-          'POLY_SIGNATURE':  sig,
-          'POLY_TIMESTAMP':  ts,
-          'POLY_API_KEY':    derived.apiKey,
-          'POLY_PASSPHRASE': derived.passphrase,
-        },
-        signal: AbortSignal.timeout(8000),
-      });
-      const txt = await r2.text();
-      let parsed; try { parsed = JSON.parse(txt); } catch { parsed = txt; }
-
-      report.tests.derivedKeyTest = {
-        derivedApiKey:    derived.apiKey,
-        envApiKey:        polyApiCreds.key,
-        keysMatch:        derived.apiKey === polyApiCreds.key,
-        status:           r2.status,
-        ok:               r2.ok,
-        response:         parsed,
-        diagnosis:        r2.ok
-          ? '✅ DERIVED ключ работает! Значит env-ключи (' + polyApiCreds.key + ') принадлежат ДРУГОМУ кошельку. Поставь в Railway: POLY_API_KEY=' + derived.apiKey + ', POLY_API_SECRET=' + derived.secret + ', POLY_PASSPHRASE=' + derived.passphrase
-          : '❌ Даже DERIVED ключ возвращает ' + r2.status + '. Значит проблема не в ключах, а в чём-то ещё (HMAC формат / EOA не зарегистрирован на Polymarket / гео-блок).',
-      };
-    }
-  } catch (e) {
-    report.tests.derivedKeyTest = { error: e.message };
-  }
-
-  // Test 1: GET /balance-allowance с PROXY (правильный вариант для UI-keys)
-  try {
-    const owner   = POLY_FUNDER || polyWallet.address;
-    const reqPath = `/balance-allowance?asset_type=USDC&owner=${owner}`;
-    const hdrs    = l2Headers('GET', reqPath);
-    const t0      = Date.now();
-    const r       = await fetch(`${POLY_CLOB}${reqPath}`, { method: 'GET', headers: hdrs, signal: AbortSignal.timeout(8000) });
-    const txt     = await r.text();
-    let parsed;
-    try { parsed = JSON.parse(txt); } catch { parsed = txt; }
-    report.tests.balanceAllowance = {
-      url:          `${POLY_CLOB}${reqPath}`,
-      status:       r.status,
-      ok:           r.ok,
-      ms:           Date.now() - t0,
-      response:     parsed,
-      sentHeaders:  {
-        POLY_ADDRESS:    hdrs.POLY_ADDRESS,
-        POLY_API_KEY:    hdrs.POLY_API_KEY,
-        POLY_TIMESTAMP:  hdrs.POLY_TIMESTAMP,
-        POLY_SIGNATURE:  hdrs.POLY_SIGNATURE.slice(0, 16) + '...' + hdrs.POLY_SIGNATURE.slice(-4),
-        sigContainsPlus: hdrs.POLY_SIGNATURE.includes('+'),
-        sigContainsSlash: hdrs.POLY_SIGNATURE.includes('/'),
-        sigContainsDash: hdrs.POLY_SIGNATURE.includes('-'),
-        sigContainsUnderscore: hdrs.POLY_SIGNATURE.includes('_'),
-      },
-    };
-  } catch (e) {
-    report.tests.balanceAllowance = { error: e.message };
-  }
-
-  // Test 1b: same запрос, но временно подменив POLY_ADDRESS на EOA — чтобы было видно
-  // какой адрес Polymarket принимает. Если этот тест проходит, а balanceAllowance — нет,
-  // значит ключ зарегистрирован под EOA, а не под proxy.
-  if (POLY_FUNDER) {
+  // ─── ON-CHAIN BALANCES (independent of CLOB auth) ───────────────────────────
+  if (polyWallet) {
     try {
-      const savedOwner = process.env.POLY_API_OWNER;
-      process.env.POLY_API_OWNER = polyWallet.address;  // временно
-      const reqPath = `/balance-allowance?asset_type=USDC&owner=${polyWallet.address}`;
-      const hdrs    = l2Headers('GET', reqPath);
-      // восстанавливаем сразу
-      if (savedOwner === undefined) delete process.env.POLY_API_OWNER;
-      else process.env.POLY_API_OWNER = savedOwner;
-      const r   = await fetch(`${POLY_CLOB}${reqPath}`, { method: 'GET', headers: hdrs, signal: AbortSignal.timeout(8000) });
+      const provider     = getRpcProvider(POLYGON_RPCS[0]);
+      const USDC_NATIVE  = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359';
+      const USDC_BRIDGED = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+      const erc20Abi     = ['function balanceOf(address) view returns (uint256)'];
+      const cBridged     = new ethers.Contract(USDC_BRIDGED, erc20Abi, provider);
+      const cNative      = new ethers.Contract(USDC_NATIVE,  erc20Abi, provider);
+      const checks       = {};
+      const eoa          = polyWallet.address;
+      checks.EOA = { addr: eoa };
+      try { checks.EOA.usdc_bridged = Number(await cBridged.balanceOf(eoa)) / 1e6; } catch {}
+      try { checks.EOA.usdc_native  = Number(await cNative .balanceOf(eoa)) / 1e6; } catch {}
+      try { checks.EOA.matic        = Number(await provider.getBalance(eoa)) / 1e18; } catch {}
+      try { checks.EOA.code         = (await provider.getCode(eoa)) === '0x' ? 'EOA (no code)' : 'contract'; } catch {}
+      if (POLY_FUNDER) {
+        checks.FUNDER = { addr: POLY_FUNDER };
+        try { checks.FUNDER.usdc_bridged = Number(await cBridged.balanceOf(POLY_FUNDER)) / 1e6; } catch {}
+        try { checks.FUNDER.usdc_native  = Number(await cNative .balanceOf(POLY_FUNDER)) / 1e6; } catch {}
+        try {
+          const code = await provider.getCode(POLY_FUNDER);
+          checks.FUNDER.code = code === '0x'
+            ? '⚠ NO CONTRACT — этот адрес не задеплоен. Это НЕ proxy.'
+            : `contract (${code.length} bytes) ✓`;
+        } catch {}
+      }
+      report.tests.onChain = checks;
+    } catch (e) {
+      report.tests.onChain = { error: e.message };
+    }
+  }
+
+  // ─── GAMMA PROFILE (returns user's real trading proxy by EOA) ───────────────
+  if (polyWallet) {
+    try {
+      const url = `https://gamma-api.polymarket.com/profile?address=${polyWallet.address}`;
+      const r   = await fetch(url, { method: 'GET', signal: AbortSignal.timeout(8000) });
       const txt = await r.text();
-      let parsed;
-      try { parsed = JSON.parse(txt); } catch { parsed = txt; }
-      report.tests.balanceAllowance_asEOA = {
-        status: r.status, ok: r.ok, response: parsed,
-        sentPolyAddress: hdrs.POLY_ADDRESS,
-        note: r.ok
-          ? 'Ключ зарегистрирован под EOA. Поставь POLY_API_OWNER=<EOA> в env.'
-          : 'И с EOA тоже 401 — ключ либо неверен, либо требует чего-то ещё.',
+      let p; try { p = JSON.parse(txt); } catch { p = txt.slice(0,300); }
+      report.tests.gammaProfile = {
+        status:   r.status,
+        response: p,
+        hint:     r.ok && p?.proxyWallet
+          ? `🎯 Настоящий торговый proxy: ${p.proxyWallet}. Если POLY_FUNDER ≠ этот адрес — замени.`
+          : (r.ok ? 'gamma вернул профиль' : `EOA не зарегистрирован в Polymarket (${r.status})`),
       };
     } catch (e) {
-      report.tests.balanceAllowance_asEOA = { error: e.message };
+      report.tests.gammaProfile = { error: e.message };
     }
   }
 
-  // Test 2: check USDC on EOA, proxy, and bridged USDC variant
-  try {
-    const provider  = getRpcProvider(POLYGON_RPCS[0]);
-    const USDC_NEW  = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359';  // Native USDC (Circle)
-    const USDC_BRIDGED = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';  // Bridged USDC.e
-    const erc20Abi  = ['function balanceOf(address) view returns (uint256)'];
-    const c1 = new ethers.Contract(USDC_BRIDGED, erc20Abi, provider);
-    const c2 = new ethers.Contract(USDC_NEW,     erc20Abi, provider);
-
-    const checks = {};
-    const eoa = polyWallet.address;
-    checks.EOA = { addr: eoa };
-    try { checks.EOA.usdc_bridged = Number(await c1.balanceOf(eoa)) / 1e6; } catch (e) { checks.EOA.usdc_bridged_err = e.message; }
-    try { checks.EOA.usdc_native  = Number(await c2.balanceOf(eoa)) / 1e6; } catch (e) { checks.EOA.usdc_native_err  = e.message; }
-    try { checks.EOA.code = (await provider.getCode(eoa)) === '0x' ? 'EOA (no code)' : 'contract'; } catch {}
-
-    if (POLY_FUNDER) {
-      checks.FUNDER = { addr: POLY_FUNDER };
-      try { checks.FUNDER.usdc_bridged = Number(await c1.balanceOf(POLY_FUNDER)) / 1e6; } catch (e) { checks.FUNDER.usdc_bridged_err = e.message; }
-      try { checks.FUNDER.usdc_native  = Number(await c2.balanceOf(POLY_FUNDER)) / 1e6; } catch (e) { checks.FUNDER.usdc_native_err  = e.message; }
+  // ─── V2 SDK SMOKE TEST (real L2 auth round-trip) ────────────────────────────
+  if (polyClob) {
+    try {
+      const t0 = Date.now();
+      const r  = await polyClob.getBalanceAllowance({ asset_type: 'COLLATERAL' });
+      report.tests.v2BalanceAllowance = {
+        ms:      Date.now() - t0,
+        ok:      true,
+        balance: r?.balance ? `$${(parseFloat(r.balance)/1e6).toFixed(4)}` : 'n/a',
+        raw:     r,
+        verdict: '✅ V2 L2 auth работает',
+      };
+    } catch (e) {
+      report.tests.v2BalanceAllowance = {
+        ok:      false,
+        error:   e.message,
+        status:  e instanceof ApiError ? e.status : undefined,
+        data:    e instanceof ApiError ? e.data   : undefined,
+        verdict: '❌ V2 L2 auth fails',
+        hint:    (e.message?.includes('401') || e.status === 401)
+          ? 'Аккаунт не активирован для CLOB. Проверь: 1) залогинен ли этим кошельком в polymarket.com 2) принят ли ToS 3) SIGNATURE_TYPE правильный (0=EOA,1=Magic,2=Phantom+Safe,3=smart)'
+          : 'возможно нужен updateBalanceAllowance (V2 sync)',
+      };
       try {
-        const code = await provider.getCode(POLY_FUNDER);
-        checks.FUNDER.code = code === '0x'
-          ? '⚠ NO CONTRACT — этот адрес не задеплоен. Скорее всего, это НЕ твой Polymarket прокси.'
-          : `contract (${code.length} bytes of bytecode) ✓`;
-      } catch (e) { checks.FUNDER.code_err = e.message; }
+        await polyClob.updateBalanceAllowance({ asset_type: 'COLLATERAL' });
+        const r2 = await polyClob.getBalanceAllowance({ asset_type: 'COLLATERAL' });
+        report.tests.v2BalanceAllowance.afterUpdate = {
+          balance: r2?.balance ? `$${(parseFloat(r2.balance)/1e6).toFixed(4)}` : 'n/a',
+          verdict: '✅ заработало после updateBalanceAllowance',
+        };
+      } catch (e2) {
+        report.tests.v2BalanceAllowance.afterUpdate = {
+          error:  e2.message,
+          status: e2 instanceof ApiError ? e2.status : undefined,
+        };
+      }
     }
-
-    report.tests.onChain = checks;
-  } catch (e) {
-    report.tests.onChain = { error: e.message };
+    try {
+      const orders = await polyClob.getOpenOrders({}, true);
+      report.tests.v2OpenOrders = { ok: true, count: orders?.data?.length || 0 };
+    } catch (e) {
+      report.tests.v2OpenOrders = { ok: false, error: e.message, status: e instanceof ApiError ? e.status : undefined };
+    }
+  } else {
+    report.tests.v2BalanceAllowance = { skipped: 'polyClob not initialized — see logs for init error' };
   }
 
-  // Test 3: try POST /auth/api-key — does Polymarket accept this wallet for trading at all?
-  try {
-    const hdrs = await l1Headers('POST', '/auth/api-key');
-    const t0   = Date.now();
-    const r    = await fetch(`${POLY_CLOB}/auth/api-key`, {
-      method: 'POST', headers: hdrs, signal: AbortSignal.timeout(10000),
-    });
-    const txt  = await r.text();
-    let parsed;
-    try { parsed = JSON.parse(txt); } catch { parsed = txt; }
-    report.tests.createApiKey = {
-      url:      `${POLY_CLOB}/auth/api-key`,
-      status:   r.status,
-      ok:       r.ok,
-      ms:       Date.now() - t0,
-      response: parsed,
-      note:     r.status === 400 || r.status === 401
-        ? 'Кошелёк не зарегистрирован в системе Polymarket. Зайди на app.polymarket.com Phantom-ом (EOA), прими ToS, создай ключ через Settings → API Keys.'
-        : (r.ok ? 'Ключ можно создать через API! Перезапиши env vars.' : 'неожиданный ответ'),
-    };
-  } catch (e) {
-    report.tests.createApiKey = { error: e.message };
-  }
-
-  // Test 4: GET /auth/derive-api-key — what key does Polymarket think you should have?
-  try {
-    const hdrs = await l1Headers('GET', '/auth/derive-api-key');
-    const r    = await fetch(`${POLY_CLOB}/auth/derive-api-key`, {
-      method: 'GET', headers: hdrs, signal: AbortSignal.timeout(10000),
-    });
-    const txt  = await r.text();
-    let parsed;
-    try { parsed = JSON.parse(txt); } catch { parsed = txt; }
-    report.tests.deriveApiKey = {
-      status:   r.status,
-      ok:       r.ok,
-      response: parsed,
-    };
-  } catch (e) {
-    report.tests.deriveApiKey = { error: e.message };
+  // ─── L1 AUTH PROBE (independent attempt to derive a fresh key) ──────────────
+  if (polyWallet && POLY_PK) {
+    try {
+      const pkNorm      = POLY_PK.startsWith('0x') ? POLY_PK : '0x' + POLY_PK;
+      const viemWallet  = _buildViemWallet(pkNorm);
+      const sigType     = _resolveSigType();
+      const funderAddr  = POLY_FUNDER || polyWallet.address;
+      const probeClient = _buildBootClient(viemWallet, sigType, funderAddr);
+      const t0 = Date.now();
+      const creds = await probeClient.createOrDeriveApiKey();
+      report.tests.v2L1Auth = {
+        ms:         Date.now() - t0,
+        ok:         true,
+        apiKey:     creds.key.slice(0, 8) + '...',
+        matchesEnv: !!process.env.POLY_API_KEY && creds.key === process.env.POLY_API_KEY,
+        verdict:    '✅ L1 EIP-712 подпись принята Polymarket → wallet валидный',
+      };
+    } catch (e) {
+      report.tests.v2L1Auth = {
+        ok:      false,
+        error:   e.message,
+        status:  e instanceof ApiError ? e.status : undefined,
+        verdict: '❌ L1 auth fails — wallet/sigType/funder неверен',
+      };
+    }
   }
 
   res.json(report);

@@ -1,7 +1,7 @@
 {
   "name": "btc-scalp-bot",
-  "version": "6.0.0",
-  "description": "BTC Polymarket scalp bot — server edition",
+  "version": "7.0.0",
+  "description": "BTC Polymarket scalp bot — CLOB V2 edition",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -10,9 +10,11 @@
   "dependencies": {
     "express": "^4.19.2",
     "ws": "^8.17.1",
-"ethers": "^6.13.1"
+    "ethers": "^6.13.1",
+    "@polymarket/clob-client-v2": "^1.0.6",
+    "viem": "^2.21.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.10.0"
   }
 }
