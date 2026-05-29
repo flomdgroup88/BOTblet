@@ -763,11 +763,20 @@ async function placeClobOrder({ tokenId, side, size, price, orderType = 'GTC' })
   // Then enforce 5-share Polymarket minimum either way.
   let sizeShares = side === 'BUY' ? (size / price) : size;
 
-  // Round UP to 2-decimal precision so we never undershoot the minimum
-  sizeShares = Math.ceil(sizeShares * 100) / 100;
+  // BUY: round UP so we clear the 5-share minimum.
+  // SELL: round DOWN so we never ask for more shares than we actually own.
+  //       Asking for ceil(5.3469)=5.35 while holding 5.3469 is exactly what
+  //       produced "not enough balance: 5346922 vs 5350000".
+  if (side === 'SELL') {
+    sizeShares = Math.floor(sizeShares * 100) / 100;
+  } else {
+    sizeShares = Math.ceil(sizeShares * 100) / 100;
+  }
 
-  // Polymarket floor: 5 shares per order
-  if (sizeShares < POLYMARKET_MIN_SHARES) sizeShares = POLYMARKET_MIN_SHARES;
+  // Polymarket floor: 5 shares per RESTING order. Only bump BUYs — never bump a
+  // SELL up to 5, because we can't sell shares we don't hold. The caller handles
+  // sub-5 leftovers by letting them ride to SETTLE.
+  if (side === 'BUY' && sizeShares < POLYMARKET_MIN_SHARES) sizeShares = POLYMARKET_MIN_SHARES;
 
   const dollarValue = sizeShares * price;
   const userOrder = {
@@ -1074,6 +1083,8 @@ const REAL_MIN_PRICE         = 0.10;     // Skip if either side < 10¢ — marke
 const REAL_MAX_PRICE         = 0.90;     // Skip if our entry side > 90¢ — bad RR even when right
 const REAL_MIN_MS_TO_END     = 45_000;   // Need ≥45s left in window — else no time to play out
 const REAL_COOLDOWN_MS       = 20_000;   // Wait ≥20s after any real close before opening again
+const REAL_BUY_SLIPPAGE      = 0.02;     // Cross the spread by 2¢ so a marketable BUY fills immediately
+                                         // (limit price acts as a cap — you still fill at the best ask)
 const REAL_DAILY_LOSS_CAP    = parseFloat(process.env.REAL_DAILY_LOSS_CAP || '3');  // USD; -$3 default
                                                                                     // After cap is hit, real autodisables until next UTC day
 
@@ -1113,6 +1124,15 @@ function getStratContext() {
 }
 
 function stratOpen(s, ctx, entry, acct, isReal) {
+  // ── HARD STOP: never trade on simulated / fake BTC prices ───────────────────
+  // If the Coinbase feed dropped and we fell into random-walk SIM mode, the
+  // UP/DOWN signal is built on Math.random() and is meaningless. Block ALL
+  // entries — demo AND real — until a real price feed returns. Keeps demo stats
+  // honest and protects real funds from coin-flip trades.
+  if (isSim) {
+    return;
+  }
+
   // ── Safety guard: never size a real trade from the default $1000 placeholder ──
   // If the USDC balance was never successfully fetched from CLOB, bail out.
   if (isReal && REAL_TRADING && realBalance === null) {
@@ -1123,12 +1143,13 @@ function stratOpen(s, ctx, entry, acct, isReal) {
   // For real accounts, always use the live wallet balance for sizing (not stale state value)
   const effectiveBalance = isReal && realBalance !== null ? realBalance : acct.balance;
   let sizeUSDC = sizingByKelly(effectiveBalance, entry.ourProb, entry.polyPrice, s.params.kellyFrac, s.params.maxFrac);
-  // For sim: reject tiny sizes immediately. For real: check AFTER the 5-share
-  // bump below, so a $0.94 Kelly still becomes $3.03 (5 shares × 60.5¢) and passes.
-  if (!isReal && sizeUSDC < 1)            return;
+  // The < $1 floor is checked AFTER the 5-share bump below — and now applies to
+  // demo too, so demo mirrors the real strategy exactly.
   if (sizeUSDC > effectiveBalance * 0.95) return;
 
-  const isRealOrder = isReal && s.def.id === 'momentum' && !!polyWallet && !!polyApiCreds;
+  // Real orders also require !isSim (already guaranteed by the hard stop above,
+  // kept here as defense-in-depth) plus a configured wallet.
+  const isRealOrder = isReal && !isSim && s.def.id === 'momentum' && !!polyWallet && !!polyApiCreds;
   const tokenId     = entry.side === 'UP' ? poly.market?.tokenIdUp : poly.market?.tokenIdDown;
 
   // For real orders: need tokenId
@@ -1137,9 +1158,39 @@ function stratOpen(s, ctx, entry, acct, isReal) {
     return;
   }
 
-  // ── REAL-TRADING RISK CONTROLS ─────────────────────────────────────────────
-  // Each guard below applies ONLY to real orders — demo keeps trading
-  // unhindered so we still collect statistics.
+  // ── MARKET-CONDITION GUARDS — applied to BOTH demo and real ─────────────────
+  // Demo now mirrors real so its statistics reflect the live strategy, not a
+  // fantasy that buys 1¢ lottery tokens. Account-specific money risk controls
+  // (the daily-loss breaker) stay real-only, just below.
+  const acctTag = isReal ? 'real' : 'demo';
+
+  // [Guard A] Skip extreme prices. When one side trades ≤ 10¢ the market has
+  // effectively decided the outcome. Our model still says "50/50" so edge looks
+  // gigantic (+50pp), but it's a mathematical artifact — and on 2¢ tokens any
+  // micro-move is a huge % swing, so SL triggers within 1 second. This single
+  // guard is what kills the fake-profit 1¢ lottery trades on demo, too.
+  const oppositePrice = entry.side === 'UP' ? ctx.polyDn : ctx.polyUp;
+  if (entry.polyPrice < REAL_MIN_PRICE || entry.polyPrice > REAL_MAX_PRICE
+      || oppositePrice < REAL_MIN_PRICE || oppositePrice > REAL_MAX_PRICE) {
+    console.log(`[${acctTag}] SKIP extreme price — ${entry.side}=${(entry.polyPrice*100).toFixed(1)}¢ / opp=${(oppositePrice*100).toFixed(1)}¢ (market already decided)`);
+    return;
+  }
+
+  // [Guard D] Need enough time left in the window for SL/TP to play out.
+  if (ctx.msToEnd < REAL_MIN_MS_TO_END) {
+    console.log(`[${acctTag}] SKIP — only ${Math.round(ctx.msToEnd/1000)}s left in window, need ≥${REAL_MIN_MS_TO_END/1000}s`);
+    return;
+  }
+
+  // [Guard C] Per-account cooldown after this account's last close (20s buffer
+  // so a stuck SELL / balance sync can settle before the next trade).
+  const sinceClose = Date.now() - (acct.lastCloseTime || 0);
+  if (sinceClose < REAL_COOLDOWN_MS) {
+    console.log(`[${acctTag}] SKIP — cooldown, ${Math.round((REAL_COOLDOWN_MS - sinceClose)/1000)}s remaining`);
+    return;
+  }
+
+  // ── REAL-ONLY MONEY RISK CONTROL ────────────────────────────────────────────
   if (isRealOrder) {
     // Reset daily-loss bucket if we've rolled into a new UTC day.
     const utcToday = new Date().toISOString().slice(0, 10);
@@ -1148,66 +1199,35 @@ function stratOpen(s, ctx, entry, acct, isReal) {
       s.realDailyLossAmount   = 0;
       s.realDailyAutoDisabled = false;
     }
-
-    // [Guard E] Daily-loss circuit-breaker: once total real losses today
-    // exceed REAL_DAILY_LOSS_CAP, autodisable real until the user flips it
-    // back on (or until UTC midnight rolls over).
+    // [Guard E] Daily-loss circuit-breaker: once real losses today exceed
+    // REAL_DAILY_LOSS_CAP, auto-disable real until the user re-enables (or UTC
+    // midnight rolls over). TG warning was sent when the breaker fired.
     if (s.realDailyAutoDisabled) {
-      // Silent skip — TG warning was sent when the breaker fired.
-      return;
-    }
-
-    // [Guard A] Skip extreme prices. When one side trades ≤ 10¢, the market
-    // has effectively decided the outcome. Our model still says "50/50" so
-    // edge looks gigantic (+50pp), but it's mathematical artifact — the
-    // market knows something our predictor doesn't (e.g. window almost over,
-    // BTC already 100¢ in the other direction). On 2¢ tokens any micro-move
-    // is a huge % swing, so ADVERSE/SL triggers within 1 second and we
-    // spam-trade ourselves to zero. This single guard would have blocked
-    // all 6 burned trades from window 1779977100.
-    const oppositePrice = entry.side === 'UP' ? ctx.polyDn : ctx.polyUp;
-    if (entry.polyPrice < REAL_MIN_PRICE || entry.polyPrice > REAL_MAX_PRICE
-        || oppositePrice < REAL_MIN_PRICE || oppositePrice > REAL_MAX_PRICE) {
-      console.log(`[real] SKIP extreme price — ${entry.side}=${(entry.polyPrice*100).toFixed(1)}¢ / opp=${(oppositePrice*100).toFixed(1)}¢ (market already decided)`);
-      return;
-    }
-
-    // [Guard D] Need enough time left in the window. Less than 45s and SL/TP
-    // won't get a chance to work out — the position will just expire.
-    if (ctx.msToEnd < REAL_MIN_MS_TO_END) {
-      console.log(`[real] SKIP — only ${Math.round(ctx.msToEnd/1000)}s left in window, need ≥${REAL_MIN_MS_TO_END/1000}s`);
-      return;
-    }
-
-    // [Guard C] Cooldown after any real close. Even across windows, give a
-    // 20-second buffer so a stuck SELL or a wallet-balance sync can complete
-    // before we touch another trade.
-    const sinceClose = Date.now() - (s.lastRealCloseTime || 0);
-    if (sinceClose < REAL_COOLDOWN_MS) {
-      console.log(`[real] SKIP — cooldown, ${Math.round((REAL_COOLDOWN_MS - sinceClose)/1000)}s remaining`);
       return;
     }
   }
 
-  // ── Real-order sizing: enforce Polymarket 5-share minimum ──────────────────
+  // ── Sizing: enforce Polymarket 5-share minimum (BOTH demo and real) ─────────
   // If Kelly says $1.30 but at price 0.36 that's only 3.6 shares < 5, bump the
-  // trade up to 5 shares so we can SELL it later (every SELL needs ≥5 shares).
-  // This may push the trade above maxFrac but it's required for the position
-  // to be exitable. Skip if even 5 shares would blow >95% of balance.
+  // trade up to 5 shares so it's exitable later (every SELL needs ≥5 shares).
+  // Demo respects the same constraint so its trade list and sizing match what
+  // real would actually do. Skip if even 5 shares would blow >95% of balance.
   let plannedShares = null;
-  if (isRealOrder) {
+  {
     const kellyShares = sizeUSDC / entry.polyPrice;
     plannedShares = Math.max(POLYMARKET_MIN_SHARES, Math.ceil(kellyShares * 100) / 100);
     const requiredUSDC = plannedShares * entry.polyPrice;
     // Apply the < $1 guard AFTER bump (edge case: very low price + tiny balance)
     if (requiredUSDC < 1) return;
     if (requiredUSDC > effectiveBalance * 0.95) {
-      console.warn(`[real] skipping OPEN — 5-share minimum ($${requiredUSDC.toFixed(2)}) exceeds 95% of balance ($${effectiveBalance.toFixed(2)}). Pop up balance to trade at this price.`);
-      sendTg(
-        `⚠️ <b>Сделка пропущена</b>\n` +
-        `5 shares × ${(entry.polyPrice * 100).toFixed(1)}¢ = $${requiredUSDC.toFixed(2)} — больше 95% твоего баланса $${effectiveBalance.toFixed(2)}.\n` +
-        `Пополни кошелёк или подожди более выгодной цены.`
-      );
+      if (isRealOrder) {
+        console.warn(`[real] skipping OPEN — 5-share minimum ($${requiredUSDC.toFixed(2)}) exceeds 95% of balance ($${effectiveBalance.toFixed(2)}). Pop up balance to trade at this price.`);
+        sendTg(
+          `⚠️ <b>Сделка пропущена</b>\n` +
+          `5 shares × ${(entry.polyPrice * 100).toFixed(1)}¢ = $${requiredUSDC.toFixed(2)} — больше 95% твоего баланса $${effectiveBalance.toFixed(2)}.\n` +
+          `Пополни кошелёк или подожди более выгодной цены.`
+        );
+      }
       return;
     }
     // Bumped: use the corrected size for both sim accounting and the real order
@@ -1251,15 +1271,28 @@ function stratOpen(s, ctx, entry, acct, isReal) {
       `Edge: ${(entry.edge * 100).toFixed(1)}pp\n` +
       `Баланс: $${effectiveBalance.toFixed(2)}`
     );
-    placeClobOrder({ tokenId, side: 'BUY', size: sizeUSDC, price: entry.polyPrice })
-      .then(result => {
+    // Cross the spread + FAK so the entry fills immediately (status=matched) or
+    // is killed — instead of resting as a GTC limit (status=live) that fills
+    // partially/never and later makes the SELL fail with "not enough balance".
+    const buyPrice = Math.min(0.99, parseFloat((entry.polyPrice + REAL_BUY_SLIPPAGE).toFixed(4)));
+    placeClobOrder({ tokenId, side: 'BUY', size: sizeUSDC, price: buyPrice, orderType: 'FAK' })
+      .then(async result => {
         s.pendingReal = false;
         if (acct.open) {
           acct.open.realOrderId     = result.orderID;
           acct.open.realOrderStatus = result.status || 'placed';
-          acct.open.actualShares    = result.actualShares;  // ← critical: what we'll SELL
+          acct.open.actualShares    = result.actualShares;  // requested; refined below
+          // Replace with the TRUE on-chain balance so the later SELL sells
+          // exactly what we own (no overshoot). Best-effort — the SELL path
+          // re-checks the balance anyway, so a lag/miss here is harmless.
+          try {
+            await polyClob.updateBalanceAllowance({ asset_type: 'CONDITIONAL', token_id: tokenId });
+            const bal     = await polyClob.getBalanceAllowance({ asset_type: 'CONDITIONAL', token_id: tokenId });
+            const onchain = Math.floor((parseFloat(bal?.balance || '0') / 1e6) * 100) / 100;
+            if (onchain > 0) acct.open.actualShares = onchain;
+          } catch (_) { /* keep requested size; SELL re-checks balance */ }
           saveState();
-          console.log(`[real] BUY placed orderId=${result.orderID} status=${result.status} actualShares=${result.actualShares}`);
+          console.log(`[real] BUY placed orderId=${result.orderID} status=${result.status} shares=${acct.open.actualShares}`);
         }
       })
       .catch(err => {
@@ -1297,8 +1330,9 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
 
   const pnl   = proceeds - o.sizeUSDC;
   const entry = { ...o, closeTime: Date.now(), reason, proceeds, pnl, won, btcAtClose: ctx.curBTC, polyExitPrice: exitPolyPrice, strategy: s.def.id };
-  acct.balance    += proceeds;
-  acct.peakBalance = Math.max(acct.peakBalance, acct.balance);
+  acct.balance      += proceeds;
+  acct.peakBalance   = Math.max(acct.peakBalance, acct.balance);
+  acct.lastCloseTime = Date.now();   // per-account cooldown (demo + real)
   acct.log.push(entry);
   if (acct.log.length > 500) acct.log.shift();
   acct.open = null;
@@ -1385,15 +1419,38 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
       syncBalanceAfter(90_000, 'post-settle');
     } else if (o.tokenId && o.realOrderId && exitPolyPrice > 0.01) {
       // Early exit (TP / SL / FLIP / ADVERSE): sell shares back on CLOB.
-      // Use a slightly-below-market price so it's marketable (executes against
-      // the best bid immediately) but doesn't give away too much spread.
+      // Read the REAL on-chain balance first and sell exactly that (rounded
+      // down), so we can never request more than we own → no more CLOB 400.
       const sellPrice = Math.max(0.01, parseFloat((exitPolyPrice * 0.99).toFixed(4)));
-      placeClobOrder({ tokenId: o.tokenId, side: 'SELL', size: shares, price: sellPrice })
-        .then(result => {
+      (async () => {
+        let sellShares = shares;
+        try {
+          await polyClob.updateBalanceAllowance({ asset_type: 'CONDITIONAL', token_id: o.tokenId });
+          const bal     = await polyClob.getBalanceAllowance({ asset_type: 'CONDITIONAL', token_id: o.tokenId });
+          const onchain = parseFloat(bal?.balance || '0') / 1e6;
+          if (onchain > 0) sellShares = Math.min(shares, onchain);
+        } catch (e) {
+          console.warn('[real] could not read CONDITIONAL balance before SELL — using model shares:', e.message);
+        }
+        sellShares = Math.floor(sellShares * 100) / 100;   // round down to real precision
+
+        // Can't place a resting SELL below the 5-share minimum — let it ride to
+        // SETTLE instead of throwing a guaranteed CLOB 400.
+        if (sellShares < POLYMARKET_MIN_SHARES) {
+          console.warn(`[real] only ${sellShares} shares on-chain (<${POLYMARKET_MIN_SHARES}) — cannot place resting SELL, letting it ride to SETTLE`);
+          sendTg(
+            `ℹ️ <b>SELL пропущен</b> (${_tgEsc(reason)})\n` +
+            `На кошельке ${sellShares} shares — меньше минимума ${POLYMARKET_MIN_SHARES}. Позиция дойдёт до SETTLE.`
+          );
+          syncBalanceAfter(Math.max(60_000, o.expiryTime + 90_000 - Date.now()), 'post-SETTLE-fallback');
+          return;
+        }
+
+        try {
+          const result = await placeClobOrder({ tokenId: o.tokenId, side: 'SELL', size: sellShares, price: sellPrice });
           console.log(`[real] SELL placed orderId=${result.orderID} reason=${reason} price=${sellPrice} shares=${result.actualShares}`);
           syncBalanceAfter(8_000, 'post-SELL');
-        })
-        .catch(err => {
+        } catch (err) {
           console.error(`[real] SELL order FAILED (${reason}):`, err.message);
           sendTg(
             `⚠️ <b>SELL не прошёл</b> (${_tgEsc(reason)})\n` +
@@ -1402,7 +1459,8 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
           );
           // Wait for the market to settle, then reconcile from on-chain balance.
           syncBalanceAfter(Math.max(60_000, o.expiryTime + 90_000 - Date.now()), 'post-SETTLE-fallback');
-        });
+        }
+      })();
     } else if (o.tokenId && !o.realOrderId) {
       // BUY order was placed but hasn't confirmed yet — wait then cancel
       console.warn('[real] closing before BUY order confirmed — will cancel once orderId is known');
@@ -1459,7 +1517,7 @@ function connectCoinbase() {
   wsStatus = 'connecting';
   try {
     ws_ = new WebSocket('wss://advanced-trade-ws.coinbase.com');
-    const timeout = setTimeout(() => { if (wsStatus !== 'live') { ws_.terminate(); startSim(); } }, 10000);
+    const timeout = setTimeout(() => { if (wsStatus !== 'live') { ws_.terminate(); startFallback(); } }, 10000);
 
     ws_.on('open', () => {
       const sub = {
@@ -1478,6 +1536,8 @@ function connectCoinbase() {
       if (!wsStatus.startsWith('live') && d.channel) {
         wsStatus = 'live';
         clearTimeout(timeout);
+        stopChainlinkFeed();           // Coinbase recovered → stop fallback ticks
+        if (isSim) isSim = false;       // back on a real feed
         console.log('[coinbase] ws connected');
       }
       if (d.channel === 'market_trades' && d.events) {
@@ -1501,7 +1561,7 @@ function connectCoinbase() {
       }
     });
 
-    ws_.on('error', () => { if (wsStatus !== 'live') startSim(); });
+    ws_.on('error', () => { if (wsStatus !== 'live') startFallback(); });
     ws_.on('close', () => {
       if (wsStatus === 'live') {
         wsStatus = 'reconnecting';
@@ -1509,7 +1569,7 @@ function connectCoinbase() {
         setTimeout(connectCoinbase, 3000);
       }
     });
-  } catch (e) { startSim(); }
+  } catch (e) { startFallback(); }
 }
 
 // ─── SIMULATION MODE ─────────────────────────────────────────────────────────
@@ -1547,6 +1607,87 @@ function startSim() {
     for (let i = 0; i < n; i++) pushTick(price + (Math.random() - 0.5) * noise * 0.25, Math.random() * 0.35 + 0.005, Math.random() > buyBias ? 'BUY' : 'SELL');
     if (chain.enabled) { chain.currentPrice = price + (Math.random() - 0.5) * 1; chain.lastUpdate = Date.now(); chain.available = true; }
   }, 120);
+}
+
+// ─── CHAINLINK FALLBACK FEED ─────────────────────────────────────────────────
+// When the Coinbase WS is unreachable (e.g. its IP is geo/datacenter-blocked on
+// DigitalOcean), we DON'T want the random-walk sim — that produces fake prices
+// and a fake signal. Instead we poll the REAL Chainlink BTC/USD price (Polygon
+// RPCs are public and not blocked) and synthesize a clean tick stream from it.
+//
+// Honesty note: Chainlink gives us the *price* only — no real trade sides/sizes
+// and no order book. So we feed NEUTRAL microstructure (balanced BUY/SELL ticks
+// of equal size → CVD & order-flow imbalance ≈ 0; a symmetric book → book
+// imbalance ≈ 0). The price-based signals (momentum, EMA) run on the real price;
+// the flow/book signals contribute ~nothing rather than lying. Crucially isSim
+// stays FALSE here, so real prices ⇒ trading is allowed (unlike random sim).
+let chainlinkFeedTimer = null;
+
+function seedSymmetricBook(px) {
+  book.bids.clear(); book.asks.clear();
+  for (let i = 0; i < 10; i++) {
+    book.bids.set(+(px - i * 0.5 - 0.3).toFixed(2), 1.0);  // equal sizes both sides
+    book.asks.set(+(px + i * 0.5 + 0.3).toFixed(2), 1.0);  // → bookImbalance ≈ 0
+  }
+}
+
+function startChainlinkFeed() {
+  if (isSim) return;                       // never run alongside random sim
+  wsStatus = 'chainlink';                  // always reflect current mode (fixes stuck 'connecting' after a failed Coinbase retry)
+  if (chainlinkFeedTimer) return;          // feed already running — don't double-start / re-notify
+  console.log('[chainlink-feed] Coinbase unavailable — using REAL Chainlink BTC/USD price as fallback (trading stays enabled)');
+  sendTg(
+    `⚠️ <b>Coinbase недоступен</b>\n` +
+    `Переключаюсь на реальную цену <b>Chainlink</b> (Polygon RPC).\n` +
+    `Торговля продолжается на настоящих ценах — это НЕ симуляция.`
+  );
+
+  const tick = async () => {
+    await refreshChainlinkPrice();         // updates chain.currentPrice / .available
+    const px = chain.currentPrice;
+    if (px && !isNaN(px)) {
+      bestBid = px - 0.5;
+      bestAsk = px + 0.5;
+      seedSymmetricBook(px);
+      // Net-zero CVD: one BUY + one SELL of equal tiny size at the real price.
+      pushTick(px, 0.01, 'BUY');
+      pushTick(px, 0.01, 'SELL');
+    }
+  };
+
+  // Backfill ~60 neutral ticks at the first real price so processStrategies()
+  // (which needs ticks.length ≥ 60) can start within the first poll instead of
+  // waiting ~75s for the buffer to fill.
+  const warmup = async () => {
+    await refreshChainlinkPrice();
+    const px = chain.currentPrice;
+    if (px && !isNaN(px)) {
+      seedSymmetricBook(px);
+      bestBid = px - 0.5; bestAsk = px + 0.5;
+      for (let i = 0; i < 30; i++) { pushTick(px, 0.01, 'BUY'); pushTick(px, 0.01, 'SELL'); }
+    }
+  };
+  warmup();
+  chainlinkFeedTimer = setInterval(tick, 2500);
+}
+
+function stopChainlinkFeed() {
+  if (chainlinkFeedTimer) { clearInterval(chainlinkFeedTimer); chainlinkFeedTimer = null; }
+}
+
+// Coinbase WS failed → prefer the REAL Chainlink price; only drop to random SIM
+// if Chainlink is ALSO unreachable (e.g. Polygon RPCs blocked too).
+function startFallback() {
+  if (wsStatus === 'live') return;
+  startChainlinkFeed();
+  setTimeout(() => {
+    if (wsStatus === 'chainlink' && !chain.available) {
+      console.warn('[fallback] Chainlink also unreachable — dropping to random SIM (trading BLOCKED via isSim)');
+      sendTg('🛑 <b>И Chainlink недоступен</b>\nПерехожу в симуляцию. Торговля заблокирована до возврата реального фида.');
+      stopChainlinkFeed();
+      startSim();
+    }
+  }, 15000);
 }
 
 // ─── STATE SNAPSHOT FOR DASHBOARD ────────────────────────────────────────────
@@ -2001,6 +2142,14 @@ setInterval(() => {
 setInterval(() => { if (poly.autoFetch) fetchPolyMarket().catch(e => console.error('[poly]', e.message)); }, 2000);
 // Chainlink every 4s
 setInterval(() => { if (chain.enabled && !isSim) refreshChainlinkPrice().catch(() => {}); }, 4000);
+// Retry Coinbase every 5 min while on the Chainlink fallback — upgrade to live
+// automatically if its IP block ever lifts (a successful connect stops the feed).
+setInterval(() => {
+  if (wsStatus === 'chainlink') {
+    console.log('[coinbase] retrying connection from Chainlink fallback...');
+    connectCoinbase();
+  }
+}, 300_000);
 // Strategy engine every 1s
 setInterval(() => { try { processStrategies(); } catch (e) { console.error('[strategies]', e.message); } }, 1000);
 // SSE broadcast every 1s
