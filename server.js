@@ -1089,13 +1089,12 @@ const REAL_DAILY_LOSS_CAP    = parseFloat(process.env.REAL_DAILY_LOSS_CAP || '3'
 // ── MARKETABLE ENTRY (вход по рынку) ──────────────────────────────────────────
 // Раньше BUY ставился лимиткой ровно по цене входа. Если ask был выше — ордер
 // висел в стакане как status=live и НЕ исполнялся, но бот считал позицию
-// открытой (фантомная позиция). Теперь BUY идёт как FAK по "потолку" цены:
-// entry + BUY_SLIPPAGE. FAK сметает лучшие ask'и и исполняется мгновенно, либо
-// (если ликвидности нет) не открывает позицию вовсе.
-//   BUY_FAK=false      → вернуть старое поведение (лимитка по цене входа)
-//   BUY_SLIPPAGE=0.05  → допустимое проскальзывание вверх (по умолчанию 5¢)
-const BUY_FAK      = !['false', '0', 'no', 'off']
-  .includes((process.env.BUY_FAK || 'true').toLowerCase().trim());
+// открытой (фантомная позиция). Теперь BUY идёт маркетабельной лимиткой GTC по
+// "потолку" = entry + BUY_SLIPPAGE (округлённому вверх до целого цента). Ордер
+// берёт ликвидность до потолка как тейкер; если за пару секунд не залился —
+// отменяется и откатывается. Позиция открывается только при реальном исполнении.
+//   BUY_SLIPPAGE=0.05  → допустимое проскальзывание вверх (по умолчанию 5¢).
+//                        Подними (0.07–0.10), если часто "вход не состоялся".
 const BUY_SLIPPAGE = Math.max(0, Math.min(0.20,
   parseFloat(process.env.BUY_SLIPPAGE || '0.05') || 0.05));
 
@@ -1234,7 +1233,10 @@ function stratOpen(s, ctx, entry, acct, isReal) {
   let plannedShares = null;
   if (isRealOrder) {
     const kellyShares = sizeUSDC / entry.polyPrice;
-    plannedShares = Math.max(POLYMARKET_MIN_SHARES, Math.ceil(kellyShares * 100) / 100);
+    // Целое число акций: Polymarket market-ордера требуют ограниченной точности
+    // сумм (maker amount ≤ 2 знака). Дробные акции (5.07) ломали вход с ошибкой
+    // "invalid amounts". Округляем ВВЕРХ до целого, минимум 5.
+    plannedShares = Math.max(POLYMARKET_MIN_SHARES, Math.ceil(kellyShares));
     const requiredUSDC = plannedShares * entry.polyPrice;
     // Apply the < $1 guard AFTER bump (edge case: very low price + tiny balance)
     if (requiredUSDC < 1) return;
@@ -1283,28 +1285,28 @@ function stratOpen(s, ctx, entry, acct, isReal) {
 
   // ── Place real BUY order on Polymarket CLOB (async, Momentum only) ──────────
   if (isRealOrder) {
-    // Marketable entry: FAK ("Fill-And-Kill") по потолку = entry + slippage.
-    // FAK сметает лучшие ask'и и исполняется СРАЗУ по их ценам (≤ потолка),
-    // либо не исполняется вовсе — но НЕ висит в стакане как фантомная позиция.
-    // Шлём "ОТКРЫТА" в Telegram только ПОСЛЕ подтверждения исполнения.
-    const useFak   = BUY_FAK;
-    const ceiling  = useFak
-      ? Math.max(0.02, Math.min(0.99, parseFloat((entry.polyPrice + BUY_SLIPPAGE).toFixed(4))))
-      : entry.polyPrice;
-    // Для FAK хотим РОВНО plannedShares акций. placeClobOrder для BUY считает
-    // shares = size / price, поэтому передаём size = plannedShares * ceiling →
-    // shares = plannedShares, а заплатим по факту ≤ ceiling за штуку.
-    const buySize  = useFak ? (plannedShares * ceiling) : sizeUSDC;
-    const buyType  = useFak ? 'FAK' : 'GTC';
+    // Маркетабельная лимитка (GTC) по потолку = entry + slippage, ОКРУГЛЁННОМУ
+    // вверх до целого цента. Лимитка берёт всю ликвидность до потолка как тейкер
+    // (как рыночный ордер), но, в отличие от FAK, не умирает мгновенно, если ask
+    // чуть выше — стоит пару секунд и может поймать продавца. Если за окно
+    // проверки не залилась — отменяем и откатываем (фантома не оставляем).
+    // GTC-лимитки не подпадают под жёсткое "max 2 decimals" для market-ордеров.
+    //
+    // ceiling округляем ВВЕРХ до цента, чтобы цена была валидным тиком Polymarket
+    // (1¢) и не оказалась ниже рынка из-за получентовой entry-цены.
+    const ceiling = Math.max(0.02, Math.min(0.99,
+      Math.ceil((entry.polyPrice + BUY_SLIPPAGE) * 100) / 100));
+    // plannedShares уже целое. size = shares * ceiling → placeClobOrder получит
+    // ровно plannedShares акций, а maker amount = целые_акции × цент = чистая
+    // сумма с 2 знаками. Заплатим по факту ≤ ceiling за штуку.
+    const buySize  = plannedShares * ceiling;
+    const BUY_VERIFY_MS = 2_500; // сколько ждём заполнения перед откатом
 
-    // Считается ли BUY реально исполнившимся.
-    const isFilled = (result) => {
-      const st = String(result?.status || '').toLowerCase();
-      if (st === 'matched') return true;
-      // Подстраховка: если SDK отдал size_matched в raw — доверяем ему.
-      const m = parseFloat(result?.raw?.size_matched ?? result?.raw?.sizeMatched ?? 'NaN');
-      if (!isNaN(m) && m >= plannedShares * 0.99) return true;
-      return false; // 'live'/'unmatched'/'delayed' → НЕ открываем позицию
+    // Считается ли BUY исполнившимся по ответу/статусу ордера.
+    const filledByStatus = (st, sizeMatched) => {
+      if (String(st || '').toLowerCase() === 'matched') return true;
+      const m = parseFloat(sizeMatched ?? 'NaN');
+      return !isNaN(m) && m >= plannedShares * 0.99;
     };
 
     // Откат фантомной позиции: вернуть баланс, снять счётчик окна, очистить open.
@@ -1319,37 +1321,51 @@ function stratOpen(s, ctx, entry, acct, isReal) {
       if (whyTg) sendTg(whyTg);
     };
 
-    placeClobOrder({ tokenId, side: 'BUY', size: buySize, price: ceiling, orderType: buyType })
+    const confirmOpen = (orderId, actualShares) => {
+      if (!acct.open) return;
+      acct.open.realOrderId     = orderId;
+      acct.open.realOrderStatus = 'matched';
+      acct.open.actualShares    = actualShares;
+      saveState();
+      sendTg(
+        `🔵 <b>ОТКРЫТА</b> — ${entry.side}\n` +
+        `Стратегия: <i>${_tgEsc(s.def.id)}</i>\n` +
+        `Цена входа: <b>≤ ${(ceiling * 100).toFixed(0)}¢</b> (по рынку)\n` +
+        `Размер: <b>${actualShares} shares = $${sizeUSDC.toFixed(2)}</b> (${(sizeUSDC / effectiveBalance * 100).toFixed(1)}% от баланса)\n` +
+        `Edge: ${(entry.edge * 100).toFixed(1)}pp\n` +
+        `Баланс: $${effectiveBalance.toFixed(2)}`
+      );
+    };
+
+    placeClobOrder({ tokenId, side: 'BUY', size: buySize, price: ceiling, orderType: 'GTC' })
       .then(async result => {
         s.pendingReal = false;
-        console.log(`[real] BUY placed orderId=${result.orderID} status=${result.status} type=${buyType} ceiling=${ceiling} actualShares=${result.actualShares}`);
+        console.log(`[real] BUY placed orderId=${result.orderID} status=${result.status} ceiling=${ceiling} shares=${plannedShares}`);
+        if (!acct.open) { await cancelClobOrder(result.orderID); return; }
 
-        if (!acct.open) return; // уже закрыли/откатили где-то ещё
-
-        if (isFilled(result)) {
-          acct.open.realOrderId     = result.orderID;
-          acct.open.realOrderStatus = 'matched';
-          acct.open.actualShares    = result.actualShares;  // ← что реально продавать на выходе
-          saveState();
-          // Подтверждение входа — ТОЛЬКО после фактического исполнения.
-          sendTg(
-            `🔵 <b>ОТКРЫТА</b> — ${entry.side}\n` +
-            `Стратегия: <i>${_tgEsc(s.def.id)}</i>\n` +
-            `Цена входа: <b>≤ ${(ceiling * 100).toFixed(1)}¢</b> (по рынку)\n` +
-            `Размер: <b>${result.actualShares} shares = $${sizeUSDC.toFixed(2)}</b> (${(sizeUSDC / effectiveBalance * 100).toFixed(1)}% от баланса)\n` +
-            `Edge: ${(entry.edge * 100).toFixed(1)}pp\n` +
-            `Баланс: $${effectiveBalance.toFixed(2)}`
-          );
+        // Сразу залилось как тейкер?
+        if (filledByStatus(result.status, result.raw?.size_matched ?? result.raw?.sizeMatched)) {
+          confirmOpen(result.orderID, result.actualShares);
           return;
         }
 
-        // НЕ залилось (FAK убил остаток / лимитка повисла). Не держим фантом.
-        console.warn(`[real] BUY not filled (status=${result.status}) — cancelling & rolling back, NO position opened`);
-        await cancelClobOrder(result.orderID); // на случай GTC-остатка в стакане
+        // Повисло — даём короткое окно и перепроверяем статус.
+        await new Promise(r => setTimeout(r, BUY_VERIFY_MS));
+        if (!acct.open) { await cancelClobOrder(result.orderID); return; }
+        const st = await getClobOrderStatus(result.orderID);
+        if (filledByStatus(st?.status, st?.size_matched)) {
+          console.log(`[real] BUY filled on verify orderId=${result.orderID}`);
+          confirmOpen(result.orderID, result.actualShares);
+          return;
+        }
+
+        // Так и не залилось → отменяем хвост и откатываем (без фантома).
+        console.warn(`[real] BUY not filled (status=${st?.status || result.status}) — cancel & rollback, NO position`);
+        await cancelClobOrder(result.orderID);
         rollback(
           `🚫 <b>Вход не состоялся</b> — ${entry.side}\n` +
-          `Не нашлось ликвидности ≤ ${(ceiling * 100).toFixed(1)}¢ (статус: ${_tgEsc(result.status || 'unmatched')}).\n` +
-          `Позицию НЕ открыл — реальных акций нет. Жду следующий сигнал.`
+          `Нет ликвидности ≤ ${(ceiling * 100).toFixed(0)}¢ за ${BUY_VERIFY_MS / 1000}с — ордер отменён.\n` +
+          `Позицию НЕ открыл, реальных акций нет. Жду следующий сигнал.`
         );
       })
       .catch(err => {
