@@ -570,6 +570,12 @@ function updateAll(d) {
   } else if (d.ws === 'chainlink') {
     wsBadge.className = 'ws-badge ws-live';
     wsBadge.textContent = '● chainlink live';
+  } else if (d.ws === 'binance') {
+    wsBadge.className = 'ws-badge ws-live';
+    wsBadge.textContent = '● binance live';
+  } else if (d.ws === 'kraken') {
+    wsBadge.className = 'ws-badge ws-live';
+    wsBadge.textContent = '● kraken live';
   } else {
     wsBadge.className = 'ws-badge ws-off';
     wsBadge.textContent = '● ' + (d.ws || 'connecting');
@@ -578,7 +584,12 @@ function updateAll(d) {
   // BTC Price
   if (d.btc) {
     $('btc-price').textContent = '$' + fmt2(d.btc);
-    const src = d.chain?.available ? 'Chainlink' : d.isSim ? 'Sim' : 'Coinbase WS';
+    const src = d.ws === 'live' ? 'Coinbase WS'
+              : d.ws === 'binance' ? 'Binance WS'
+              : d.ws === 'kraken' ? 'Kraken WS'
+              : d.ws === 'chainlink' ? 'Chainlink'
+              : d.isSim ? 'Sim'
+              : (d.chain?.available ? 'Chainlink' : '…');
     $('btc-src').textContent = 'источник: ' + src;
   }
 
