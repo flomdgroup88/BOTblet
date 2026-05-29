@@ -567,6 +567,9 @@ function updateAll(d) {
   } else if (d.ws === 'live') {
     wsBadge.className = 'ws-badge ws-live';
     wsBadge.textContent = '● coinbase live';
+  } else if (d.ws === 'chainlink') {
+    wsBadge.className = 'ws-badge ws-live';
+    wsBadge.textContent = '● chainlink live';
   } else {
     wsBadge.className = 'ws-badge ws-off';
     wsBadge.textContent = '● ' + (d.ws || 'connecting');
