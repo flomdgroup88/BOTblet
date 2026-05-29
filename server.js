@@ -1667,6 +1667,14 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
 
 function processAccount(s, ctx, acct, isReal) {
   if (acct.open) {
+    // Реальный вход ещё не подтверждён (BUY висит / идёт проверка заполнения)?
+    // НЕ трогаем позицию логикой выхода — иначе можем отменить собственную
+    // покупку до того, как она зальётся (так была упущена сделка @13.5¢).
+    // В этот момент позицией управляет verify-логика в stratOpen: она либо
+    // подтвердит заполнение (status→matched), либо откатит вход.
+    if (isReal && acct.open.isReal && acct.open.realOrderStatus === 'pending') {
+      return;
+    }
     if (Date.now() >= acct.open.expiryTime) {
       stratClose(s, ctx, 'SETTLE', null, acct, isReal); return;
     }
