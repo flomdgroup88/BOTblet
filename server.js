@@ -1086,6 +1086,19 @@ const REAL_COOLDOWN_MS       = 20_000;   // Wait ≥20s after any real close bef
 const REAL_DAILY_LOSS_CAP    = parseFloat(process.env.REAL_DAILY_LOSS_CAP || '3');  // USD; -$3 default
                                                                                     // After cap is hit, real autodisables until next UTC day
 
+// ── MARKETABLE ENTRY (вход по рынку) ──────────────────────────────────────────
+// Раньше BUY ставился лимиткой ровно по цене входа. Если ask был выше — ордер
+// висел в стакане как status=live и НЕ исполнялся, но бот считал позицию
+// открытой (фантомная позиция). Теперь BUY идёт как FAK по "потолку" цены:
+// entry + BUY_SLIPPAGE. FAK сметает лучшие ask'и и исполняется мгновенно, либо
+// (если ликвидности нет) не открывает позицию вовсе.
+//   BUY_FAK=false      → вернуть старое поведение (лимитка по цене входа)
+//   BUY_SLIPPAGE=0.05  → допустимое проскальзывание вверх (по умолчанию 5¢)
+const BUY_FAK      = !['false', '0', 'no', 'off']
+  .includes((process.env.BUY_FAK || 'true').toLowerCase().trim());
+const BUY_SLIPPAGE = Math.max(0, Math.min(0.20,
+  parseFloat(process.env.BUY_SLIPPAGE || '0.05') || 0.05));
+
 function initStrategies() {
   for (const def of STRAT_DEFINITIONS) {
     STRATEGIES[def.id] = {
@@ -1270,37 +1283,79 @@ function stratOpen(s, ctx, entry, acct, isReal) {
 
   // ── Place real BUY order on Polymarket CLOB (async, Momentum only) ──────────
   if (isRealOrder) {
-    sendTg(
-      `🔵 <b>ОТКРЫТА</b> — ${entry.side}\n` +
-      `Стратегия: <i>${_tgEsc(s.def.id)}</i>\n` +
-      `Цена входа: <b>${(entry.polyPrice * 100).toFixed(1)}¢</b>\n` +
-      `Размер: <b>${plannedShares} shares = $${sizeUSDC.toFixed(2)}</b> (${(sizeUSDC / effectiveBalance * 100).toFixed(1)}% от баланса)\n` +
-      `Edge: ${(entry.edge * 100).toFixed(1)}pp\n` +
-      `Баланс: $${effectiveBalance.toFixed(2)}`
-    );
-    placeClobOrder({ tokenId, side: 'BUY', size: sizeUSDC, price: entry.polyPrice })
-      .then(result => {
+    // Marketable entry: FAK ("Fill-And-Kill") по потолку = entry + slippage.
+    // FAK сметает лучшие ask'и и исполняется СРАЗУ по их ценам (≤ потолка),
+    // либо не исполняется вовсе — но НЕ висит в стакане как фантомная позиция.
+    // Шлём "ОТКРЫТА" в Telegram только ПОСЛЕ подтверждения исполнения.
+    const useFak   = BUY_FAK;
+    const ceiling  = useFak
+      ? Math.max(0.02, Math.min(0.99, parseFloat((entry.polyPrice + BUY_SLIPPAGE).toFixed(4))))
+      : entry.polyPrice;
+    // Для FAK хотим РОВНО plannedShares акций. placeClobOrder для BUY считает
+    // shares = size / price, поэтому передаём size = plannedShares * ceiling →
+    // shares = plannedShares, а заплатим по факту ≤ ceiling за штуку.
+    const buySize  = useFak ? (plannedShares * ceiling) : sizeUSDC;
+    const buyType  = useFak ? 'FAK' : 'GTC';
+
+    // Считается ли BUY реально исполнившимся.
+    const isFilled = (result) => {
+      const st = String(result?.status || '').toLowerCase();
+      if (st === 'matched') return true;
+      // Подстраховка: если SDK отдал size_matched в raw — доверяем ему.
+      const m = parseFloat(result?.raw?.size_matched ?? result?.raw?.sizeMatched ?? 'NaN');
+      if (!isNaN(m) && m >= plannedShares * 0.99) return true;
+      return false; // 'live'/'unmatched'/'delayed' → НЕ открываем позицию
+    };
+
+    // Откат фантомной позиции: вернуть баланс, снять счётчик окна, очистить open.
+    const rollback = (whyTg) => {
+      s.pendingReal = false;
+      if (acct.open) {
+        acct.balance += acct.open.sizeUSDC;
+        acct.open     = null;
+      }
+      s.realTradesThisWindow = Math.max(0, (s.realTradesThisWindow || 1) - 1);
+      saveState();
+      if (whyTg) sendTg(whyTg);
+    };
+
+    placeClobOrder({ tokenId, side: 'BUY', size: buySize, price: ceiling, orderType: buyType })
+      .then(async result => {
         s.pendingReal = false;
-        if (acct.open) {
+        console.log(`[real] BUY placed orderId=${result.orderID} status=${result.status} type=${buyType} ceiling=${ceiling} actualShares=${result.actualShares}`);
+
+        if (!acct.open) return; // уже закрыли/откатили где-то ещё
+
+        if (isFilled(result)) {
           acct.open.realOrderId     = result.orderID;
-          acct.open.realOrderStatus = result.status || 'placed';
-          acct.open.actualShares    = result.actualShares;  // ← critical: what we'll SELL
+          acct.open.realOrderStatus = 'matched';
+          acct.open.actualShares    = result.actualShares;  // ← что реально продавать на выходе
           saveState();
-          console.log(`[real] BUY placed orderId=${result.orderID} status=${result.status} actualShares=${result.actualShares}`);
+          // Подтверждение входа — ТОЛЬКО после фактического исполнения.
+          sendTg(
+            `🔵 <b>ОТКРЫТА</b> — ${entry.side}\n` +
+            `Стратегия: <i>${_tgEsc(s.def.id)}</i>\n` +
+            `Цена входа: <b>≤ ${(ceiling * 100).toFixed(1)}¢</b> (по рынку)\n` +
+            `Размер: <b>${result.actualShares} shares = $${sizeUSDC.toFixed(2)}</b> (${(sizeUSDC / effectiveBalance * 100).toFixed(1)}% от баланса)\n` +
+            `Edge: ${(entry.edge * 100).toFixed(1)}pp\n` +
+            `Баланс: $${effectiveBalance.toFixed(2)}`
+          );
+          return;
         }
+
+        // НЕ залилось (FAK убил остаток / лимитка повисла). Не держим фантом.
+        console.warn(`[real] BUY not filled (status=${result.status}) — cancelling & rolling back, NO position opened`);
+        await cancelClobOrder(result.orderID); // на случай GTC-остатка в стакане
+        rollback(
+          `🚫 <b>Вход не состоялся</b> — ${entry.side}\n` +
+          `Не нашлось ликвидности ≤ ${(ceiling * 100).toFixed(1)}¢ (статус: ${_tgEsc(result.status || 'unmatched')}).\n` +
+          `Позицию НЕ открыл — реальных акций нет. Жду следующий сигнал.`
+        );
       })
       .catch(err => {
         console.error('[real] BUY order FAILED:', err.message);
-        sendTg(`❌ <b>BUY order failed</b>\n<code>${_tgEsc(err.message)}</code>\nПозиция откатилась.`);
-        // Always reset pendingReal — even if acct.open was already cleared
-        s.pendingReal = false;
-        // Rollback: refund balance and clear the position
-        if (acct.open) {
-          acct.balance    += acct.open.sizeUSDC;
-          acct.open        = null;
-          saveState();
-          console.warn('[real] position rolled back due to order failure');
-        }
+        rollback(`❌ <b>BUY order failed</b>\n<code>${_tgEsc(err.message)}</code>\nПозиция откатилась.`);
+        console.warn('[real] position rolled back due to order failure');
       });
   }
 }
