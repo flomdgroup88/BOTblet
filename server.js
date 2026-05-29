@@ -1057,6 +1057,10 @@ const STRAT_MOMENTUM = {
     const curMid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
     if (curMid !== null) {
       const mv = (curMid - pos.polyEntryPrice) / pos.polyEntryPrice;
+      // Абсолютный потолок TP: при высоком входе процентная цель недостижима
+      // (токен ≤ 100¢). Фиксируем, как только цена дошла до уровня — выше почти
+      // нет апсайда, а разворот оттуда крайне болезненный.
+      if (curMid >= TP_ABS_PRICE) return { reason: 'TP', exitPrice: curMid };
       if (mv >= p.tpPct) return { reason: 'TP', exitPrice: curMid };
       if (mv <= -p.slPct) return { reason: 'SL', exitPrice: curMid };
     }
@@ -1085,6 +1089,15 @@ const REAL_MIN_MS_TO_END     = 45_000;   // Need ≥45s left in window — else 
 const REAL_COOLDOWN_MS       = 20_000;   // Wait ≥20s after any real close before opening again
 const REAL_DAILY_LOSS_CAP    = parseFloat(process.env.REAL_DAILY_LOSS_CAP || '3');  // USD; -$3 default
                                                                                     // After cap is hit, real autodisables until next UTC day
+
+// ── АБСОЛЮТНЫЙ TAKE-PROFIT ─────────────────────────────────────────────────────
+// Бинарный токен не может стоить дороже 100¢, поэтому ПРОЦЕНТНЫЙ TP при высоком
+// входе недостижим (вход 75¢ × 1.5 = 112¢ — невозможно), и позиция зависает до
+// SETTLE. Этот абсолютный потолок фиксирует прибыль при ЛЮБОМ входе, как только
+// цена дошла до уровня: выше апсайд мизерный (≤5¢), а риск разворота огромный.
+//   TP_ABS_PRICE=0.95 → фиксировать на 95¢ (по умолчанию). Можно 0.90–0.97.
+const TP_ABS_PRICE = Math.max(0.50, Math.min(0.99,
+  parseFloat(process.env.TP_ABS_PRICE || '0.95') || 0.95));
 
 // ── MARKETABLE ENTRY (вход по рынку) ──────────────────────────────────────────
 // Раньше BUY ставился лимиткой ровно по цене входа. Если ask был выше — ордер
