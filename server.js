@@ -1512,6 +1512,9 @@ function processStrategies() {
 
 // ─── COINBASE WEBSOCKET ──────────────────────────────────────────────────────
 let ws_ = null;
+let binanceWs = null;   // fallback feed #1 (real trades + book)
+let krakenWs  = null;   // fallback feed #2 (real trades + book)
+let simTimer  = null;   // handle for the random-sim interval so we can STOP it on recovery
 
 function connectCoinbase() {
   wsStatus = 'connecting';
@@ -1533,11 +1536,9 @@ function connectCoinbase() {
     ws_.on('message', raw => {
       let d;
       try { d = JSON.parse(raw); } catch (_) { return; }
-      if (!wsStatus.startsWith('live') && d.channel) {
-        wsStatus = 'live';
+      if (wsStatus !== 'live' && d.channel) {
         clearTimeout(timeout);
-        stopChainlinkFeed();           // Coinbase recovered → stop fallback ticks
-        if (isSim) isSim = false;       // back on a real feed
+        goLiveFeed('live', ws_);        // stops sim/chainlink + closes binance/kraken
         console.log('[coinbase] ws connected');
       }
       if (d.channel === 'market_trades' && d.events) {
@@ -1592,7 +1593,7 @@ function startSim() {
   };
   seedBook();
 
-  setInterval(() => {
+  simTimer = setInterval(() => {
     if (Math.random() < 0.005) regime = ['trending', 'ranging', 'volatile'][Math.floor(Math.random() * 3)];
     if (Math.random() < 0.015) { trend = (Math.random() - 0.46) * 2; trendLife = Math.random() * 50 + 10; }
     trendLife > 0 ? trendLife-- : (trend *= 0.97);
@@ -1609,6 +1610,12 @@ function startSim() {
   }, 120);
 }
 
+// Stop the random-sim feed (clears its forever-interval). Called whenever a real
+// feed (Coinbase / Binance / Kraken / Chainlink) takes over.
+function stopSim() {
+  if (simTimer) { clearInterval(simTimer); simTimer = null; }
+}
+
 // ─── CHAINLINK FALLBACK FEED ─────────────────────────────────────────────────
 // When the Coinbase WS is unreachable (e.g. its IP is geo/datacenter-blocked on
 // DigitalOcean), we DON'T want the random-walk sim — that produces fake prices
@@ -1623,6 +1630,20 @@ function startSim() {
 // stays FALSE here, so real prices ⇒ trading is allowed (unlike random sim).
 let chainlinkFeedTimer = null;
 
+function terminateWs(w) { if (w) { try { w.terminate(); } catch (_) {} } }
+
+// Promote one feed to "active": set status, leave SIM, and shut down every other
+// feed so we never have two sources pushing ticks at once.
+function goLiveFeed(name, keep) {
+  wsStatus = name;
+  if (isSim) isSim = false;
+  stopSim();
+  stopChainlinkFeed();
+  if (keep !== ws_)       terminateWs(ws_);
+  if (keep !== binanceWs) terminateWs(binanceWs);
+  if (keep !== krakenWs)  terminateWs(krakenWs);
+}
+
 function seedSymmetricBook(px) {
   book.bids.clear(); book.asks.clear();
   for (let i = 0; i < 10; i++) {
@@ -1631,63 +1652,194 @@ function seedSymmetricBook(px) {
   }
 }
 
+// ─── FALLBACK #1: BINANCE WS (real trades + real order book) ─────────────────
+// Coinbase blocks some datacenter IPs; Binance gives full microstructure and is
+// usually reachable on Railway. (NB: Binance.com blocks US IPs — if this box is
+// in a US region it'll fail here and fall through to Kraken, which is fine.)
+function connectBinance() {
+  if (wsStatus === 'live') return;
+  wsStatus = 'connecting-binance';
+  console.log('[binance] connecting...');
+  let bws;
+  try {
+    bws = new WebSocket('wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@depth20@100ms');
+  } catch (e) { console.warn('[binance] ctor failed → Kraken:', e.message); return connectKraken(); }
+  binanceWs = bws;
+
+  const timeout = setTimeout(() => {
+    if (wsStatus !== 'binance' && wsStatus !== 'live') { terminateWs(bws); connectKraken(); }
+  }, 10_000);
+
+  bws.on('message', raw => {
+    let msg; try { msg = JSON.parse(raw); } catch (_) { return; }
+    const stream = msg && msg.stream, d = msg && msg.data;
+    if (!stream || !d) return;
+    if (wsStatus !== 'binance') {
+      clearTimeout(timeout);
+      goLiveFeed('binance', bws);
+      console.log('[binance] connected — real trades + order book (full microstructure)');
+      sendTg('✅ <b>Binance WS подключён</b>\nCoinbase недоступен, но идут реальные сделки и стакан Binance — микроструктура полная, НЕ деградация.');
+    }
+    if (stream.endsWith('@trade')) {
+      const p = parseFloat(d.p), q = parseFloat(d.q);
+      // d.m === true → buyer is the maker → the taker SOLD → side 'SELL'
+      if (p > 0 && q > 0) pushTick(p, q, d.m ? 'SELL' : 'BUY');
+    } else if (stream.includes('@depth')) {
+      if (Array.isArray(d.bids) && Array.isArray(d.asks)) {
+        book.bids.clear(); book.asks.clear();
+        for (const lv of d.bids) { const pr = parseFloat(lv[0]), sz = parseFloat(lv[1]); if (pr > 0 && sz > 0) book.bids.set(pr, sz); }
+        for (const lv of d.asks) { const pr = parseFloat(lv[0]), sz = parseFloat(lv[1]); if (pr > 0 && sz > 0) book.asks.set(pr, sz); }
+        const tb = topBook('bid', 1)[0], ta = topBook('ask', 1)[0];
+        if (tb) bestBid = tb[0]; if (ta) bestAsk = ta[0];
+      }
+    }
+  });
+  bws.on('error', e => {
+    if (wsStatus !== 'binance' && wsStatus !== 'live') {
+      clearTimeout(timeout);
+      console.warn('[binance] error → Kraken:', (e.message || '').slice(0, 100));
+      connectKraken();
+    }
+  });
+  bws.on('close', () => {
+    if (wsStatus === 'binance') { wsStatus = 'reconnecting'; console.warn('[binance] disconnected — retry in 3s'); setTimeout(connectBinance, 3000); }
+  });
+}
+
+// ─── FALLBACK #2: KRAKEN WS (real trades + real order book) ───────────────────
+// Reachable from US IPs (unlike Binance.com), so this is the one most likely to
+// catch on a US-region droplet where Coinbase is blocked.
+function connectKraken() {
+  if (wsStatus === 'live') return;
+  wsStatus = 'connecting-kraken';
+  console.log('[kraken] connecting...');
+  let kws;
+  try { kws = new WebSocket('wss://ws.kraken.com'); }
+  catch (e) { console.warn('[kraken] ctor failed → Chainlink:', e.message); return startChainlinkFeed(); }
+  krakenWs = kws;
+
+  const timeout = setTimeout(() => {
+    if (wsStatus !== 'kraken' && wsStatus !== 'live') { terminateWs(kws); startChainlinkFeed(); }
+  }, 10_000);
+
+  kws.on('open', () => {
+    kws.send(JSON.stringify({ event: 'subscribe', pair: ['XBT/USD'], subscription: { name: 'trade' } }));
+    kws.send(JSON.stringify({ event: 'subscribe', pair: ['XBT/USD'], subscription: { name: 'book', depth: 25 } }));
+  });
+
+  const applyBookSide = (map, levels, isBid) => {
+    for (const lv of levels) {
+      const pr = parseFloat(lv[0]), sz = parseFloat(lv[1]);
+      if (isNaN(pr)) continue;
+      if (sz === 0) map.delete(pr); else map.set(pr, sz);
+    }
+    // Trim to top 25 so stale deep levels don't accumulate from incremental updates.
+    const sorted = [...map.entries()].sort((a, b) => isBid ? b[0] - a[0] : a[0] - b[0]).slice(0, 25);
+    map.clear(); for (const [p, sz] of sorted) map.set(p, sz);
+  };
+
+  kws.on('message', raw => {
+    let msg; try { msg = JSON.parse(raw); } catch (_) { return; }
+    if (!Array.isArray(msg)) return;                 // ignore heartbeat/event objects
+    if (wsStatus !== 'kraken') {
+      clearTimeout(timeout);
+      goLiveFeed('kraken', kws);
+      console.log('[kraken] connected — real trades + order book (full microstructure)');
+      sendTg('✅ <b>Kraken WS подключён</b>\nCoinbase недоступен, но идут реальные сделки и стакан Kraken — микроструктура полная, НЕ деградация.');
+    }
+    const channel = msg[msg.length - 2];             // "trade" or "book-25"
+    if (channel === 'trade') {
+      const trades = msg[1];
+      if (Array.isArray(trades)) for (const t of trades) {
+        const p = parseFloat(t[0]), q = parseFloat(t[1]); const side = t[3]; // 'b' / 's'
+        if (p > 0 && q > 0) pushTick(p, q, side === 's' ? 'SELL' : 'BUY');
+      }
+    } else if (typeof channel === 'string' && channel.startsWith('book')) {
+      // Book payload objects may sit at msg[1] and/or msg[2].
+      for (let i = 1; i <= 2; i++) {
+        const o = msg[i];
+        if (o && typeof o === 'object' && !Array.isArray(o)) {
+          if (Array.isArray(o.as)) { book.asks.clear(); applyBookSide(book.asks, o.as, false); } // snapshot
+          if (Array.isArray(o.bs)) { book.bids.clear(); applyBookSide(book.bids, o.bs, true);  } // snapshot
+          if (Array.isArray(o.a))  applyBookSide(book.asks, o.a, false);                         // update
+          if (Array.isArray(o.b))  applyBookSide(book.bids, o.b, true);                          // update
+        }
+      }
+      const tb = topBook('bid', 1)[0], ta = topBook('ask', 1)[0];
+      if (tb) bestBid = tb[0]; if (ta) bestAsk = ta[0];
+    }
+  });
+  kws.on('error', e => {
+    if (wsStatus !== 'kraken' && wsStatus !== 'live') {
+      clearTimeout(timeout);
+      console.warn('[kraken] error → Chainlink:', (e.message || '').slice(0, 100));
+      startChainlinkFeed();
+    }
+  });
+  kws.on('close', () => {
+    if (wsStatus === 'kraken') { wsStatus = 'reconnecting'; console.warn('[kraken] disconnected — retry in 3s'); setTimeout(connectKraken, 3000); }
+  });
+}
+
+// ─── FALLBACK #3: CHAINLINK PRICE-ONLY FEED ──────────────────────────────────
+// Last real-price resort if no exchange WS is reachable. Polls the REAL Chainlink
+// BTC/USD price (Polygon RPCs are public, not geo-blocked) and synthesizes a
+// clean tick stream. isSim stays FALSE ⇒ trading is allowed on real prices.
+//
+// Honesty note: Chainlink gives the *price* only — no real trades, no order book.
+// So flow/book signals are fed NEUTRAL (balanced BUY/SELL ticks + symmetric book)
+// → CVD / order-flow / book-imbalance ≈ 0 rather than fabricated. Price signals
+// (momentum, EMA) run on the real price. Degraded but honest.
 function startChainlinkFeed() {
-  if (isSim) return;                       // never run alongside random sim
-  wsStatus = 'chainlink';                  // always reflect current mode (fixes stuck 'connecting' after a failed Coinbase retry)
-  if (chainlinkFeedTimer) return;          // feed already running — don't double-start / re-notify
-  console.log('[chainlink-feed] Coinbase unavailable — using REAL Chainlink BTC/USD price as fallback (trading stays enabled)');
+  if (wsStatus === 'live' || wsStatus === 'binance' || wsStatus === 'kraken') return; // a full feed is active
+  if (chainlinkFeedTimer) { wsStatus = 'chainlink'; return; }                          // already running
+  wsStatus = 'chainlink';
+  console.log('[chainlink-feed] no exchange WS reachable — using REAL Chainlink BTC/USD price (trading stays enabled)');
   sendTg(
-    `⚠️ <b>Coinbase недоступен</b>\n` +
+    `⚠️ <b>Биржевые WS недоступны</b>\n` +
     `Переключаюсь на реальную цену <b>Chainlink</b> (Polygon RPC).\n` +
-    `Торговля продолжается на настоящих ценах — это НЕ симуляция.`
+    `Торговля идёт на настоящих ценах (НЕ симуляция), но поток/стакан недоступны — сигналы потока занулены.`
   );
 
-  const tick = async () => {
-    await refreshChainlinkPrice();         // updates chain.currentPrice / .available
-    const px = chain.currentPrice;
-    if (px && !isNaN(px)) {
-      bestBid = px - 0.5;
-      bestAsk = px + 0.5;
-      seedSymmetricBook(px);
-      // Net-zero CVD: one BUY + one SELL of equal tiny size at the real price.
-      pushTick(px, 0.01, 'BUY');
-      pushTick(px, 0.01, 'SELL');
-    }
+  const onPrice = px => {
+    if (isSim) { stopSim(); isSim = false; }   // real price obtained → leave random sim
+    bestBid = px - 0.5; bestAsk = px + 0.5;
+    seedSymmetricBook(px);
   };
-
-  // Backfill ~60 neutral ticks at the first real price so processStrategies()
-  // (which needs ticks.length ≥ 60) can start within the first poll instead of
-  // waiting ~75s for the buffer to fill.
-  const warmup = async () => {
+  const tick = async () => {
     await refreshChainlinkPrice();
     const px = chain.currentPrice;
-    if (px && !isNaN(px)) {
-      seedSymmetricBook(px);
-      bestBid = px - 0.5; bestAsk = px + 0.5;
-      for (let i = 0; i < 30; i++) { pushTick(px, 0.01, 'BUY'); pushTick(px, 0.01, 'SELL'); }
-    }
+    if (px && !isNaN(px)) { onPrice(px); pushTick(px, 0.01, 'BUY'); pushTick(px, 0.01, 'SELL'); }
   };
-  warmup();
+  // Backfill ~60 neutral ticks at the first real price so processStrategies()
+  // (needs ticks.length ≥ 60) can start within the first poll, not ~75s later.
+  (async () => {
+    await refreshChainlinkPrice();
+    const px = chain.currentPrice;
+    if (px && !isNaN(px)) { onPrice(px); for (let i = 0; i < 30; i++) { pushTick(px, 0.01, 'BUY'); pushTick(px, 0.01, 'SELL'); } }
+  })();
   chainlinkFeedTimer = setInterval(tick, 2500);
+
+  // Last resort: if Chainlink is ALSO unreachable after 15s, drop to random SIM
+  // (trading BLOCKED via isSim). Covers a total outage of every real source.
+  setTimeout(() => {
+    if (chainlinkFeedTimer && !chain.available) {
+      console.warn('[fallback] Chainlink also unreachable — random SIM (trading BLOCKED)');
+      stopChainlinkFeed();
+      if (!isSim) { sendTg('🛑 <b>Все источники недоступны</b>\nПерехожу в симуляцию. Торговля ЗАБЛОКИРОВАНА до возврата реального фида.'); startSim(); }
+      else { wsStatus = 'sim'; }
+    }
+  }, 15_000);
 }
 
 function stopChainlinkFeed() {
   if (chainlinkFeedTimer) { clearInterval(chainlinkFeedTimer); chainlinkFeedTimer = null; }
 }
 
-// Coinbase WS failed → prefer the REAL Chainlink price; only drop to random SIM
-// if Chainlink is ALSO unreachable (e.g. Polygon RPCs blocked too).
+// Coinbase unavailable → walk the fallback chain: Binance → Kraken → Chainlink → SIM.
 function startFallback() {
   if (wsStatus === 'live') return;
-  startChainlinkFeed();
-  setTimeout(() => {
-    if (wsStatus === 'chainlink' && !chain.available) {
-      console.warn('[fallback] Chainlink also unreachable — dropping to random SIM (trading BLOCKED via isSim)');
-      sendTg('🛑 <b>И Chainlink недоступен</b>\nПерехожу в симуляцию. Торговля заблокирована до возврата реального фида.');
-      stopChainlinkFeed();
-      startSim();
-    }
-  }, 15000);
+  connectBinance();
 }
 
 // ─── STATE SNAPSHOT FOR DASHBOARD ────────────────────────────────────────────
@@ -2142,11 +2294,12 @@ setInterval(() => {
 setInterval(() => { if (poly.autoFetch) fetchPolyMarket().catch(e => console.error('[poly]', e.message)); }, 2000);
 // Chainlink every 4s
 setInterval(() => { if (chain.enabled && !isSim) refreshChainlinkPrice().catch(() => {}); }, 4000);
-// Retry Coinbase every 5 min while on the Chainlink fallback — upgrade to live
-// automatically if its IP block ever lifts (a successful connect stops the feed).
+// Retry the full feed chain every 5 min while on a degraded source (price-only
+// Chainlink or random SIM) — upgrade back to a real exchange feed if any becomes
+// reachable. (We don't retry while on Binance/Kraken — those are already full.)
 setInterval(() => {
-  if (wsStatus === 'chainlink') {
-    console.log('[coinbase] retrying connection from Chainlink fallback...');
+  if (wsStatus === 'chainlink' || wsStatus === 'sim') {
+    console.log('[feeds] retrying full feed chain from', wsStatus);
     connectCoinbase();
   }
 }, 300_000);
