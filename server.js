@@ -1038,11 +1038,20 @@ const STRAT_MOMENTUM = {
     if (ctx.sigP.conf < p.minConf) return null;
     if (ctx.msToEnd < p.minTimeMs) return null;
     if (ctx.polyUp === null) return null;
-    const polyPrice = ctx.sigP.dir === 'UP' ? ctx.polyUp : ctx.polyDn;
+
+    // Normalize prices so UP + DOWN = 1.0.
+    // Raw CLOB midpoints can sum to >1 (e.g. 82¢ + 19¢ = 101¢) due to
+    // bid/ask spread — this inflates edge by the spread amount. Normalizing
+    // removes that artifact and gives us the true implied probability.
+    const rawSum  = ctx.polyUp + ctx.polyDn;
+    const normUp  = ctx.polyUp  / rawSum;
+    const normDn  = ctx.polyDn  / rawSum;
+
+    const polyPrice = ctx.sigP.dir === 'UP' ? normUp : normDn;
     const ourProb   = ctx.sigP.dir === 'UP' ? ctx.sigP.prob : (1 - ctx.sigP.prob);
     const edge      = ourProb - polyPrice;
     if (edge < p.minEdge) return null;
-    return { side: ctx.sigP.dir, polyPrice, ourProb, edge, info: `conf=${ctx.sigP.conf.toFixed(0)}% edge=+${(edge * 100).toFixed(1)}pp` };
+    return { side: ctx.sigP.dir, polyPrice, ourProb, edge, info: `conf=${ctx.sigP.conf.toFixed(0)}% edge=+${(edge * 100).toFixed(1)}pp (sum=${(rawSum*100).toFixed(1)}¢)` };
   },
   shouldExit(ctx, pos, p) {
     const curMid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
