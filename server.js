@@ -106,6 +106,8 @@ let bestAsk      = null;
 let sessionStart = null;
 let wsStatus     = 'disconnected';
 let isSim        = false;
+let feedWarmupUntil = 0;          // until this ts, block NEW entries after a feed switch (exits still allowed)
+const FEED_WARMUP_MS = 12_000;    // ~12s for the fresh feed to refill the tick buffer before we trust signals
 
 // Polymarket
 let poly = {
@@ -1133,6 +1135,14 @@ function stratOpen(s, ctx, entry, acct, isReal) {
     return;
   }
 
+  // ── FEED-SWITCH WARMUP: don't OPEN on a fresh, half-filled buffer ───────────
+  // Right after the price source changes we cleared the tick buffer; give the
+  // new feed a few seconds to refill before trusting entry signals. Exits are
+  // NOT gated here (they run in stratClose off Chainlink + Polymarket prices).
+  if (Date.now() < feedWarmupUntil) {
+    return;
+  }
+
   // ── Safety guard: never size a real trade from the default $1000 placeholder ──
   // If the USDC balance was never successfully fetched from CLOB, bail out.
   if (isReal && REAL_TRADING && realBalance === null) {
@@ -1493,17 +1503,20 @@ function processAccount(s, ctx, acct, isReal) {
 
 function processStrategies() {
   const ctx = getStratContext();
+  // Entries need a healthy, warmed-up buffer. Exits must ALWAYS run (even with a
+  // thin buffer right after a feed switch) — they key off Chainlink + Polymarket
+  // prices, not the BTC tick buffer, so a managed position can never get stuck.
+  const canEnter = ticks.length >= 60 && Date.now() >= feedWarmupUntil;
   for (const id in STRATEGIES) {
     const s = STRATEGIES[id];
-    if (ticks.length < 60) continue;
 
     // Demo account — always simulation, never real orders
-    if (s.demoEnabled) {
+    if (s.demoEnabled && (s.demo.open || canEnter)) {
       processAccount(s, ctx, s.demo, false);
     }
 
     // Real account — places CLOB orders if wallet is configured; otherwise sim
-    if (s.realEnabled && !s.pendingReal) {
+    if (s.realEnabled && !s.pendingReal && (s.real.open || canEnter)) {
       const canReal = REAL_TRADING && !!polyWallet && !!polyApiCreds;
       processAccount(s, ctx, s.real, canReal);
     }
@@ -1578,6 +1591,7 @@ function startSim() {
   if (isSim) return;
   isSim    = true;
   wsStatus = 'sim';
+  onFeedSwitch('sim');
   console.log('[sim] started (ws blocked/failed)');
   let price = 107650;
   sessionStart = price;
@@ -1632,9 +1646,25 @@ let chainlinkFeedTimer = null;
 
 function terminateWs(w) { if (w) { try { w.terminate(); } catch (_) {} } }
 
+// Called on EVERY change of the active price feed. Wipes the tick/book buffers so
+// stale ticks from the previous source don't mix with the new one, and arms a
+// short warmup during which NO NEW positions open (exits keep working — they run
+// off Chainlink price + Polymarket prices, not the BTC tick buffer).
+function onFeedSwitch(label) {
+  ticks.length = 0;
+  cvd = 0;
+  cvdSeries.length = 0;
+  bookHistory.length = 0;
+  book.bids.clear(); book.asks.clear();
+  sessionStart = null;
+  feedWarmupUntil = Date.now() + FEED_WARMUP_MS;
+  console.log(`[feed] switched to ${label} — buffer cleared, ${FEED_WARMUP_MS/1000}s entry warmup (exits stay active)`);
+}
+
 // Promote one feed to "active": set status, leave SIM, and shut down every other
 // feed so we never have two sources pushing ticks at once.
 function goLiveFeed(name, keep) {
+  const changed = wsStatus !== name;
   wsStatus = name;
   if (isSim) isSim = false;
   stopSim();
@@ -1642,6 +1672,7 @@ function goLiveFeed(name, keep) {
   if (keep !== ws_)       terminateWs(ws_);
   if (keep !== binanceWs) terminateWs(binanceWs);
   if (keep !== krakenWs)  terminateWs(krakenWs);
+  if (changed) onFeedSwitch(name);
 }
 
 function seedSymmetricBook(px) {
@@ -1794,6 +1825,7 @@ function startChainlinkFeed() {
   if (wsStatus === 'live' || wsStatus === 'binance' || wsStatus === 'kraken') return; // a full feed is active
   if (chainlinkFeedTimer) { wsStatus = 'chainlink'; return; }                          // already running
   wsStatus = 'chainlink';
+  onFeedSwitch('chainlink');
   console.log('[chainlink-feed] no exchange WS reachable — using REAL Chainlink BTC/USD price (trading stays enabled)');
   sendTg(
     `⚠️ <b>Биржевые WS недоступны</b>\n` +
