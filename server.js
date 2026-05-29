@@ -1425,8 +1425,89 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
       const SELL_LADDER        = [0.97, 0.90, 0.80];
       const SELL_RETRY_DELAY_MS = 2_000;
 
+      // ── PANIC SELL (рыночный сброс) ──────────────────────────────────────
+      // Если лесенка лимитных ордеров не залилась, НЕ держим позицию до SETTLE
+      // (для SL это почти гарантированный 0). Вместо этого делаем рыночный
+      // выход: ордер FAK (Fill-And-Kill) по "полу" цены. FAK не висит в стакане,
+      // а мгновенно сметает все доступные биды сверху вниз по их ценам и убивает
+      // остаток. Так мы гарантированно выходим в ту ликвидность, что есть сейчас.
+      //   PANIC_SELL=false      → отключить, вернуться к старому "держать до SETTLE"
+      //   PANIC_SELL_FLOOR=0.05 → не продавать дешевле 5¢ (по умолчанию 0.01 = любой бид)
+      const PANIC_SELL = !['false', '0', 'no', 'off']
+        .includes((process.env.PANIC_SELL || 'true').toLowerCase().trim());
+      const PANIC_SELL_FLOOR = Math.max(0.01, Math.min(0.99,
+        parseFloat(process.env.PANIC_SELL_FLOOR || '0.01') || 0.01));
+
+      // SELL_LADDER_FIRST — пробовать ли лесенку лимиток ПЕРЕД рыночным сбросом.
+      //   false (по умолчанию) → сразу паник-селл по рынку (FAK), без задержек.
+      //                          FAK всё равно берёт лучшие биды первыми, так что
+      //                          в цене не теряем, зато выходим мгновенно и точно.
+      //   true                 → старое поведение: 3 лимитки (97→90→80%), и только
+      //                          если все промахнулись — паник-селл.
+      const SELL_LADDER_FIRST = ['true', '1', 'yes', 'on']
+        .includes((process.env.SELL_LADDER_FIRST || 'false').toLowerCase().trim());
+
+      // Рыночный сброс всей позиции через FAK по floor-цене.
+      // Возвращает true, если ордер ушёл на матчинг (даже частичный),
+      // false — если биржа отвергла ордер (тогда падаем в SETTLE как раньше).
+      const panicSell = async () => {
+        try {
+          const result = await placeClobOrder({
+            tokenId:   o.tokenId,
+            side:      'SELL',
+            size:      shares,
+            price:     PANIC_SELL_FLOOR,
+            orderType: 'FAK',
+          });
+          console.log(
+            `[real] PANIC SELL (FAK @ ${PANIC_SELL_FLOOR}) orderId=${result.orderID} ` +
+            `status=${result.status} shares=${result.actualShares} reason=${reason}`
+          );
+          sendTg(
+            `🆘 <b>PANIC SELL — рыночный сброс</b>\n` +
+            `Лимитные попытки не залились — продаю по рынку (FAK).\n` +
+            `Беру лучшие биды, принимаю любую цену ≥ ${(PANIC_SELL_FLOOR * 100).toFixed(0)}¢.\n` +
+            `Статус: <b>${_tgEsc(result.status || 'placed')}</b> | ${result.actualShares} shares`
+          );
+          // Дать матчингу/ончейну осесть, затем сверить реальный баланс.
+          syncBalanceAfter(8_000, 'post-PANIC-SELL');
+          return true;
+        } catch (err) {
+          console.error(`[real] PANIC SELL failed (${reason}):`, err.message);
+          sendTg(
+            `❌ <b>PANIC SELL не прошёл</b>: ${_tgEsc(err.message)}\n` +
+            `Стакан пустой или ордер отвергнут — остаётся ждать SETTLE.`
+          );
+          return false;
+        }
+      };
+
       const trySellWithRetry = async () => {
         let lastOrderId = null;
+
+        // ── Прямой выход по рынку (по умолчанию) ──────────────────────────
+        // Не тратим время на лесенку: сразу сбрасываем позицию рыночным FAK.
+        // FAK забирает лучшие биды первыми, поэтому цена не хуже лесенки,
+        // зато выход мгновенный и без риска "повисеть в стакане".
+        if (!SELL_LADDER_FIRST) {
+          if (PANIC_SELL) {
+            console.warn(`[real] straight-to-market exit (FAK), reason=${reason}`);
+            const dumped = await panicSell();
+            if (dumped) return;
+            // FAK не нашёл ликвидности → падаем в SETTLE ниже.
+          }
+          console.warn(`[real] no market liquidity / panic disabled — holding for SETTLE`);
+          sendTg(
+            `⏳ <b>Выход по рынку не удался</b> (${_tgEsc(reason)})\n` +
+            `${PANIC_SELL ? 'Стакан пустой — ' : 'Panic sell выключен — '}` +
+            `жду SETTLE (~${Math.max(0, Math.round((o.expiryTime - Date.now()) / 1000))}с).\n` +
+            `Финальный P&amp;L будет после закрытия окна.`
+          );
+          syncBalanceAfter(Math.max(60_000, o.expiryTime + 90_000 - Date.now()), 'post-SETTLE-fallback');
+          return;
+        }
+
+        // ── Лесенка лимиток (SELL_LADDER_FIRST=true) ──────────────────────
         for (let attempt = 0; attempt < SELL_LADDER.length; attempt++) {
           const sellPrice = Math.max(0.01, parseFloat((exitPolyPrice * SELL_LADDER[attempt]).toFixed(4)));
 
@@ -1471,12 +1552,26 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
           }
         }
 
-        // All 3 attempts exhausted without a fill.
-        // Do NOT sell at floor — better to hold and let SETTLE decide.
-        console.warn(`[real] SELL: all ${SELL_LADDER.length} attempts missed — holding for on-chain SETTLE`);
+        // ── Лесенка не залилась ──────────────────────────────────────────
+        // Раньше тут бот просто держал позицию до SETTLE. Для SL это означало
+        // почти гарантированный 0 (рынок ушёл против нас). Теперь сначала
+        // пытаемся выйти по рынку (FAK), и только если стакан совсем пуст —
+        // падаем в ожидание SETTLE.
+        console.warn(`[real] SELL: all ${SELL_LADDER.length} ladder attempts missed`);
+
+        if (PANIC_SELL) {
+          console.warn('[real] firing PANIC market sell (FAK)…');
+          const dumped = await panicSell();
+          if (dumped) return; // вышли по рынку — дальше не ждём SETTLE
+        }
+
+        // PANIC_SELL выключен ИЛИ стакан пуст / ордер отвергнут → последний
+        // рубеж: ждём ончейн-SETTLE по истечении окна.
+        console.warn(`[real] holding for on-chain SETTLE (panic ${PANIC_SELL ? 'failed' : 'disabled'})`);
         sendTg(
-          `⏳ <b>SELL не прошёл за 3 попытки</b> (${_tgEsc(reason)})\n` +
-          `Продавать по бросовой цене не буду — жду SETTLE (~${Math.max(0, Math.round((o.expiryTime - Date.now()) / 1000))}с).\n` +
+          `⏳ <b>Выход по рынку не удался</b> (${_tgEsc(reason)})\n` +
+          `${PANIC_SELL ? 'Стакан пустой — ' : 'Panic sell выключен — '}` +
+          `жду SETTLE (~${Math.max(0, Math.round((o.expiryTime - Date.now()) / 1000))}с).\n` +
           `Финальный P&amp;L будет после закрытия окна.`
         );
         syncBalanceAfter(Math.max(60_000, o.expiryTime + 90_000 - Date.now()), 'post-SETTLE-fallback');
