@@ -815,14 +815,16 @@ async function placeClobOrder({ tokenId, side, size, price, orderType = 'GTC' })
   }
 }
 
-/** Cancel an open order by ID. Safe to call even if already filled. */
+/** Cancel an open order by ID. Returns the CLOB response (or null). */
 async function cancelClobOrder(orderId) {
-  if (!polyClob || !orderId) return;
+  if (!polyClob || !orderId) return null;
   try {
     const resp = await polyClob.cancelOrder({ orderID: orderId });
     console.log(`[real] cancel orderId=${orderId} →`, JSON.stringify(resp).slice(0, 200));
+    return resp;
   } catch (e) {
     console.error('[real] cancel error:', e.message);
+    return null;
   }
 }
 
@@ -1372,9 +1374,38 @@ function stratOpen(s, ctx, entry, acct, isReal) {
           return;
         }
 
-        // Так и не залилось → отменяем хвост и откатываем (без фантома).
-        console.warn(`[real] BUY not filled (status=${st?.status || result.status}) — cancel & rollback, NO position`);
-        await cancelClobOrder(result.orderID);
+        // Так и не залилось за окно проверки. Пытаемся отменить — НО отмена
+        // может прийти ровно в момент заполнения (гонка). Поэтому после отмены
+        // ПЕРЕпроверяем реальное заполнение и откатываемся ТОЛЬКО при нуле.
+        // Иначе оставим без присмотра реальную позицию, которая сгорит в SETTLE.
+        const cancelResp = await cancelClobOrder(result.orderID);
+        const finalSt    = await getClobOrderStatus(result.orderID);
+        const matched    = parseFloat(finalSt?.size_matched ?? finalSt?.sizeMatched ?? '0') || 0;
+        const cantCancel = !!(cancelResp && cancelResp.not_canceled &&
+                              Object.keys(cancelResp.not_canceled).length > 0);
+        const raceFilled = matched > 0
+          || String(finalSt?.status || '').toLowerCase() === 'matched'
+          || cantCancel; // не смогли отменить → ордер уже исполнен
+
+        if (raceFilled) {
+          const filledShares = matched > 0 ? matched : plannedShares;
+          if (acct.open) {
+            acct.open.realOrderId     = result.orderID;
+            acct.open.realOrderStatus = 'matched';
+            acct.open.actualShares    = filledShares;
+            saveState();
+          }
+          console.warn(`[real] BUY filled during cancel race — KEEP position, shares=${filledShares}`);
+          sendTg(
+            `⚠️ <b>Вход всё-таки прошёл</b> — ${entry.side}\n` +
+            `Ордер залился в момент отмены (${filledShares} shares). НЕ бросаю позицию — ` +
+            `веду её, выход по TP/SL/panic-sell, чтобы не сгорела в ноль.`
+          );
+          return;
+        }
+
+        // Подтверждённо НЕ залилось → чистый откат (без фантома).
+        console.warn(`[real] BUY not filled (status=${finalSt?.status || result.status}) — rolled back, NO position`);
         rollback(
           `🚫 <b>Вход не состоялся</b> — ${entry.side}\n` +
           `Нет ликвидности ≤ ${(ceiling * 100).toFixed(0)}¢ за ${BUY_VERIFY_MS / 1000}с — ордер отменён.\n` +
