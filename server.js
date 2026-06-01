@@ -103,6 +103,12 @@ let book         = { bids: new Map(), asks: new Map() };
 let bookHistory  = [];   // snapshots for OFI
 let bestBid      = null;
 let bestAsk      = null;
+let clobQuotes   = {};   // tokenId → {bid, ask} последних котировок CLOB (для калибровки спреда)
+// Калибровочный лог: по каждому входу — условия входа + фактический исход окна.
+// Нужен, чтобы на РЕАЛЬНЫХ данных посчитать, в каком диапазоне цены входа есть
+// эдж после спреда (на симуляции шэров это считать нельзя).
+let calibLog = [];
+const CALIB_MAX = 4000;
 let sessionStart = null;
 let wsStatus     = 'disconnected';
 let isSim        = false;
@@ -173,6 +179,7 @@ function saveState() {
       demoDelaySec: DEMO_ENTRY_DELAY_MS / 1000, demoMaxChasePct: DEMO_MAX_CHASE * 100,
       schedEnabled: SCHEDULE_ENABLED, schedFrom: SCHEDULE_FROM, schedTo: SCHEDULE_TO,
     };
+    out.__calib = calibLog.slice(-CALIB_MAX);
     fs.writeFileSync(STATE_FILE, JSON.stringify(out, null, 2));
   } catch (e) { console.error('[state] save error:', e.message); }
 }
@@ -231,6 +238,7 @@ function loadState() {
       if (isFinite(Number(g.schedFrom)))        SCHEDULE_FROM      = Math.max(0, Math.min(24, parseInt(g.schedFrom, 10)));
       if (isFinite(Number(g.schedTo)))          SCHEDULE_TO        = Math.max(0, Math.min(24, parseInt(g.schedTo, 10)));
     }
+    if (Array.isArray(stored.__calib)) calibLog = stored.__calib.slice(-CALIB_MAX);
     console.log('[state] loaded');
   } catch (e) { console.error('[state] load error:', e.message); }
 }
@@ -562,7 +570,7 @@ async function fetchClobMidpoint(tokenId) {
       // the inner quotes are degenerate — treat the book as effectively empty
       // and fall through to the midpoint endpoint.
       const spread = bestAsk - bestBid;
-      if (spread < 0.50) return (bestBid + bestAsk) / 2;
+      if (spread < 0.50) { clobQuotes[tokenId] = { bid: bestBid, ask: bestAsk }; return (bestBid + bestAsk) / 2; }
     } else if (bestBid !== null) {
       return bestBid;
     } else if (bestAsk !== null) {
@@ -638,7 +646,9 @@ async function fetchPolyMarket() {
   }
 
   if (up !== null && dn !== null) {
-    poly.prices = { up, down: dn, ts: Date.now() };
+    const qu = clobQuotes[poly.market?.tokenIdUp] || {};
+    const qd = clobQuotes[poly.market?.tokenIdDown] || {};
+    poly.prices = { up, down: dn, upBid: qu.bid ?? null, upAsk: qu.ask ?? null, dnBid: qd.bid ?? null, dnAsk: qd.ask ?? null, ts: Date.now() };
   }
 }
 
@@ -1412,6 +1422,52 @@ function getStratContext() {
   };
 }
 
+// Котировки стороны (bid/ask/mid) в текущий момент — для калибровочного лога.
+function _sideQuote(side) {
+  const p = poly.prices;
+  return side === 'UP'
+    ? { bid: p.upBid, ask: p.upAsk, mid: p.up }
+    : { bid: p.dnBid, ask: p.dnAsk, mid: p.down };
+}
+
+// Записать условия входа. Исход окна допишется позже в resolveCalib().
+function logCalibEntry(s, ctx, entry, acct, isReal) {
+  const q = _sideQuote(entry.side);
+  const mode = isReal ? 'real' : (acct === s.demo ? 'demo' : 'simreal');
+  calibLog.push({
+    ts:         Date.now(),
+    strategy:   s.def.id,
+    mode,
+    side:       entry.side,
+    mid:        entry.polyPrice,                                   // норм. цена (как видит стратегия)
+    rawMid:     q.mid,                                             // сырой mid стороны
+    bid:        q.bid,
+    ask:        q.ask,
+    spread:     (q.bid != null && q.ask != null) ? +(q.ask - q.bid).toFixed(4) : null,
+    msToEnd:    ctx.msToEnd,
+    btcMove:    (ctx.curBTC != null && ctx.openingBTC != null) ? +(ctx.curBTC - ctx.openingBTC).toFixed(2) : null,
+    openingBTC: ctx.openingBTC,
+    windowEnd:  ctx.win.endTs,
+    slug:       poly.market ? poly.market.eventSlug : 'manual',
+    outcome:    null,   // 'UP'/'DOWN'/'stale' — дописывается при закрытии окна
+    ourWin:     null,   // 1 если outcome === side
+  });
+  if (calibLog.length > CALIB_MAX) calibLog.shift();
+}
+
+// Дописать фактический исход окна для записей, чьё окно уже закрылось.
+function resolveCalib(ctx) {
+  const now = Date.now();
+  for (const r of calibLog) {
+    if (r.outcome !== null) continue;
+    if (now < r.windowEnd) continue;
+    if (now > r.windowEnd + 120000) { r.outcome = 'stale'; continue; } // не поймали закрытие
+    if (ctx.curBTC == null || r.openingBTC == null) continue;
+    r.outcome = ctx.curBTC > r.openingBTC ? 'UP' : 'DOWN';
+    r.ourWin  = (r.outcome === r.side) ? 1 : 0;
+  }
+}
+
 function stratOpen(s, ctx, entry, acct, isReal) {
   // ── Safety guard: never size a real trade from the default $1000 placeholder ──
   // If the USDC balance was never successfully fetched from CLOB, bail out.
@@ -1558,6 +1614,7 @@ function stratOpen(s, ctx, entry, acct, isReal) {
     s.pendingReal = true;
     s.realTradesThisWindow = (s.realTradesThisWindow || 0) + 1;
   }
+  logCalibEntry(s, ctx, entry, acct, isReal);
   saveState();
   console.log(`[${s.def.id}] ${isRealOrder ? 'REAL' : 'SIM'} OPEN ${entry.side} @ ${entry.polyPrice.toFixed(3)} size=$${sizeUSDC.toFixed(2)} (balance=$${effectiveBalance.toFixed(2)}) | ${entry.info}`);
 
@@ -2021,6 +2078,7 @@ function processAccount(s, ctx, acct, isReal) {
 
 function processStrategies() {
   const ctx = getStratContext();
+  resolveCalib(ctx);
   for (const id in STRATEGIES) {
     const s = STRATEGIES[id];
     if (ticks.length < 60) continue;
@@ -2216,6 +2274,8 @@ function buildSnapshot() {
       demoDelaySec: DEMO_ENTRY_DELAY_MS / 1000, demoMaxChasePct: DEMO_MAX_CHASE * 100,
       schedEnabled: SCHEDULE_ENABLED, schedFrom: SCHEDULE_FROM, schedTo: SCHEDULE_TO,
       entriesAllowedNow: entriesAllowedNow(),
+      calibTotal: calibLog.length,
+      calibResolved: calibLog.filter(r => r.outcome === 'UP' || r.outcome === 'DOWN').length,
     },
   };
 }
@@ -2446,6 +2506,26 @@ app.get('/api/export/csv', (_, res) => {
     }
   }
   res.set({ 'Content-Type': 'text/csv', 'Content-Disposition': `attachment; filename="bot_log_${Date.now()}.csv"` });
+  res.send(rows.map(r => r.join(',')).join('\n'));
+});
+
+// API: экспорт КАЛИБРОВОЧНОГО лога (цена/спред входа + фактический исход окна).
+// На реальных данных по нему считаем, в каком диапазоне цены входа есть эдж.
+app.get('/api/export/calib.csv', (_, res) => {
+  const cols = ['ts','strategy','mode','side','mid','rawMid','bid','ask','spread','msToEnd','btcMove','openingBTC','windowEnd','slug','outcome','ourWin'];
+  const rows = [cols];
+  for (const r of calibLog) {
+    rows.push([
+      new Date(r.ts).toISOString(), r.strategy, r.mode, r.side,
+      r.mid != null ? r.mid.toFixed(4) : '', r.rawMid != null ? Number(r.rawMid).toFixed(4) : '',
+      r.bid != null ? Number(r.bid).toFixed(4) : '', r.ask != null ? Number(r.ask).toFixed(4) : '',
+      r.spread != null ? r.spread.toFixed(4) : '',
+      r.msToEnd ?? '', r.btcMove ?? '', r.openingBTC != null ? Number(r.openingBTC).toFixed(2) : '',
+      r.windowEnd ? new Date(r.windowEnd).toISOString() : '', r.slug || '',
+      r.outcome ?? '', r.ourWin ?? '',
+    ]);
+  }
+  res.set({ 'Content-Type': 'text/csv', 'Content-Disposition': `attachment; filename="calib_${Date.now()}.csv"` });
   res.send(rows.map(r => r.join(',')).join('\n'));
 });
 
