@@ -167,7 +167,7 @@ function saveState() {
         customParams:  s.customParams,
       };
     }
-    out.__global = { invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE };
+    out.__global = { invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE };
     fs.writeFileSync(STATE_FILE, JSON.stringify(out, null, 2));
   } catch (e) { console.error('[state] save error:', e.message); }
 }
@@ -211,6 +211,9 @@ function loadState() {
     }
     if (stored.__global && isFinite(Number(stored.__global.tpAbsPrice))) {
       TP_ABS_PRICE = Math.max(0.50, Math.min(0.99, Number(stored.__global.tpAbsPrice)));
+    }
+    if (stored.__global && isFinite(Number(stored.__global.minEntryPrice))) {
+      MIN_ENTRY_PRICE = Math.max(0.0, Math.min(0.50, Number(stored.__global.minEntryPrice)));
     }
     console.log('[state] loaded');
   } catch (e) { console.error('[state] load error:', e.message); }
@@ -1072,6 +1075,8 @@ const STRAT_MOMENTUM = {
 
     const polyPrice = dir === 'UP' ? normUp : normDn;
     const ourProb   = dir === 'UP' ? prob : (1 - prob);
+    // Порог минимальной цены входа: дешёвую сторону вживую не залить — пропускаем.
+    if (polyPrice < MIN_ENTRY_PRICE) return null;
     const edge      = ourProb - polyPrice;
     if (edge < p.minEdge) return null;
     return { side: dir, polyPrice, ourProb, edge, info: `conf=${ctx.sigP.conf.toFixed(0)}% edge=+${(edge * 100).toFixed(1)}pp${INVERT_SIGNAL ? ' [INV]' : ''} (sum=${(rawSum*100).toFixed(1)}¢)` };
@@ -1121,6 +1126,13 @@ const REAL_DAILY_LOSS_CAP    = parseFloat(process.env.REAL_DAILY_LOSS_CAP || '3'
 //   TP_ABS_PRICE=0.95 → фиксировать на 95¢ (по умолчанию). Можно 0.90–0.97.
 let TP_ABS_PRICE = Math.max(0.50, Math.min(0.99,
   parseFloat(process.env.TP_ABS_PRICE || '0.95') || 0.95));
+
+// Минимальная цена входа: не заходим, если наша сторона дешевле этого порога.
+// Дешёвые токены на резком рывке вживую не заливаются (цена уже ушла), а demo
+// рисует фантомный филл по 1–20¢ с нереальными +1000%. Порог режет эти окна на
+// ОБЕИХ ветках (demo и real), чтобы статистика была сравнимой. Меняется с дашборда.
+let MIN_ENTRY_PRICE = Math.max(0.0, Math.min(0.50,
+  parseFloat(process.env.MIN_ENTRY_PRICE || '0.15') || 0.15));
 
 // ── MARKETABLE ENTRY (вход по рынку) ──────────────────────────────────────────
 // Раньше BUY ставился лимиткой ровно по цене входа. Если ask был выше — ордер
@@ -1956,7 +1968,7 @@ function buildSnapshot() {
       wallet:   polyWallet?.address ?? null,
       balance:  realBalance,
     },
-    config: { invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE },
+    config: { invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE },
   };
 }
 
@@ -2000,9 +2012,13 @@ app.post('/api/strategy/:id/params', (req, res) => {
     const t = Number(b.tpAbsPrice);
     if (Number.isFinite(t)) { TP_ABS_PRICE = Math.max(0.50, Math.min(0.99, t)); applied.tpAbsPrice = TP_ABS_PRICE; }
   }
+  if (b.minEntryPrice !== undefined && b.minEntryPrice !== null && b.minEntryPrice !== '') {
+    const t = Number(b.minEntryPrice);
+    if (Number.isFinite(t)) { MIN_ENTRY_PRICE = Math.max(0.0, Math.min(0.50, t)); applied.minEntryPrice = MIN_ENTRY_PRICE; }
+  }
   saveState();
   console.log(`[params] ${req.params.id} updated`, applied);
-  res.json({ ok: true, customEnabled: s.customEnabled, customParams: s.customParams, params: s.params, tpAbsPrice: TP_ABS_PRICE });
+  res.json({ ok: true, customEnabled: s.customEnabled, customParams: s.customParams, params: s.params, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE });
 });
 
 // Включить/выключить кастом-режим (база ↔ кастом).

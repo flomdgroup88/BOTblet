@@ -535,6 +535,15 @@ table.log tr:hover td { background: var(--bg3); }
       <input id="p-tpAbs" class="cfg-input" type="number" step="1" min="50" max="99" style="width:90px;flex:0 0 auto;">
     </div>
 
+    <!-- МИН. ЦЕНА ВХОДА (глобальная, применяется всегда) -->
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px;padding:12px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px;">
+      <div style="flex:1;min-width:220px;">
+        <div style="font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px;">Мин. цена входа (¢)</div>
+        <div style="font-size:11px;color:var(--tx3);">не входим дешевле — дешёвые рывки вживую не залить. Режет фантомы в demo. Применяется ВСЕГДА.</div>
+      </div>
+      <input id="p-minEntry" class="cfg-input" type="number" step="1" min="0" max="50" style="width:90px;flex:0 0 auto;">
+    </div>
+
     <!-- КАСТОМ ПАРАМЕТРЫ -->
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
       <span style="font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px;">Параметры:</span>
@@ -968,6 +977,7 @@ function updateConfigPanel(d) {
       : 'обычный — торгуем ПО сигналу модели';
   }
   if (d.config && isFinite(d.config.tpAbsPrice)) _setIfBlur('p-tpAbs', Math.round(d.config.tpAbsPrice * 100));
+  if (d.config && isFinite(d.config.minEntryPrice)) _setIfBlur('p-minEntry', Math.round(d.config.minEntryPrice * 100));
   // кастом-режим
   const s = d.strats && d.strats[MOM];
   if (!s) return;
@@ -1016,13 +1026,14 @@ async function saveParams() {
     maxFrac:    num('p-maxFrac') / 100,
     minTimeMs:  num('p-minTimeSec') * 1000,
     tpAbsPrice: num('p-tpAbs') / 100,
+    minEntryPrice: num('p-minEntry') / 100,
   };
   for (const k in body) if (!isFinite(body[k])) delete body[k];
   $('cfgMsg').textContent = '...';
   const r = await (await fetch(`/api/strategy/${MOM}/params`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
   if (r.ok) {
     const be = (r.params.slPct/(r.params.tpPct+r.params.slPct)*100).toFixed(1);
-    $('cfgMsg').textContent = `✅ Сохранено · TP ${Math.round(r.params.tpPct*100)}% / SL ${Math.round(r.params.slPct*100)}% · абс.TP ${Math.round((r.tpAbsPrice||0)*100)}¢ · безубыток ${be}%` + (r.customEnabled ? '' : ' (включи КАСТОМ для TP/SL!)');
+    $('cfgMsg').textContent = `✅ Сохранено · TP ${Math.round(r.params.tpPct*100)}% / SL ${Math.round(r.params.slPct*100)}% · абс.TP ${Math.round((r.tpAbsPrice||0)*100)}¢ · мин.вход ${Math.round((r.minEntryPrice||0)*100)}¢ · безубыток ${be}%` + (r.customEnabled ? '' : ' (включи КАСТОМ для TP/SL!)');
   } else $('cfgMsg').textContent = 'Ошибка сохранения';
 }
 
