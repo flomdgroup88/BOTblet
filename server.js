@@ -177,6 +177,7 @@ function saveState() {
       invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE,
       dailyLossCap: REAL_DAILY_LOSS_CAP,
       demoDelaySec: DEMO_ENTRY_DELAY_MS / 1000, demoMaxChasePct: DEMO_MAX_CHASE * 100,
+      demoRealSpread: DEMO_REAL_SPREAD,
       schedEnabled: SCHEDULE_ENABLED, schedFrom: SCHEDULE_FROM, schedTo: SCHEDULE_TO,
     };
     out.__calib = calibLog.slice(-CALIB_MAX);
@@ -235,6 +236,7 @@ function loadState() {
       if (isFinite(Number(g.demoDelaySec)))    DEMO_ENTRY_DELAY_MS = Math.max(0, Math.min(30000, Math.round(Number(g.demoDelaySec) * 1000)));
       if (isFinite(Number(g.demoMaxChasePct))) DEMO_MAX_CHASE      = Math.max(0.01, Math.min(2.0, Number(g.demoMaxChasePct) / 100));
       if (typeof g.schedEnabled === 'boolean')  SCHEDULE_ENABLED   = g.schedEnabled;
+      if (typeof g.demoRealSpread === 'boolean') DEMO_REAL_SPREAD  = g.demoRealSpread;
       if (isFinite(Number(g.schedFrom)))        SCHEDULE_FROM      = Math.max(0, Math.min(24, parseInt(g.schedFrom, 10)));
       if (isFinite(Number(g.schedTo)))          SCHEDULE_TO        = Math.max(0, Math.min(24, parseInt(g.schedTo, 10)));
     }
@@ -1364,6 +1366,10 @@ let DEMO_ENTRY_DELAY_MS = Math.max(0, Math.min(30000,
   Math.round((parseFloat(process.env.DEMO_ENTRY_DELAY_SEC || '2') || 2) * 1000)));
 let DEMO_MAX_CHASE = Math.max(0.01, Math.min(2.0,
   (parseFloat(process.env.DEMO_MAX_CHASE_PCT || '15') || 15) / 100));
+// Реальный спред в demo: вход по ask, выход по bid (как реал). По умолчанию ВЫКЛ —
+// тогда demo торгует по mid (идеальная точка отсчёта). Включается тумблером.
+let DEMO_REAL_SPREAD = ['true', '1', 'yes', 'on']
+  .includes((process.env.DEMO_REAL_SPREAD || 'false').toLowerCase().trim());
 
 // ── РАСПИСАНИЕ ТОРГОВЛИ ───────────────────────────────────────────────────────
 // Ограничивает ОТКРЫТИЕ сделок по часам (МСК, UTC+3). Выходы работают всегда.
@@ -1478,6 +1484,12 @@ function stratOpen(s, ctx, entry, acct, isReal) {
 
   // For real accounts, always use the live wallet balance for sizing (not stale state value)
   const effectiveBalance = isReal && realBalance !== null ? realBalance : acct.balance;
+  // Реальный спред в demo: заливаемся по ASK стороны (как реал платит за вход),
+  // а не по mid. Тогда позиция сразу слегка в минусе на полспреда — реалистично.
+  if (acct === s.demo && DEMO_REAL_SPREAD) {
+    const q = _sideQuote(entry.side);
+    if (q.ask != null) entry = { ...entry, polyPrice: q.ask };
+  }
   let sizeUSDC = sizingByKelly(effectiveBalance, entry.ourProb, entry.polyPrice, s.params.kellyFrac, s.params.maxFrac);
   // For sim: reject tiny sizes immediately. For real: check AFTER the 5-share
   // bump below, so a $0.94 Kelly still becomes $3.03 (5 shares × 60.5¢) and passes.
@@ -2044,7 +2056,15 @@ function processAccount(s, ctx, acct, isReal) {
       stratClose(s, ctx, 'SETTLE', null, acct, isReal); return;
     }
     const exit = s.def.shouldExit(ctx, acct.open, s.params);
-    if (exit && exit.exitPrice !== null) stratClose(s, ctx, exit.reason, exit.exitPrice, acct, isReal);
+    if (exit && exit.exitPrice !== null) {
+      let xp = exit.exitPrice;
+      // Реальный спред в demo: продаём в BID стороны (как реал получает при выходе).
+      if (acct === s.demo && DEMO_REAL_SPREAD && exit.reason !== 'SETTLE') {
+        const q = _sideQuote(acct.open.side);
+        if (q.bid != null) xp = q.bid;
+      }
+      stratClose(s, ctx, exit.reason, xp, acct, isReal);
+    }
   } else {
     if (ctx.polyUp === null) return;
     if (!entriesAllowedNow()) { acct.pendingEntry = null; return; } // расписание: вне окна не открываем
@@ -2274,6 +2294,7 @@ function buildSnapshot() {
       demoDelaySec: DEMO_ENTRY_DELAY_MS / 1000, demoMaxChasePct: DEMO_MAX_CHASE * 100,
       schedEnabled: SCHEDULE_ENABLED, schedFrom: SCHEDULE_FROM, schedTo: SCHEDULE_TO,
       entriesAllowedNow: entriesAllowedNow(),
+      demoRealSpread: DEMO_REAL_SPREAD,
       calibTotal: calibLog.length,
       calibResolved: calibLog.filter(r => r.outcome === 'UP' || r.outcome === 'DOWN').length,
     },
@@ -2369,6 +2390,14 @@ app.post('/api/invert/toggle', (req, res) => {
   saveState();
   console.warn(`[config] INVERT_SIGNAL → ${INVERT_SIGNAL ? 'ON (торгуем ПРОТИВ сигнала)' : 'OFF (обычный режим)'}`);
   res.json({ ok: true, invertSignal: INVERT_SIGNAL });
+});
+
+// API: тумблер «реальный спред в demo» (вход по ask, выход по bid).
+app.post('/api/demo-spread/toggle', (req, res) => {
+  DEMO_REAL_SPREAD = typeof (req.body || {}).enabled === 'boolean' ? req.body.enabled : !DEMO_REAL_SPREAD;
+  saveState();
+  console.warn(`[config] DEMO_REAL_SPREAD → ${DEMO_REAL_SPREAD ? 'ON (demo платит спред)' : 'OFF (demo по mid)'}`);
+  res.json({ ok: true, demoRealSpread: DEMO_REAL_SPREAD });
 });
 
 // API: расписание торговли (часы МСК; выходы всегда работают).
