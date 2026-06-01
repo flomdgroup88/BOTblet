@@ -633,6 +633,7 @@ table.log tr:hover td { background: var(--bg3); }
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
     <div class="lbl" style="margin-bottom:0;">Сводный журнал сделок <span id="log-count" style="color:var(--tx3);">(0)</span></div>
     <a href="/api/export/csv" class="export-btn" download>↓ CSV</a>
+    <a id="calibLink" href="/api/export/calib.csv" class="export-btn" download title="Цена/спред входа + фактический исход окна — для калибровки на реальных данных">↓ CALIB</a>
   </div>
   <div class="log-wrap">
     <table class="log" id="main-log">
@@ -1059,6 +1060,8 @@ function updateConfigPanel(d) {
   if (d.config && isFinite(d.config.demoDelaySec)) _setIfBlur('p-demoDelay', d.config.demoDelaySec);
   if (d.config && isFinite(d.config.demoMaxChasePct)) _setIfBlur('p-demoChase', Math.round(d.config.demoMaxChasePct));
   if (d.config) {
+    const cl = $('calibLink');
+    if (cl && isFinite(d.config.calibResolved)) cl.textContent = `↓ CALIB (${d.config.calibResolved})`;
     const en = !!d.config.schedEnabled;
     const sb = $('schedBtn');
     if (sb) {
