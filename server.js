@@ -167,7 +167,12 @@ function saveState() {
         customParams:  s.customParams,
       };
     }
-    out.__global = { invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE, dailyLossCap: REAL_DAILY_LOSS_CAP };
+    out.__global = {
+      invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE,
+      dailyLossCap: REAL_DAILY_LOSS_CAP,
+      demoDelaySec: DEMO_ENTRY_DELAY_MS / 1000, demoMaxChasePct: DEMO_MAX_CHASE * 100,
+      schedEnabled: SCHEDULE_ENABLED, schedFrom: SCHEDULE_FROM, schedTo: SCHEDULE_TO,
+    };
     fs.writeFileSync(STATE_FILE, JSON.stringify(out, null, 2));
   } catch (e) { console.error('[state] save error:', e.message); }
 }
@@ -217,6 +222,14 @@ function loadState() {
     }
     if (stored.__global && isFinite(Number(stored.__global.dailyLossCap))) {
       REAL_DAILY_LOSS_CAP = Math.max(0.1, Math.min(10000, Number(stored.__global.dailyLossCap)));
+    }
+    if (stored.__global) {
+      const g = stored.__global;
+      if (isFinite(Number(g.demoDelaySec)))    DEMO_ENTRY_DELAY_MS = Math.max(0, Math.min(30000, Math.round(Number(g.demoDelaySec) * 1000)));
+      if (isFinite(Number(g.demoMaxChasePct))) DEMO_MAX_CHASE      = Math.max(0.01, Math.min(2.0, Number(g.demoMaxChasePct) / 100));
+      if (typeof g.schedEnabled === 'boolean')  SCHEDULE_ENABLED   = g.schedEnabled;
+      if (isFinite(Number(g.schedFrom)))        SCHEDULE_FROM      = Math.max(0, Math.min(24, parseInt(g.schedFrom, 10)));
+      if (isFinite(Number(g.schedTo)))          SCHEDULE_TO        = Math.max(0, Math.min(24, parseInt(g.schedTo, 10)));
     }
     console.log('[state] loaded');
   } catch (e) { console.error('[state] load error:', e.message); }
@@ -1116,7 +1129,166 @@ const STRAT_MOMENTUM = {
   },
 };
 
-const STRAT_DEFINITIONS = [STRAT_MOMENTUM];
+// ── ХЕЛПЕРЫ ДЛЯ СТРАТЕГИЙ ─────────────────────────────────────────────────────
+function _normPoly(ctx) {
+  if (ctx.polyUp == null || ctx.polyDn == null) return null;
+  const sum = ctx.polyUp + ctx.polyDn;
+  if (sum <= 0) return null;
+  return { up: ctx.polyUp / sum, dn: ctx.polyDn / sum, sum };
+}
+// Синтетическая вероятность для сайзинга там, где нет модельной prob — должна быть
+// выше цены (иначе Kelly даст 0), но в разумных пределах.
+function _clampProb(prob, price) { return Math.max(price + 0.02, Math.min(0.97, prob)); }
+// Общий ценовой выход TP/SL (+ абсолютный потолок).
+function _tpSlExit(ctx, pos, p) {
+  const curMid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+  if (curMid == null) return null;
+  const mv = (curMid - pos.polyEntryPrice) / pos.polyEntryPrice;
+  if (curMid >= TP_ABS_PRICE) return { reason: 'TP', exitPrice: curMid };
+  if (mv >= p.tpPct)          return { reason: 'TP', exitPrice: curMid };
+  if (mv <= -p.slPct)         return { reason: 'SL', exitPrice: curMid };
+  return null;
+}
+function _advExit(ctx, pos, p) {
+  const curMid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+  const entryBTC = pos.btcAtEntryCoinbase || pos.btcAtEntry;
+  if (ctx.curBTC && entryBTC && ctx.msToEnd > 90000) {
+    const mvBTC = ((ctx.curBTC - entryBTC) / entryBTC) * 100;
+    if (pos.side === 'UP'   && mvBTC < -p.advMovePct) return { reason: 'ADVERSE', exitPrice: curMid };
+    if (pos.side === 'DOWN' && mvBTC > p.advMovePct)  return { reason: 'ADVERSE', exitPrice: curMid };
+  }
+  return null;
+}
+// Вход в стиле momentum (с возможной инверсией направления).
+function _momentumEntry(ctx, p, invert) {
+  if (ctx.sigP.dir === 'WAIT') return null;
+  if (ctx.sigP.conf < p.minConf) return null;
+  if (ctx.msToEnd < p.minTimeMs) return null;
+  const np = _normPoly(ctx); if (!np) return null;
+  let dir = ctx.sigP.dir, prob = ctx.sigP.prob;
+  if (invert) { dir = dir === 'UP' ? 'DOWN' : 'UP'; prob = 1 - prob; }
+  const polyPrice = dir === 'UP' ? np.up : np.dn;
+  const ourProb   = dir === 'UP' ? prob : (1 - prob);
+  if (polyPrice < MIN_ENTRY_PRICE) return null;
+  const edge = ourProb - polyPrice;
+  if (edge < p.minEdge) return null;
+  return { side: dir, polyPrice, ourProb, edge, info: `conf=${ctx.sigP.conf.toFixed(0)}% edge=+${(edge*100).toFixed(1)}pp${invert ? ' [ANTI]' : ''}` };
+}
+
+// ── 1. MOMENTUM SCRATCH — momentum, но фиксируем малую прибыль, если до TP не
+//       дотягиваем и импульс выдыхается (или мало времени до конца окна). ───────
+const STRAT_MOM_SCRATCH = {
+  id: 'momScratch',
+  name: 'Momentum Scratch (ранний выход)',
+  desc: 'momentum + фиксация малой прибыли, если TP недостижим',
+  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, tpPct: 0.50, slPct: 0.30, flipConf: 50, advMovePct: 0.25, kellyFrac: 0.25, maxFrac: 0.10, scratchMin: 0.08, scratchTimeMs: 120000 },
+  shouldEnter(ctx, p) { return _momentumEntry(ctx, p, INVERT_SIGNAL); },
+  shouldExit(ctx, pos, p) {
+    const curMid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (curMid != null) {
+      const mv = (curMid - pos.polyEntryPrice) / pos.polyEntryPrice;
+      if (curMid >= TP_ABS_PRICE) return { reason: 'TP', exitPrice: curMid };
+      if (mv >= p.tpPct)          return { reason: 'TP', exitPrice: curMid };
+      // SCRATCH: в плюсе, но TP не достигнут и импульс уходит / времени мало.
+      if (mv >= p.scratchMin && mv < p.tpPct) {
+        let effDir = ctx.sigP.dir;
+        if (INVERT_SIGNAL && effDir !== 'WAIT') effDir = effDir === 'UP' ? 'DOWN' : 'UP';
+        const fading = (effDir !== pos.side) || (ctx.sigP.conf < p.minConf);
+        if (fading || ctx.msToEnd < p.scratchTimeMs) return { reason: 'SCRATCH', exitPrice: curMid };
+      }
+      if (mv <= -p.slPct) return { reason: 'SL', exitPrice: curMid };
+    }
+    return _advExit(ctx, pos, p);
+  },
+};
+
+// ── 2. ANTI-MOMENTUM — всегда против сырого сигнала модели (отдельная стратегия,
+//       чтобы крутить momentum и его зеркало одновременно). ────────────────────
+const STRAT_ANTI_MOM = {
+  id: 'antiMom',
+  name: 'Anti-Momentum (контр-сигнал)',
+  desc: 'всегда ПРОТИВ сигнала модели — постоянное зеркало momentum',
+  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, tpPct: 0.50, slPct: 0.30, advMovePct: 0.25, kellyFrac: 0.25, maxFrac: 0.10 },
+  shouldEnter(ctx, p) { return _momentumEntry(ctx, p, true); },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
+};
+
+// ── 3. MEAN REVERSION — когда одна сторона перегрета (дорого), ставим против
+//       на возврат. Входим в дорогой рынок → меньше трения, чем дешёвые рывки. ──
+const STRAT_MEAN_REV = {
+  id: 'meanRev',
+  name: 'Mean Reversion (контр-перелёт)',
+  desc: 'против перегретой стороны (>80¢) в середине окна',
+  defaults: { mrHot: 0.80, revEdge: 0.08, minTimeMs: 60000, maxTimeMs: 240000, tpPct: 0.30, slPct: 0.30, kellyFrac: 0.20, maxFrac: 0.08 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs || ctx.msToEnd > p.maxTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const hotSide  = np.up >= np.dn ? 'UP' : 'DOWN';
+    const hotPrice = Math.max(np.up, np.dn);
+    if (hotPrice < p.mrHot) return null;
+    const betSide  = hotSide === 'UP' ? 'DOWN' : 'UP';
+    const betPrice = Math.min(np.up, np.dn);
+    if (betPrice < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(betPrice + p.revEdge, betPrice);
+    return { side: betSide, polyPrice: betPrice, ourProb, edge: ourProb - betPrice, info: `против ${hotSide} @${(hotPrice*100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p); },
+};
+
+// ── 4. LATE-WINDOW FAVORITE — под конец окна добираем явного фаворита по цене
+//       Chainlink BTC, пока он ещё не у 1.0 (ловим оставшийся зазор). ───────────
+const STRAT_LATE_FAV = {
+  id: 'lateFav',
+  name: 'Late Favorite (фаворит под закрытие)',
+  desc: 'в конце окна берём фаворита по факту BTC, пока он < 93¢',
+  defaults: { lateMs: 90000, minTimeMs: 8000, favMin: 0.62, favMax: 0.93, favEdge: 0.08, tpPct: 0.20, slPct: 0.40, kellyFrac: 0.20, maxFrac: 0.08 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd > p.lateMs || ctx.msToEnd < p.minTimeMs) return null;
+    if (ctx.curBTC == null || ctx.openingBTC == null) return null;
+    const fav = ctx.curBTC > ctx.openingBTC ? 'UP' : (ctx.curBTC < ctx.openingBTC ? 'DOWN' : null);
+    if (!fav) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const favPrice = fav === 'UP' ? np.up : np.dn;
+    if (favPrice < p.favMin || favPrice > p.favMax) return null;
+    if (favPrice < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(favPrice + p.favEdge, favPrice);
+    const d = ctx.curBTC - ctx.openingBTC;
+    return { side: fav, polyPrice: favPrice, ourProb, edge: ourProb - favPrice, info: `фаворит ${fav} @${(favPrice*100).toFixed(0)}¢ (BTC ${d>=0?'+':''}${d.toFixed(0)})` };
+  },
+  shouldExit(ctx, pos, p) {
+    const e = _tpSlExit(ctx, pos, p); if (e) return e;
+    // фаворит потерян — BTC вернулся на другую сторону открытия окна
+    const curMid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (ctx.curBTC != null && ctx.openingBTC != null) {
+      const stillFav = pos.side === 'UP' ? ctx.curBTC > ctx.openingBTC : ctx.curBTC < ctx.openingBTC;
+      if (!stillFav) return { reason: 'ADVERSE', exitPrice: curMid };
+    }
+    return null;
+  },
+};
+
+// ── 5. ORDER-BOOK IMBALANCE — направление по перекосу стакана BTC (Coinbase
+//       L2). Независимый микроструктурный сигнал, не зависит от модели. ─────────
+const STRAT_BOOK_IMB = {
+  id: 'bookImb',
+  name: 'Order-Book Imbalance (стакан)',
+  desc: 'направление по дисбалансу стакана BTC > порога',
+  defaults: { imbThresh: 0.40, minTimeMs: 30000, tpPct: 0.30, slPct: 0.30, advMovePct: 0.25, kellyFrac: 0.20, maxFrac: 0.08 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const imb = bookImbalance(10);
+    if (imb == null || Math.abs(imb) < p.imbThresh) return null;
+    const dir = imb > 0 ? 'UP' : 'DOWN';
+    const np = _normPoly(ctx); if (!np) return null;
+    const price = dir === 'UP' ? np.up : np.dn;
+    if (price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + Math.min(0.20, Math.abs(imb) * 0.25), price);
+    return { side: dir, polyPrice: price, ourProb, edge: ourProb - price, info: `imb=${(imb*100).toFixed(0)}% → ${dir}` };
+  },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
+};
+
+const STRAT_DEFINITIONS = [STRAT_MOMENTUM, STRAT_MOM_SCRATCH, STRAT_ANTI_MOM, STRAT_MEAN_REV, STRAT_LATE_FAV, STRAT_BOOK_IMB];
 
 // ─── REAL-TRADING RISK CONTROLS ──────────────────────────────────────────────
 // These guards exist to prevent the bot from spamming trades on dead markets
@@ -1169,6 +1341,38 @@ function applyParams(s) {
 // (/api/invert/toggle) и сохраняется в state. По умолчанию ВЫКЛ (обычный режим).
 let INVERT_SIGNAL = ['true', '1', 'yes', 'on']
   .includes((process.env.INVERT_SIGNAL || 'false').toLowerCase().trim());
+
+// ── РЕАЛИСТИЧНОСТЬ DEMO ───────────────────────────────────────────────────────
+// Проблема: при резком рывке цены real не может залиться (нет ликвидности / цена
+// уже ушла), а demo мгновенно «входит» по идеальной цене и ловит фантомную
+// прибыль. Лечим двумя вещами:
+//  1) DEMO_ENTRY_DELAY_MS — demo не входит мгновенно по сигналу, а ждёт N секунд
+//     и заливается уже по ЦЕНЕ ПОСЛЕ задержки (как реальная задержка ордера).
+//  2) DEMO_MAX_CHASE — если за время задержки цена входа убежала вверх больше чем
+//     на этот %, считаем что «залиться нельзя» (вагон уехал) и пропускаем сделку.
+let DEMO_ENTRY_DELAY_MS = Math.max(0, Math.min(30000,
+  Math.round((parseFloat(process.env.DEMO_ENTRY_DELAY_SEC || '2') || 2) * 1000)));
+let DEMO_MAX_CHASE = Math.max(0.01, Math.min(2.0,
+  (parseFloat(process.env.DEMO_MAX_CHASE_PCT || '15') || 15) / 100));
+
+// ── РАСПИСАНИЕ ТОРГОВЛИ ───────────────────────────────────────────────────────
+// Ограничивает ОТКРЫТИЕ сделок по часам (МСК, UTC+3). Выходы работают всегда.
+// from..to — часы [0..24). Если from==to → круглосуточно. Поддержан переход
+// через полночь (например 22→6 = с вечера до утра).
+let SCHEDULE_ENABLED = ['true', '1', 'yes', 'on']
+  .includes((process.env.SCHEDULE_ENABLED || 'false').toLowerCase().trim());
+let SCHEDULE_FROM = Math.max(0, Math.min(24, parseInt(process.env.SCHEDULE_FROM || '9', 10)));
+let SCHEDULE_TO   = Math.max(0, Math.min(24, parseInt(process.env.SCHEDULE_TO   || '23', 10)));
+
+// Разрешено ли СЕЙЧАС открывать сделки (по расписанию). Выходы это не трогает.
+function entriesAllowedNow() {
+  if (!SCHEDULE_ENABLED) return true;
+  if (SCHEDULE_FROM === SCHEDULE_TO) return true; // круглосуточно
+  const mskHour = (new Date().getUTCHours() + 3) % 24; // МСК = UTC+3
+  return SCHEDULE_FROM < SCHEDULE_TO
+    ? (mskHour >= SCHEDULE_FROM && mskHour < SCHEDULE_TO)        // дневной интервал
+    : (mskHour >= SCHEDULE_FROM || mskHour < SCHEDULE_TO);       // через полночь
+}
 
 function initStrategies() {
   for (const def of STRAT_DEFINITIONS) {
@@ -1539,10 +1743,11 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
     const emoji   = pnl >= 0 ? '✅' : '🔻';
     const sign    = pnl >= 0 ? '+' : '';
     const pctMove = ((proceeds / o.sizeUSDC - 1) * 100).toFixed(1);
+    const reasonLabel = reason === 'MANUAL' ? 'Ручной выход (кнопка)' : reason;
     sendTg(
       `${emoji} <b>ЗАКРЫТА</b> — ${o.side}\n` +
       `Стратегия: <i>${_tgEsc(s.def.id)}</i>\n` +
-      `Причина: <b>${_tgEsc(reason)}</b>\n` +
+      `Причина: <b>${_tgEsc(reasonLabel)}</b>\n` +
       `P&amp;L (расчёт): <b>${sign}$${pnl.toFixed(2)}</b> (${pctMove}%)\n` +
       `Размер: ${shares} shares = $${o.sizeUSDC.toFixed(2)}\n` +
       `Баланс (модель): $${acct.balance.toFixed(2)}`
@@ -1785,6 +1990,30 @@ function processAccount(s, ctx, acct, isReal) {
     if (exit && exit.exitPrice !== null) stratClose(s, ctx, exit.reason, exit.exitPrice, acct, isReal);
   } else {
     if (ctx.polyUp === null) return;
+    if (!entriesAllowedNow()) { acct.pendingEntry = null; return; } // расписание: вне окна не открываем
+
+    // DEMO: реалистичный вход с задержкой и отсечкой «улетевшей» цены.
+    if (acct === s.demo && DEMO_ENTRY_DELAY_MS > 0) {
+      const now   = Date.now();
+      const entry = s.def.shouldEnter(ctx, s.params);
+      if (!acct.pendingEntry) {
+        // фиксируем намерение войти и ждём задержку (заливаемся позже, по факту-цене)
+        if (entry) acct.pendingEntry = { side: entry.side, signalPrice: entry.polyPrice, fireAt: now + DEMO_ENTRY_DELAY_MS };
+        return;
+      }
+      if (now < acct.pendingEntry.fireAt) return;       // ещё ждём
+      const sig = acct.pendingEntry;
+      acct.pendingEntry = null;                          // намерение израсходовано
+      if (!entry || entry.side !== sig.side) return;     // сигнал пропал/сменился за задержку → не входим
+      const chase = (entry.polyPrice - sig.signalPrice) / sig.signalPrice;
+      if (chase > DEMO_MAX_CHASE) {                       // цена убежала вверх → «нет ликвидности», пропускаем
+        console.log(`[demo] SKIP — цена убежала +${(chase*100).toFixed(0)}% за задержку (вагон уехал)`);
+        return;
+      }
+      stratOpen(s, ctx, entry, acct, false);             // заливаемся по ТЕКУЩЕЙ (после задержки) цене
+      return;
+    }
+
     const entry = s.def.shouldEnter(ctx, s.params);
     if (entry) stratOpen(s, ctx, entry, acct, isReal);
   }
@@ -1981,7 +2210,13 @@ function buildSnapshot() {
       wallet:   polyWallet?.address ?? null,
       balance:  realBalance,
     },
-    config: { invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE, dailyLossCap: REAL_DAILY_LOSS_CAP },
+    config: {
+      invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE,
+      dailyLossCap: REAL_DAILY_LOSS_CAP,
+      demoDelaySec: DEMO_ENTRY_DELAY_MS / 1000, demoMaxChasePct: DEMO_MAX_CHASE * 100,
+      schedEnabled: SCHEDULE_ENABLED, schedFrom: SCHEDULE_FROM, schedTo: SCHEDULE_TO,
+      entriesAllowedNow: entriesAllowedNow(),
+    },
   };
 }
 
@@ -2033,9 +2268,17 @@ app.post('/api/strategy/:id/params', (req, res) => {
     const t = Number(b.dailyLossCap);
     if (Number.isFinite(t)) { REAL_DAILY_LOSS_CAP = Math.max(0.1, Math.min(10000, t)); applied.dailyLossCap = REAL_DAILY_LOSS_CAP; }
   }
+  if (b.demoDelaySec !== undefined && b.demoDelaySec !== null && b.demoDelaySec !== '') {
+    const t = Number(b.demoDelaySec);
+    if (Number.isFinite(t)) { DEMO_ENTRY_DELAY_MS = Math.max(0, Math.min(30000, Math.round(t * 1000))); applied.demoDelaySec = DEMO_ENTRY_DELAY_MS / 1000; }
+  }
+  if (b.demoMaxChasePct !== undefined && b.demoMaxChasePct !== null && b.demoMaxChasePct !== '') {
+    const t = Number(b.demoMaxChasePct);
+    if (Number.isFinite(t)) { DEMO_MAX_CHASE = Math.max(0.01, Math.min(2.0, t / 100)); applied.demoMaxChasePct = DEMO_MAX_CHASE * 100; }
+  }
   saveState();
   console.log(`[params] ${req.params.id} updated`, applied);
-  res.json({ ok: true, customEnabled: s.customEnabled, customParams: s.customParams, params: s.params, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE, dailyLossCap: REAL_DAILY_LOSS_CAP });
+  res.json({ ok: true, customEnabled: s.customEnabled, customParams: s.customParams, params: s.params, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE, dailyLossCap: REAL_DAILY_LOSS_CAP, demoDelaySec: DEMO_ENTRY_DELAY_MS/1000, demoMaxChasePct: DEMO_MAX_CHASE*100 });
 });
 
 // Включить/выключить кастом-режим (база ↔ кастом).
@@ -2066,6 +2309,50 @@ app.post('/api/invert/toggle', (req, res) => {
   saveState();
   console.warn(`[config] INVERT_SIGNAL → ${INVERT_SIGNAL ? 'ON (торгуем ПРОТИВ сигнала)' : 'OFF (обычный режим)'}`);
   res.json({ ok: true, invertSignal: INVERT_SIGNAL });
+});
+
+// API: расписание торговли (часы МСК; выходы всегда работают).
+app.post('/api/schedule', (req, res) => {
+  const b = req.body || {};
+  if (typeof b.enabled === 'boolean') SCHEDULE_ENABLED = b.enabled;
+  if (b.from !== undefined && b.from !== null && b.from !== '' && isFinite(Number(b.from)))
+    SCHEDULE_FROM = Math.max(0, Math.min(24, parseInt(b.from, 10)));
+  if (b.to !== undefined && b.to !== null && b.to !== '' && isFinite(Number(b.to)))
+    SCHEDULE_TO = Math.max(0, Math.min(24, parseInt(b.to, 10)));
+  saveState();
+  console.log(`[schedule] enabled=${SCHEDULE_ENABLED} ${SCHEDULE_FROM}→${SCHEDULE_TO} МСК · открытие сейчас: ${entriesAllowedNow()}`);
+  res.json({ ok: true, schedEnabled: SCHEDULE_ENABLED, schedFrom: SCHEDULE_FROM, schedTo: SCHEDULE_TO, entriesAllowedNow: entriesAllowedNow() });
+});
+
+// API: переключить расписание (быстрый тумблер)
+app.post('/api/schedule/toggle', (req, res) => {
+  SCHEDULE_ENABLED = typeof (req.body || {}).enabled === 'boolean' ? req.body.enabled : !SCHEDULE_ENABLED;
+  saveState();
+  res.json({ ok: true, schedEnabled: SCHEDULE_ENABLED, entriesAllowedNow: entriesAllowedNow() });
+});
+
+
+// Дёргает ту же рыночную логику (straight-to-market FAK), что и авто-выход.
+app.post('/api/strategy/:id/panic', (req, res) => {
+  const s = STRATEGIES[req.params.id];
+  if (!s) return res.status(404).json({ error: 'not found' });
+  const acct = s.real;
+  if (!acct.open || !acct.open.isReal) return res.status(400).json({ error: 'нет открытой реальной позиции' });
+  if (acct.open.realOrderStatus === 'pending')
+    return res.status(409).json({ error: 'вход ещё не подтверждён — подожди заполнения' });
+
+  const ctx     = getStratContext();
+  const curMid  = acct.open.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+  const exitRef = (curMid && curMid > 0.01) ? curMid : 0.02; // референс для расчёта; продаём по рынку
+  const side    = acct.open.side;
+  console.warn(`[manual] PANIC SELL по кнопке: ${req.params.id} ${side} @~${(exitRef*100).toFixed(0)}¢`);
+  try {
+    stratClose(s, ctx, 'MANUAL', exitRef, acct, true); // reason MANUAL → рыночный сброс
+    res.json({ ok: true, side, message: 'Рыночный выход запущен (MANUAL)' });
+  } catch (e) {
+    console.error('[manual] panic sell error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // API: toggle strategy demo account (backward-compat shortcut)

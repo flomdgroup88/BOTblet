@@ -517,6 +517,14 @@ table.log tr:hover td { background: var(--bg3); }
   </div>
 
   <div id="cfgBody">
+    <!-- 🆘 РУЧНОЙ ВЫХОД ПО РЫНКУ (видно только при открытой реальной позиции) -->
+    <div id="panicBlock" style="display:none;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px;padding:14px;background:rgba(224,85,106,.08);border:1px solid rgba(224,85,106,.5);border-radius:8px;">
+      <div style="flex:1;min-width:220px;">
+        <div style="font-size:12px;color:#e0556a;text-transform:uppercase;letter-spacing:.5px;font-weight:600;">🆘 Открыта реальная позиция</div>
+        <div id="panicInfo" style="font-size:11px;color:var(--tx);">—</div>
+      </div>
+      <button id="panicBtn" class="cfg-btn" onclick="panicSell()" style="min-width:200px;border-color:#e0556a;color:#fff;background:#e0556a;font-weight:600;">ЗАКРЫТЬ ПО РЫНКУ СЕЙЧАС</button>
+    </div>
     <!-- РЕЖИМ: база / инверсия -->
     <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px;padding:12px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px;">
       <div style="flex:1;min-width:220px;">
@@ -551,6 +559,35 @@ table.log tr:hover td { background: var(--bg3); }
         <div style="font-size:11px;color:var(--tx3);">реальная торговля авто-выключается на сутки при таком минусе за день (UTC). Только REAL.</div>
       </div>
       <input id="p-dailyLoss" class="cfg-input" type="number" step="0.5" min="0.1" style="width:90px;flex:0 0 auto;">
+    </div>
+
+    <!-- РЕАЛИСТИЧНОСТЬ DEMO -->
+    <div style="margin-bottom:18px;padding:12px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px;">
+      <div style="font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Реалистичность demo</div>
+      <div style="font-size:11px;color:var(--tx3);margin-bottom:10px;">demo ждёт задержку и заливается по цене ПОСЛЕ неё. Если за это время цена входа убежала вверх больше порога — сделка пропускается (вживую не залить «улетевший вагон»). 0 сек = мгновенный вход, как раньше.</div>
+      <div style="display:flex;gap:18px;flex-wrap:wrap;">
+        <div class="cfg-field" style="flex:0 0 auto;"><label>Задержка входа demo (сек)</label><input id="p-demoDelay" class="cfg-input" type="number" step="0.5" min="0" max="30" style="width:120px;"></div>
+        <div class="cfg-field" style="flex:0 0 auto;"><label>Макс. рывок цены за задержку (%)</label><input id="p-demoChase" class="cfg-input" type="number" step="1" min="1" max="200" style="width:140px;"></div>
+      </div>
+    </div>
+
+    <!-- РАСПИСАНИЕ ТОРГОВЛИ -->
+    <div style="margin-bottom:18px;padding:12px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px;">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px;">
+        <span style="font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px;">Расписание торговли</span>
+        <button id="schedBtn" class="cfg-btn" onclick="toggleSchedule()">РАСПИСАНИЕ OFF</button>
+        <span id="schedNote" style="font-size:11px;color:var(--tx3);"></span>
+      </div>
+      <div style="font-size:11px;color:var(--tx3);margin-bottom:10px;">ограничивает ОТКРЫТИЕ сделок по часам (МСК, UTC+3). Выходы работают всегда. Можно через полночь (например 22 → 6).</div>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <span style="font-size:11px;color:var(--tx3);">торговать с</span>
+        <input id="p-schedFrom" class="cfg-input" type="number" step="1" min="0" max="24" style="width:70px;">
+        <span style="font-size:11px;color:var(--tx3);">до</span>
+        <input id="p-schedTo" class="cfg-input" type="number" step="1" min="0" max="24" style="width:70px;">
+        <span style="font-size:11px;color:var(--tx3);">час МСК</span>
+        <button class="cfg-btn" onclick="saveSchedule()">💾 Сохранить расписание</button>
+        <span id="schedMsg" style="font-size:11px;color:var(--up);"></span>
+      </div>
     </div>
 
     <!-- КАСТОМ ПАРАМЕТРЫ -->
@@ -745,6 +782,7 @@ function updateAll(d) {
   // Aggregate stats — demo accounts only
   let totalBal = 0, totalPnl = 0, totalTrades = 0, totalWins = 0, minDd = 0;
   for (const [, s] of Object.entries(d.strats)) {
+    if (!s.demoEnabled && s.demo.trades === 0) continue; // спящие стратегии не учитываем в сводке
     totalBal    += s.demo.balance;
     totalPnl    += s.demo.pnl;
     totalTrades += s.demo.trades;
@@ -984,6 +1022,27 @@ function _beNote() {
   $('beNote').textContent = (tp && sl) ? `Безубыток по винрейту: ${(sl/(tp+sl)*100).toFixed(1)}%  (SL/(TP+SL))` : '';
 }
 function updateConfigPanel(d) {
+  // 🆘 ручной выход: показываем блок только при открытой реальной позиции
+  const s0 = d.strats && d.strats[MOM];
+  const ropen = s0 && s0.real && s0.real.open && s0.real.open.isReal ? s0.real.open : null;
+  const pb = $('panicBlock');
+  if (pb) {
+    if (ropen) {
+      pb.style.display = 'flex';
+      const cur = ropen.side === 'UP' ? (d.poly && d.poly.up) : (d.poly && d.poly.down);
+      const entry = ropen.polyEntryPrice;
+      $('panicInfo').textContent =
+        `${ropen.side} · вход ${(entry*100).toFixed(0)}¢` +
+        (isFinite(cur) ? ` · сейчас ${(cur*100).toFixed(0)}¢` : '') +
+        ` · размер $${(ropen.sizeUSDC||0).toFixed(2)}`;
+      const pending = ropen.realOrderStatus === 'pending';
+      $('panicBtn').disabled = pending;
+      $('panicBtn').textContent = pending ? 'ВХОД ПОДТВЕРЖДАЕТСЯ…' : 'ЗАКРЫТЬ ПО РЫНКУ СЕЙЧАС';
+      $('panicBtn').style.opacity = pending ? '0.5' : '1';
+    } else {
+      pb.style.display = 'none';
+    }
+  }
   // режим инверсии
   const inv = !!(d.config && d.config.invertSignal);
   const ib = $('invBtn');
@@ -997,6 +1056,22 @@ function updateConfigPanel(d) {
   if (d.config && isFinite(d.config.tpAbsPrice)) _setIfBlur('p-tpAbs', Math.round(d.config.tpAbsPrice * 100));
   if (d.config && isFinite(d.config.minEntryPrice)) _setIfBlur('p-minEntry', Math.round(d.config.minEntryPrice * 100));
   if (d.config && isFinite(d.config.dailyLossCap)) _setIfBlur('p-dailyLoss', d.config.dailyLossCap);
+  if (d.config && isFinite(d.config.demoDelaySec)) _setIfBlur('p-demoDelay', d.config.demoDelaySec);
+  if (d.config && isFinite(d.config.demoMaxChasePct)) _setIfBlur('p-demoChase', Math.round(d.config.demoMaxChasePct));
+  if (d.config) {
+    const en = !!d.config.schedEnabled;
+    const sb = $('schedBtn');
+    if (sb) {
+      sb.textContent = en ? 'РАСПИСАНИЕ ON' : 'РАСПИСАНИЕ OFF';
+      sb.className = 'cfg-btn ' + (en ? 'on' : '');
+      const allowed = d.config.entriesAllowedNow;
+      $('schedNote').textContent = en
+        ? (allowed ? 'сейчас в окне — открываем' : 'сейчас вне окна — только выходы')
+        : 'выключено — торгует 24/7';
+    }
+    _setIfBlur('p-schedFrom', d.config.schedFrom);
+    _setIfBlur('p-schedTo', d.config.schedTo);
+  }
   // кастом-режим
   const s = d.strats && d.strats[MOM];
   if (!s) return;
@@ -1016,6 +1091,32 @@ function updateConfigPanel(d) {
   _setIfBlur('p-maxFrac',    (p.maxFrac * 100).toFixed(0));
   _setIfBlur('p-minTimeSec', Math.round(p.minTimeMs / 1000));
   _beNote();
+}
+async function toggleSchedule() {
+  $('schedMsg').textContent = '...';
+  const r = await (await fetch('/api/schedule/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).json();
+  $('schedMsg').textContent = '✅ Расписание ' + (r.schedEnabled ? 'ВКЛ' : 'ВЫКЛ');
+}
+async function saveSchedule() {
+  const from = parseInt($('p-schedFrom').value, 10);
+  const to   = parseInt($('p-schedTo').value, 10);
+  const body = {};
+  if (isFinite(from)) body.from = from;
+  if (isFinite(to))   body.to   = to;
+  $('schedMsg').textContent = '...';
+  const r = await (await fetch('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
+  _dirty.delete('p-schedFrom'); _dirty.delete('p-schedTo');
+  $('schedMsg').textContent = r.ok ? `✅ Сохранено: ${r.schedFrom}→${r.schedTo} МСК` : 'Ошибка';
+}
+async function panicSell() {
+  const btn = $('panicBtn'); btn.disabled = true; btn.textContent = 'ЗАКРЫВАЮ…';
+  try {
+    const r = await (await fetch(`/api/strategy/${MOM}/panic`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).json();
+    $('cfgMsg').textContent = r.ok ? `🆘 Рыночный выход запущен (${r.side}) — смотри Telegram` : ('Ошибка: ' + (r.error || ''));
+  } catch (e) {
+    $('cfgMsg').textContent = 'Ошибка запроса';
+  }
+  // кнопка/блок сами обновятся со следующим снапшотом (позиция закроется)
 }
 async function toggleInvert() {
   $('cfgMsg').textContent = '...';
@@ -1048,6 +1149,8 @@ async function saveParams() {
     tpAbsPrice: num('p-tpAbs') / 100,
     minEntryPrice: num('p-minEntry') / 100,
     dailyLossCap: num('p-dailyLoss'),
+    demoDelaySec: num('p-demoDelay'),
+    demoMaxChasePct: num('p-demoChase'),
   };
   for (const k in body) if (!isFinite(body[k])) delete body[k];
   $('cfgMsg').textContent = '...';
