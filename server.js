@@ -1095,7 +1095,12 @@ const STRAT_MOMENTUM = {
       if (mv >= p.tpPct) return { reason: 'TP', exitPrice: curMid };
       if (mv <= -p.slPct) return { reason: 'SL', exitPrice: curMid };
     }
-    if (ctx.sigP.dir !== 'WAIT' && ctx.sigP.dir !== pos.side && ctx.sigP.conf > p.flipConf)
+    // FLIP-выход: сигнал развернулся ПРОТИВ позиции. Учитываем инверсию —
+    // иначе при INVERT каждая позиция «против сырого сигнала» и FLIP зациклится
+    // (открыл → тут же закрыл → открыл …). Сравниваем с эффективным направлением.
+    let effDir = ctx.sigP.dir;
+    if (INVERT_SIGNAL && effDir !== 'WAIT') effDir = effDir === 'UP' ? 'DOWN' : 'UP';
+    if (effDir !== 'WAIT' && effDir !== pos.side && ctx.sigP.conf > p.flipConf)
       return { reason: 'FLIP', exitPrice: curMid };
     if (ctx.curBTC && pos.btcAtEntry && ctx.msToEnd > 90000) {
       const mvBTC = ((ctx.curBTC - pos.btcAtEntry) / pos.btcAtEntry) * 100;
