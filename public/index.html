@@ -565,10 +565,12 @@ table.log tr:hover td { background: var(--bg3); }
     <div style="margin-bottom:18px;padding:12px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px;">
       <div style="font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Реалистичность demo</div>
       <div style="font-size:11px;color:var(--tx3);margin-bottom:10px;">demo ждёт задержку и заливается по цене ПОСЛЕ неё. Если за это время цена входа убежала вверх больше порога — сделка пропускается (вживую не залить «улетевший вагон»). 0 сек = мгновенный вход, как раньше.</div>
-      <div style="display:flex;gap:18px;flex-wrap:wrap;">
+      <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end;">
         <div class="cfg-field" style="flex:0 0 auto;"><label>Задержка входа demo (сек)</label><input id="p-demoDelay" class="cfg-input" type="number" step="0.5" min="0" max="30" style="width:120px;"></div>
         <div class="cfg-field" style="flex:0 0 auto;"><label>Макс. рывок цены за задержку (%)</label><input id="p-demoChase" class="cfg-input" type="number" step="1" min="1" max="200" style="width:140px;"></div>
+        <button id="demoSpreadBtn" class="cfg-btn" onclick="toggleDemoSpread()" title="Вкл: demo заходит по ask и выходит по bid, как реал. Выкл: demo по mid (идеальная точка отсчёта).">СПРЕД В DEMO: OFF</button>
       </div>
+      <div id="demoSpreadNote" style="font-size:11px;color:var(--tx3);margin-top:8px;"></div>
     </div>
 
     <!-- РАСПИСАНИЕ ТОРГОВЛИ -->
@@ -1060,6 +1062,17 @@ function updateConfigPanel(d) {
   if (d.config && isFinite(d.config.demoDelaySec)) _setIfBlur('p-demoDelay', d.config.demoDelaySec);
   if (d.config && isFinite(d.config.demoMaxChasePct)) _setIfBlur('p-demoChase', Math.round(d.config.demoMaxChasePct));
   if (d.config) {
+    const ds = !!d.config.demoRealSpread;
+    const dsb = $('demoSpreadBtn');
+    if (dsb) {
+      dsb.textContent = ds ? 'СПРЕД В DEMO: ON' : 'СПРЕД В DEMO: OFF';
+      dsb.className = 'cfg-btn ' + (ds ? 'on' : '');
+      $('demoSpreadNote').textContent = ds
+        ? 'demo платит спред: вход по ask, выход по bid (как реал) — P&L реалистичный'
+        : 'demo по mid — идеальная точка отсчёта (разница с real = цена трения)';
+    }
+  }
+  if (d.config) {
     const cl = $('calibLink');
     if (cl && isFinite(d.config.calibResolved)) cl.textContent = `↓ CALIB (${d.config.calibResolved})`;
     const en = !!d.config.schedEnabled;
@@ -1094,6 +1107,11 @@ function updateConfigPanel(d) {
   _setIfBlur('p-maxFrac',    (p.maxFrac * 100).toFixed(0));
   _setIfBlur('p-minTimeSec', Math.round(p.minTimeMs / 1000));
   _beNote();
+}
+async function toggleDemoSpread() {
+  $('cfgMsg').textContent = '...';
+  const r = await (await fetch('/api/demo-spread/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).json();
+  $('cfgMsg').textContent = '✅ Спред в demo ' + (r.demoRealSpread ? 'ВКЛ (вход ask / выход bid)' : 'ВЫКЛ (по mid)');
 }
 async function toggleSchedule() {
   $('schedMsg').textContent = '...';
