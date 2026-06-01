@@ -1102,8 +1102,13 @@ const STRAT_MOMENTUM = {
     if (INVERT_SIGNAL && effDir !== 'WAIT') effDir = effDir === 'UP' ? 'DOWN' : 'UP';
     if (effDir !== 'WAIT' && effDir !== pos.side && ctx.sigP.conf > p.flipConf)
       return { reason: 'FLIP', exitPrice: curMid };
-    if (ctx.curBTC && pos.btcAtEntry && ctx.msToEnd > 90000) {
-      const mvBTC = ((ctx.curBTC - pos.btcAtEntry) / pos.btcAtEntry) * 100;
+    // ADVERSE: BTC ушёл против позиции с МОМЕНТА ВХОДА. Берём цену входа позиции
+    // (btcAtEntryCoinbase), а НЕ открытие окна (btcAtEntry) — иначе при повторном
+    // входе в то же окно отсчёт не сбрасывается и ADVERSE срабатывает мгновенно
+    // (петля «вышел → зашёл → тут же вышел», особенно при инверсии).
+    const entryBTC = pos.btcAtEntryCoinbase || pos.btcAtEntry;
+    if (ctx.curBTC && entryBTC && ctx.msToEnd > 90000) {
+      const mvBTC = ((ctx.curBTC - entryBTC) / entryBTC) * 100;
       if (pos.side === 'UP'   && mvBTC < -p.advMovePct) return { reason: 'ADVERSE', exitPrice: curMid };
       if (pos.side === 'DOWN' && mvBTC > p.advMovePct)  return { reason: 'ADVERSE', exitPrice: curMid };
     }
