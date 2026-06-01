@@ -509,6 +509,70 @@ table.log tr:hover td { background: var(--bg3); }
   <!-- injected by JS -->
 </div>
 
+<!-- ⚙️ НАСТРОЙКИ СТРАТЕГИИ + ИНВЕРСИЯ -->
+<div style="padding:16px;background:var(--bg);border-top:1px solid var(--bd);">
+  <div onclick="document.getElementById('cfgBody').style.display = document.getElementById('cfgBody').style.display==='none'?'block':'none';" style="cursor:pointer;display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+    <div class="lbl" style="margin-bottom:0;">⚙️ Настройки — параметры входа и режим торговли</div>
+    <span style="color:var(--tx3);font-size:10px;">(нажми, чтобы свернуть)</span>
+  </div>
+
+  <div id="cfgBody">
+    <!-- РЕЖИМ: база / инверсия -->
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px;padding:12px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px;">
+      <div style="flex:1;min-width:220px;">
+        <div style="font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px;">Режим направления</div>
+        <div id="invDesc" style="font-size:11px;color:var(--tx3);">обычный — торгуем ПО сигналу модели</div>
+      </div>
+      <button id="invBtn" class="cfg-btn" onclick="toggleInvert()" style="min-width:150px;">ИНВЕРСИЯ: OFF</button>
+    </div>
+
+    <!-- АБСОЛЮТНЫЙ TP (глобальный, применяется всегда) -->
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px;padding:12px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px;">
+      <div style="flex:1;min-width:220px;">
+        <div style="font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px;">Абсолютный Take Profit (¢)</div>
+        <div style="font-size:11px;color:var(--tx3);">фиксируем при любом входе, как только цена дошла. Применяется ВСЕГДА (не зависит от КАСТОМ).</div>
+      </div>
+      <input id="p-tpAbs" class="cfg-input" type="number" step="1" min="50" max="99" style="width:90px;flex:0 0 auto;">
+    </div>
+
+    <!-- КАСТОМ ПАРАМЕТРЫ -->
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
+      <span style="font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px;">Параметры:</span>
+      <span style="font-size:11px;color:var(--tx3);">база (как сейчас)</span>
+      <button id="customBtn" class="cfg-btn" onclick="toggleCustom()">КАСТОМ OFF</button>
+      <span id="customNote" style="font-size:11px;color:var(--tx3);"></span>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px;">
+      <div class="cfg-field"><label>Edge мин. (pp) — порог выгоды</label><input id="p-minEdge" class="cfg-input" type="number" step="0.5"></div>
+      <div class="cfg-field"><label>Уверенность мин. (%)</label><input id="p-minConf" class="cfg-input" type="number" step="1"></div>
+      <div class="cfg-field"><label>Take Profit (%)</label><input id="p-tpPct" class="cfg-input" type="number" step="5" oninput="_beNote()"></div>
+      <div class="cfg-field"><label>Stop Loss (%)</label><input id="p-slPct" class="cfg-input" type="number" step="5" oninput="_beNote()"></div>
+      <div class="cfg-field"><label>Разворот: уверенность (%)</label><input id="p-flipConf" class="cfg-input" type="number" step="1"></div>
+      <div class="cfg-field"><label>Adverse move BTC (%)</label><input id="p-advMovePct" class="cfg-input" type="number" step="0.05"></div>
+      <div class="cfg-field"><label>Kelly доля (0–1)</label><input id="p-kellyFrac" class="cfg-input" type="number" step="0.05"></div>
+      <div class="cfg-field"><label>Макс. доля баланса (%)</label><input id="p-maxFrac" class="cfg-input" type="number" step="1"></div>
+      <div class="cfg-field"><label>Мин. время до конца (сек)</label><input id="p-minTimeSec" class="cfg-input" type="number" step="5"></div>
+    </div>
+
+    <div id="beNote" style="font-size:11px;color:#fa7;margin-bottom:10px;"></div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <button class="cfg-btn" onclick="saveParams()" style="border-color:rgba(0,232,122,.5);color:var(--up);">💾 Сохранить параметры</button>
+      <button class="cfg-btn" onclick="resetParams()">↺ Сброс к базе</button>
+      <span id="cfgMsg" style="font-size:11px;color:var(--up);min-height:14px;"></span>
+    </div>
+  </div>
+</div>
+<style>
+  .cfg-btn{background:var(--bg2);border:1px solid var(--bd);color:var(--tx);border-radius:6px;padding:8px 14px;font-size:12px;cursor:pointer;font-family:inherit;}
+  .cfg-btn:active{opacity:.7;}
+  .cfg-btn.on{border-color:rgba(0,232,122,.6);color:var(--up);}
+  .cfg-btn.inv-on{border-color:rgba(224,85,106,.7);color:#e0556a;}
+  .cfg-field label{display:block;font-size:10px;color:var(--tx3);margin-bottom:4px;}
+  .cfg-input{width:100%;background:var(--bg);border:1px solid var(--bd);color:var(--tx2);border-radius:6px;padding:7px 9px;font-size:13px;font-family:inherit;box-sizing:border-box;}
+  .cfg-input:focus{outline:none;border-color:rgba(0,232,122,.5);}
+</style>
+
 <!-- RECENT TRADES LOG -->
 <div style="padding:16px 16px 0;background:var(--bg);border-top:1px solid var(--bd);">
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
@@ -708,6 +772,7 @@ function updateAll(d) {
 
   // Strategy cards
   updateStratCards(d.strats, d.poly, d.realTrading);
+  updateConfigPanel(d);
 
   // Combined log
   updateLog(d.strats);
@@ -884,6 +949,83 @@ function updateLog(strats) {
 }
 
 // ─── ACTIONS ─────────────────────────────────────────────────────────────────
+// ── НАСТРОЙКИ: заполнение из снапшота (не трогаем поле, пока его редактируют) ──
+const MOM = 'momentum';
+function _setIfBlur(id, val) { const el = $(id); if (el && document.activeElement !== el) el.value = val; }
+function _beNote() {
+  const tp = +$('p-tpPct').value, sl = +$('p-slPct').value;
+  $('beNote').textContent = (tp && sl) ? `Безубыток по винрейту: ${(sl/(tp+sl)*100).toFixed(1)}%  (SL/(TP+SL))` : '';
+}
+function updateConfigPanel(d) {
+  // режим инверсии
+  const inv = !!(d.config && d.config.invertSignal);
+  const ib = $('invBtn');
+  if (ib) {
+    ib.textContent = inv ? 'ИНВЕРСИЯ: ON' : 'ИНВЕРСИЯ: OFF';
+    ib.className = 'cfg-btn ' + (inv ? 'inv-on' : '');
+    $('invDesc').textContent = inv
+      ? 'инверсия — торгуем ПРОТИВ сигнала (UP↔DOWN)'
+      : 'обычный — торгуем ПО сигналу модели';
+  }
+  if (d.config && isFinite(d.config.tpAbsPrice)) _setIfBlur('p-tpAbs', Math.round(d.config.tpAbsPrice * 100));
+  // кастом-режим
+  const s = d.strats && d.strats[MOM];
+  if (!s) return;
+  const cb = $('customBtn');
+  cb.textContent = s.customEnabled ? 'КАСТОМ ON' : 'КАСТОМ OFF';
+  cb.className = 'cfg-btn ' + (s.customEnabled ? 'on' : '');
+  $('customNote').textContent = s.customEnabled ? 'кастом включён — значения применяются' : 'выключено — работают базовые';
+  // показываем то, что РЕДАКТИРУЕМ (customParams), а не активные — чтобы правки не «прыгали»
+  const p = s.customParams || s.params; if (!p) return;
+  _setIfBlur('p-minEdge',    (p.minEdge * 100).toFixed(1));
+  _setIfBlur('p-minConf',    p.minConf);
+  _setIfBlur('p-tpPct',      (p.tpPct * 100).toFixed(0));
+  _setIfBlur('p-slPct',      (p.slPct * 100).toFixed(0));
+  _setIfBlur('p-flipConf',   p.flipConf);
+  _setIfBlur('p-advMovePct', p.advMovePct);
+  _setIfBlur('p-kellyFrac',  p.kellyFrac);
+  _setIfBlur('p-maxFrac',    (p.maxFrac * 100).toFixed(0));
+  _setIfBlur('p-minTimeSec', Math.round(p.minTimeMs / 1000));
+  _beNote();
+}
+async function toggleInvert() {
+  $('cfgMsg').textContent = '...';
+  const r = await (await fetch('/api/invert/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).json();
+  $('cfgMsg').textContent = '✅ Инверсия ' + (r.invertSignal ? 'ВКЛ — торгуем против сигнала' : 'ВЫКЛ — обычный режим');
+}
+async function toggleCustom() {
+  $('cfgMsg').textContent = '...';
+  const r = await (await fetch(`/api/strategy/${MOM}/custom/toggle`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).json();
+  $('cfgMsg').textContent = '✅ Кастом ' + (r.customEnabled ? 'ВКЛ' : 'ВЫКЛ');
+}
+async function resetParams() {
+  $('cfgMsg').textContent = '...';
+  await fetch(`/api/strategy/${MOM}/params/reset`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  $('cfgMsg').textContent = '✅ Сброшено к базе (50/30 и т.д.)';
+}
+async function saveParams() {
+  const num = id => parseFloat($(id).value);
+  const body = {
+    minEdge:    num('p-minEdge') / 100,
+    minConf:    num('p-minConf'),
+    tpPct:      num('p-tpPct') / 100,
+    slPct:      num('p-slPct') / 100,
+    flipConf:   num('p-flipConf'),
+    advMovePct: num('p-advMovePct'),
+    kellyFrac:  num('p-kellyFrac'),
+    maxFrac:    num('p-maxFrac') / 100,
+    minTimeMs:  num('p-minTimeSec') * 1000,
+    tpAbsPrice: num('p-tpAbs') / 100,
+  };
+  for (const k in body) if (!isFinite(body[k])) delete body[k];
+  $('cfgMsg').textContent = '...';
+  const r = await (await fetch(`/api/strategy/${MOM}/params`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
+  if (r.ok) {
+    const be = (r.params.slPct/(r.params.tpPct+r.params.slPct)*100).toFixed(1);
+    $('cfgMsg').textContent = `✅ Сохранено · TP ${Math.round(r.params.tpPct*100)}% / SL ${Math.round(r.params.slPct*100)}% · абс.TP ${Math.round((r.tpAbsPrice||0)*100)}¢ · безубыток ${be}%` + (r.customEnabled ? '' : ' (включи КАСТОМ для TP/SL!)');
+  } else $('cfgMsg').textContent = 'Ошибка сохранения';
+}
+
 async function toggleAcct(id, mode) {
   await fetch(`/api/strategy/${id}/${mode}/toggle`, { method: 'POST' });
 }

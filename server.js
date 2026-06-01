@@ -163,8 +163,11 @@ function saveState() {
           log:         s.real.log.slice(-500),
         },
         params: s.params,
+        customEnabled: s.customEnabled,
+        customParams:  s.customParams,
       };
     }
+    out.__global = { invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE };
     fs.writeFileSync(STATE_FILE, JSON.stringify(out, null, 2));
   } catch (e) { console.error('[state] save error:', e.message); }
 }
@@ -199,6 +202,15 @@ function loadState() {
         console.log(`[state] migrated ${id} to dual-account format`);
       }
       s.params = { ...s.params, ...(st.params ?? {}) };
+      s.customEnabled = st.customEnabled ?? false;
+      s.customParams  = { ...s.def.defaults, ...(st.customParams ?? {}) };
+      applyParams(s);
+    }
+    if (stored.__global && typeof stored.__global.invertSignal === 'boolean') {
+      INVERT_SIGNAL = stored.__global.invertSignal;
+    }
+    if (stored.__global && isFinite(Number(stored.__global.tpAbsPrice))) {
+      TP_ABS_PRICE = Math.max(0.50, Math.min(0.99, Number(stored.__global.tpAbsPrice)));
     }
     console.log('[state] loaded');
   } catch (e) { console.error('[state] load error:', e.message); }
@@ -1041,6 +1053,15 @@ const STRAT_MOMENTUM = {
     if (ctx.msToEnd < p.minTimeMs) return null;
     if (ctx.polyUp === null) return null;
 
+    // Инверсия: торгуем ПРОТИВ модели — зеркалим направление и вероятность,
+    // дальше вся логика (цена/edge/сайзинг) работает для перевёрнутой стороны.
+    let dir  = ctx.sigP.dir;
+    let prob = ctx.sigP.prob;
+    if (INVERT_SIGNAL) {
+      dir  = dir === 'UP' ? 'DOWN' : 'UP';
+      prob = 1 - prob;
+    }
+
     // Normalize prices so UP + DOWN = 1.0.
     // Raw CLOB midpoints can sum to >1 (e.g. 82¢ + 19¢ = 101¢) due to
     // bid/ask spread — this inflates edge by the spread amount. Normalizing
@@ -1049,11 +1070,11 @@ const STRAT_MOMENTUM = {
     const normUp  = ctx.polyUp  / rawSum;
     const normDn  = ctx.polyDn  / rawSum;
 
-    const polyPrice = ctx.sigP.dir === 'UP' ? normUp : normDn;
-    const ourProb   = ctx.sigP.dir === 'UP' ? ctx.sigP.prob : (1 - ctx.sigP.prob);
+    const polyPrice = dir === 'UP' ? normUp : normDn;
+    const ourProb   = dir === 'UP' ? prob : (1 - prob);
     const edge      = ourProb - polyPrice;
     if (edge < p.minEdge) return null;
-    return { side: ctx.sigP.dir, polyPrice, ourProb, edge, info: `conf=${ctx.sigP.conf.toFixed(0)}% edge=+${(edge * 100).toFixed(1)}pp (sum=${(rawSum*100).toFixed(1)}¢)` };
+    return { side: dir, polyPrice, ourProb, edge, info: `conf=${ctx.sigP.conf.toFixed(0)}% edge=+${(edge * 100).toFixed(1)}pp${INVERT_SIGNAL ? ' [INV]' : ''} (sum=${(rawSum*100).toFixed(1)}¢)` };
   },
   shouldExit(ctx, pos, p) {
     const curMid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
@@ -1098,7 +1119,7 @@ const REAL_DAILY_LOSS_CAP    = parseFloat(process.env.REAL_DAILY_LOSS_CAP || '3'
 // SETTLE. Этот абсолютный потолок фиксирует прибыль при ЛЮБОМ входе, как только
 // цена дошла до уровня: выше апсайд мизерный (≤5¢), а риск разворота огромный.
 //   TP_ABS_PRICE=0.95 → фиксировать на 95¢ (по умолчанию). Можно 0.90–0.97.
-const TP_ABS_PRICE = Math.max(0.50, Math.min(0.99,
+let TP_ABS_PRICE = Math.max(0.50, Math.min(0.99,
   parseFloat(process.env.TP_ABS_PRICE || '0.95') || 0.95));
 
 // ── MARKETABLE ENTRY (вход по рынку) ──────────────────────────────────────────
@@ -1113,6 +1134,17 @@ const TP_ABS_PRICE = Math.max(0.50, Math.min(0.99,
 const BUY_SLIPPAGE = Math.max(0, Math.min(0.20,
   parseFloat(process.env.BUY_SLIPPAGE || '0.05') || 0.05));
 
+// Активные параметры: база (def.defaults) или кастом (с дашборда), если включён.
+// Движок всегда читает s.params — здесь просто пересобираем его при изменениях.
+function applyParams(s) {
+  s.params = s.customEnabled ? { ...s.def.defaults, ...s.customParams } : { ...s.def.defaults };
+}
+
+// Инверсия сигнала: торгуем ПРОТИВ модели (UP↔DOWN). Переключается с дашборда
+// (/api/invert/toggle) и сохраняется в state. По умолчанию ВЫКЛ (обычный режим).
+let INVERT_SIGNAL = ['true', '1', 'yes', 'on']
+  .includes((process.env.INVERT_SIGNAL || 'false').toLowerCase().trim());
+
 function initStrategies() {
   for (const def of STRAT_DEFINITIONS) {
     STRATEGIES[def.id] = {
@@ -1122,6 +1154,8 @@ function initStrategies() {
       demo: { balance: 1000, peakBalance: 1000, open: null, log: [] },
       real: { balance: 1000, peakBalance: 1000, open: null, log: [] },
       params:       { ...def.defaults },
+      customEnabled: false,             // false = база (def.defaults), true = кастом с дашборда
+      customParams:  { ...def.defaults },// редактируемые значения для кастом-режима
       pendingReal:           false,    // true while a real BUY order is in-flight
       lastRealCloseTime:     0,        // epoch ms — for cooldown enforcement
       lastRealClosedWindow:  null,     // window slug of the last close — for per-window trade counter
@@ -1886,6 +1920,9 @@ function buildSnapshot() {
       demo:        accountSummary(s.demo),
       real:        accountSummary(s.real),
       pendingReal: s.pendingReal,
+      customEnabled: s.customEnabled,
+      customParams:  s.customParams,
+      params:        s.params,
     };
   }
 
@@ -1919,6 +1956,7 @@ function buildSnapshot() {
       wallet:   polyWallet?.address ?? null,
       balance:  realBalance,
     },
+    config: { invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE },
   };
 }
 
@@ -1938,6 +1976,64 @@ app.get('/events', (req, res) => {
 
 // API: get state
 app.get('/api/state', (_, res) => res.json(buildSnapshot()));
+
+// ── НАСТРОЙКИ СТРАТЕГИИ (редактируются с дашборда, применяются на лету) ───────
+// Список редактируемых параметров стратегии.
+const PARAM_KEYS = ['minConf','minEdge','minTimeMs','tpPct','slPct','flipConf','advMovePct','kellyFrac','maxFrac'];
+
+// Установить кастомные параметры. ВАЖНО: значения коэрсятся через Number(), так
+// что строки из инпутов ("0.25") тоже принимаются — это и была причина, по
+// которой в тестовом боте «сохранение ничего не делало» (там был typeof===number).
+app.post('/api/strategy/:id/params', (req, res) => {
+  const s = STRATEGIES[req.params.id];
+  if (!s) return res.status(404).json({ error: 'not found' });
+  const b = req.body || {};
+  const applied = {};
+  for (const k of PARAM_KEYS) {
+    if (b[k] === undefined || b[k] === null || b[k] === '') continue;
+    const v = Number(b[k]);
+    if (Number.isFinite(v)) { s.customParams[k] = v; applied[k] = v; }
+  }
+  applyParams(s);
+  // tpAbsPrice — глобальный потолок TP (не per-strategy), принимаем здесь же
+  if (b.tpAbsPrice !== undefined && b.tpAbsPrice !== null && b.tpAbsPrice !== '') {
+    const t = Number(b.tpAbsPrice);
+    if (Number.isFinite(t)) { TP_ABS_PRICE = Math.max(0.50, Math.min(0.99, t)); applied.tpAbsPrice = TP_ABS_PRICE; }
+  }
+  saveState();
+  console.log(`[params] ${req.params.id} updated`, applied);
+  res.json({ ok: true, customEnabled: s.customEnabled, customParams: s.customParams, params: s.params, tpAbsPrice: TP_ABS_PRICE });
+});
+
+// Включить/выключить кастом-режим (база ↔ кастом).
+app.post('/api/strategy/:id/custom/toggle', (req, res) => {
+  const s = STRATEGIES[req.params.id];
+  if (!s) return res.status(404).json({ error: 'not found' });
+  s.customEnabled = typeof (req.body || {}).enabled === 'boolean' ? req.body.enabled : !s.customEnabled;
+  applyParams(s);
+  saveState();
+  console.log(`[params] ${req.params.id} custom → ${s.customEnabled ? 'ON' : 'OFF'}`);
+  res.json({ ok: true, customEnabled: s.customEnabled, params: s.params });
+});
+
+// Сбросить кастомные параметры к базовым.
+app.post('/api/strategy/:id/params/reset', (req, res) => {
+  const s = STRATEGIES[req.params.id];
+  if (!s) return res.status(404).json({ error: 'not found' });
+  s.customParams = { ...s.def.defaults };
+  applyParams(s);
+  saveState();
+  console.log(`[params] ${req.params.id} reset to defaults`);
+  res.json({ ok: true, customEnabled: s.customEnabled, customParams: s.customParams, params: s.params });
+});
+
+// Переключить инверсию сигнала (база ↔ наоборот). Глобально для всех стратегий.
+app.post('/api/invert/toggle', (req, res) => {
+  INVERT_SIGNAL = typeof (req.body || {}).enabled === 'boolean' ? req.body.enabled : !INVERT_SIGNAL;
+  saveState();
+  console.warn(`[config] INVERT_SIGNAL → ${INVERT_SIGNAL ? 'ON (торгуем ПРОТИВ сигнала)' : 'OFF (обычный режим)'}`);
+  res.json({ ok: true, invertSignal: INVERT_SIGNAL });
+});
 
 // API: toggle strategy demo account (backward-compat shortcut)
 app.post('/api/strategy/:id/toggle', (req, res) => {
