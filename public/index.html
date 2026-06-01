@@ -544,6 +544,15 @@ table.log tr:hover td { background: var(--bg3); }
       <input id="p-minEntry" class="cfg-input" type="number" step="1" min="0" max="50" style="width:90px;flex:0 0 auto;">
     </div>
 
+    <!-- ДНЕВНОЙ ЛИМИТ ПОТЕРЬ (реал, в $) -->
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px;padding:12px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px;">
+      <div style="flex:1;min-width:220px;">
+        <div style="font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px;">Дневной лимит потерь ($)</div>
+        <div style="font-size:11px;color:var(--tx3);">реальная торговля авто-выключается на сутки при таком минусе за день (UTC). Только REAL.</div>
+      </div>
+      <input id="p-dailyLoss" class="cfg-input" type="number" step="0.5" min="0.1" style="width:90px;flex:0 0 auto;">
+    </div>
+
     <!-- КАСТОМ ПАРАМЕТРЫ -->
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
       <span style="font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px;">Параметры:</span>
@@ -960,7 +969,16 @@ function updateLog(strats) {
 // ─── ACTIONS ─────────────────────────────────────────────────────────────────
 // ── НАСТРОЙКИ: заполнение из снапшота (не трогаем поле, пока его редактируют) ──
 const MOM = 'momentum';
-function _setIfBlur(id, val) { const el = $(id); if (el && document.activeElement !== el) el.value = val; }
+// Поля, которые пользователь начал редактировать — их НЕ перетираем из снапшота
+// (иначе значение откатывается через секунду при следующем SSE-тике).
+const _dirty = new Set();
+document.addEventListener('input', e => {
+  if (e.target && e.target.classList && e.target.classList.contains('cfg-input')) _dirty.add(e.target.id);
+});
+function _setIfBlur(id, val) {
+  const el = $(id);
+  if (el && document.activeElement !== el && !_dirty.has(id)) el.value = val;
+}
 function _beNote() {
   const tp = +$('p-tpPct').value, sl = +$('p-slPct').value;
   $('beNote').textContent = (tp && sl) ? `Безубыток по винрейту: ${(sl/(tp+sl)*100).toFixed(1)}%  (SL/(TP+SL))` : '';
@@ -978,6 +996,7 @@ function updateConfigPanel(d) {
   }
   if (d.config && isFinite(d.config.tpAbsPrice)) _setIfBlur('p-tpAbs', Math.round(d.config.tpAbsPrice * 100));
   if (d.config && isFinite(d.config.minEntryPrice)) _setIfBlur('p-minEntry', Math.round(d.config.minEntryPrice * 100));
+  if (d.config && isFinite(d.config.dailyLossCap)) _setIfBlur('p-dailyLoss', d.config.dailyLossCap);
   // кастом-режим
   const s = d.strats && d.strats[MOM];
   if (!s) return;
@@ -1011,6 +1030,7 @@ async function toggleCustom() {
 async function resetParams() {
   $('cfgMsg').textContent = '...';
   await fetch(`/api/strategy/${MOM}/params/reset`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  _dirty.clear(); // сброшено — поля подтянут базовые значения
   $('cfgMsg').textContent = '✅ Сброшено к базе (50/30 и т.д.)';
 }
 async function saveParams() {
@@ -1027,13 +1047,15 @@ async function saveParams() {
     minTimeMs:  num('p-minTimeSec') * 1000,
     tpAbsPrice: num('p-tpAbs') / 100,
     minEntryPrice: num('p-minEntry') / 100,
+    dailyLossCap: num('p-dailyLoss'),
   };
   for (const k in body) if (!isFinite(body[k])) delete body[k];
   $('cfgMsg').textContent = '...';
   const r = await (await fetch(`/api/strategy/${MOM}/params`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
   if (r.ok) {
+    _dirty.clear(); // сохранено — снимаем защиту, поля синхронизируются с сервером
     const be = (r.params.slPct/(r.params.tpPct+r.params.slPct)*100).toFixed(1);
-    $('cfgMsg').textContent = `✅ Сохранено · TP ${Math.round(r.params.tpPct*100)}% / SL ${Math.round(r.params.slPct*100)}% · абс.TP ${Math.round((r.tpAbsPrice||0)*100)}¢ · мин.вход ${Math.round((r.minEntryPrice||0)*100)}¢ · безубыток ${be}%` + (r.customEnabled ? '' : ' (включи КАСТОМ для TP/SL!)');
+    $('cfgMsg').textContent = `✅ Сохранено · TP ${Math.round(r.params.tpPct*100)}% / SL ${Math.round(r.params.slPct*100)}% · абс.TP ${Math.round((r.tpAbsPrice||0)*100)}¢ · мин.вход ${Math.round((r.minEntryPrice||0)*100)}¢ · лимит -$${(r.dailyLossCap||0)} · безубыток ${be}%` + (r.customEnabled ? '' : ' (включи КАСТОМ для TP/SL!)');
   } else $('cfgMsg').textContent = 'Ошибка сохранения';
 }
 

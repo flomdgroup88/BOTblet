@@ -167,7 +167,7 @@ function saveState() {
         customParams:  s.customParams,
       };
     }
-    out.__global = { invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE };
+    out.__global = { invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE, dailyLossCap: REAL_DAILY_LOSS_CAP };
     fs.writeFileSync(STATE_FILE, JSON.stringify(out, null, 2));
   } catch (e) { console.error('[state] save error:', e.message); }
 }
@@ -214,6 +214,9 @@ function loadState() {
     }
     if (stored.__global && isFinite(Number(stored.__global.minEntryPrice))) {
       MIN_ENTRY_PRICE = Math.max(0.0, Math.min(0.50, Number(stored.__global.minEntryPrice)));
+    }
+    if (stored.__global && isFinite(Number(stored.__global.dailyLossCap))) {
+      REAL_DAILY_LOSS_CAP = Math.max(0.1, Math.min(10000, Number(stored.__global.dailyLossCap)));
     }
     console.log('[state] loaded');
   } catch (e) { console.error('[state] load error:', e.message); }
@@ -1115,7 +1118,7 @@ const REAL_MIN_PRICE         = 0.10;     // Skip if either side < 10¢ — marke
 const REAL_MAX_PRICE         = 0.90;     // Skip if our entry side > 90¢ — bad RR even when right
 const REAL_MIN_MS_TO_END     = 45_000;   // Need ≥45s left in window — else no time to play out
 const REAL_COOLDOWN_MS       = 20_000;   // Wait ≥20s after any real close before opening again
-const REAL_DAILY_LOSS_CAP    = parseFloat(process.env.REAL_DAILY_LOSS_CAP || '3');  // USD; -$3 default
+let REAL_DAILY_LOSS_CAP      = parseFloat(process.env.REAL_DAILY_LOSS_CAP || '3');  // USD; -$3 default
                                                                                     // After cap is hit, real autodisables until next UTC day
 
 // ── АБСОЛЮТНЫЙ TAKE-PROFIT ─────────────────────────────────────────────────────
@@ -1968,7 +1971,7 @@ function buildSnapshot() {
       wallet:   polyWallet?.address ?? null,
       balance:  realBalance,
     },
-    config: { invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE },
+    config: { invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE, dailyLossCap: REAL_DAILY_LOSS_CAP },
   };
 }
 
@@ -2016,9 +2019,13 @@ app.post('/api/strategy/:id/params', (req, res) => {
     const t = Number(b.minEntryPrice);
     if (Number.isFinite(t)) { MIN_ENTRY_PRICE = Math.max(0.0, Math.min(0.50, t)); applied.minEntryPrice = MIN_ENTRY_PRICE; }
   }
+  if (b.dailyLossCap !== undefined && b.dailyLossCap !== null && b.dailyLossCap !== '') {
+    const t = Number(b.dailyLossCap);
+    if (Number.isFinite(t)) { REAL_DAILY_LOSS_CAP = Math.max(0.1, Math.min(10000, t)); applied.dailyLossCap = REAL_DAILY_LOSS_CAP; }
+  }
   saveState();
   console.log(`[params] ${req.params.id} updated`, applied);
-  res.json({ ok: true, customEnabled: s.customEnabled, customParams: s.customParams, params: s.params, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE });
+  res.json({ ok: true, customEnabled: s.customEnabled, customParams: s.customParams, params: s.params, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE, dailyLossCap: REAL_DAILY_LOSS_CAP });
 });
 
 // Включить/выключить кастом-режим (база ↔ кастом).
