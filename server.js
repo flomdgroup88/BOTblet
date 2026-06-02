@@ -1300,7 +1300,115 @@ const STRAT_BOOK_IMB = {
   shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
 };
 
-const STRAT_DEFINITIONS = [STRAT_MOMENTUM, STRAT_MOM_SCRATCH, STRAT_ANTI_MOM, STRAT_MEAN_REV, STRAT_LATE_FAV, STRAT_BOOK_IMB];
+// ── 7. MOMENTUM STRONG — momentum только на сильных сигналах. ────────────────
+const STRAT_MOM_HI = {
+  id: 'momHi', name: 'Momentum Strong (высокая увер.)',
+  desc: 'momentum, но только conf≥50 и edge≥6pp',
+  defaults: { minConf: 50, minEdge: 0.06, minTimeMs: 60000, tpPct: 0.50, slPct: 0.30, flipConf: 55, advMovePct: 0.30, kellyFrac: 0.25, maxFrac: 0.10 },
+  shouldEnter(ctx, p) { return _momentumEntry(ctx, p, INVERT_SIGNAL); },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
+};
+
+// ── 8. EMA TREND — направление по пересечению EMA. ───────────────────────────
+const STRAT_EMA_TREND = {
+  id: 'emaTrend', name: 'EMA Trend (пересечение скользящих)',
+  desc: 'направление по EMA fast vs slow',
+  defaults: { emaThresh: 0.02, minTimeMs: 60000, tpPct: 0.40, slPct: 0.35, advMovePct: 0.30, kellyFrac: 0.20, maxFrac: 0.08 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const e = getEMACross();
+    if (e == null || Math.abs(e) < p.emaThresh) return null;
+    const dir = e > 0 ? 'UP' : 'DOWN';
+    const np = _normPoly(ctx); if (!np) return null;
+    const price = dir === 'UP' ? np.up : np.dn;
+    if (price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.07, price);
+    return { side: dir, polyPrice: price, ourProb, edge: ourProb - price, info: `EMA ${e.toFixed(3)}% → ${dir}` };
+  },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
+};
+
+// ── 9. RSI REVERSION — экстремальный RSI → разворот. ─────────────────────────
+const STRAT_RSI_REV = {
+  id: 'rsiRev', name: 'RSI Reversion (перекуп/перепрод)',
+  desc: 'RSI>70 → DOWN, RSI<30 → UP',
+  defaults: { rsiHi: 70, rsiLo: 30, rsiN: 30, minTimeMs: 60000, tpPct: 0.30, slPct: 0.30, kellyFrac: 0.15, maxFrac: 0.06 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const r = getRSI(p.rsiN);
+    if (r == null) return null;
+    let dir = null;
+    if (r > p.rsiHi) dir = 'DOWN'; else if (r < p.rsiLo) dir = 'UP';
+    if (!dir) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const price = dir === 'UP' ? np.up : np.dn;
+    if (price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.07, price);
+    return { side: dir, polyPrice: price, ourProb, edge: ourProb - price, info: `RSI ${r.toFixed(0)} → ${dir}` };
+  },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p); },
+};
+
+// ── 10. CVD MOMENTUM — направление по объёмному дисбалансу. ──────────────────
+const STRAT_CVD = {
+  id: 'cvdMom', name: 'CVD Momentum (поток объёма)',
+  desc: 'направление по наклону CVD (покупки vs продажи)',
+  defaults: { cvdThresh: 0.05, minTimeMs: 60000, tpPct: 0.40, slPct: 0.35, advMovePct: 0.30, kellyFrac: 0.20, maxFrac: 0.08 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const cv = getCVDSlope(60);
+    if (cv == null || Math.abs(cv) < p.cvdThresh) return null;
+    const dir = cv > 0 ? 'UP' : 'DOWN';
+    const np = _normPoly(ctx); if (!np) return null;
+    const price = dir === 'UP' ? np.up : np.dn;
+    if (price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.07, price);
+    return { side: dir, polyPrice: price, ourProb, edge: ourProb - price, info: `CVD ${cv.toFixed(3)} → ${dir}` };
+  },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
+};
+
+// ── 11. CONFLUENCE — вход только когда momentum, EMA и CVD согласны. ──────────
+const STRAT_CONFLUENCE = {
+  id: 'confluence', name: 'Trend Confluence (3 индикатора)',
+  desc: 'вход только когда импульс, EMA и CVD смотрят в одну сторону',
+  defaults: { minTimeMs: 60000, tpPct: 0.45, slPct: 0.30, advMovePct: 0.30, kellyFrac: 0.22, maxFrac: 0.09 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const m = getMom(60), e = getEMACross(), cv = getCVDSlope(60);
+    if (m == null || e == null || cv == null) return null;
+    const sUp = m > 0 && e > 0 && cv > 0, sDn = m < 0 && e < 0 && cv < 0;
+    if (!sUp && !sDn) return null;
+    const dir = sUp ? 'UP' : 'DOWN';
+    const np = _normPoly(ctx); if (!np) return null;
+    const price = dir === 'UP' ? np.up : np.dn;
+    if (price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.10, price);
+    return { side: dir, polyPrice: price, ourProb, edge: ourProb - price, info: `3/3 → ${dir}` };
+  },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
+};
+
+// ── 12. UNDERDOG HOLD — дешёвая сторона (15–45¢), ДЕРЖИМ до SETTLE. ───────────
+// Проверка калибровочного сигнала: дешёвые стороны выглядят чуть недооценёнными,
+// НО только если додерживать до резолва (без раннего TP/SL). Высокая дисперсия.
+const STRAT_UNDERDOG_HOLD = {
+  id: 'underdogHold', name: 'Underdog Hold (дёшево, до резолва)',
+  desc: 'покупка дешёвой стороны 15–45¢ и удержание до SETTLE (тест эджа калибровки)',
+  defaults: { lo: 0.15, hi: 0.45, minTimeMs: 60000, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const dogPrice = Math.min(np.up, np.dn);
+    if (dogPrice < p.lo || dogPrice > p.hi || dogPrice < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
+    return { side: dogSide, polyPrice: dogPrice, ourProb, edge: ourProb - dogPrice, info: `hold ${dogSide} @${(dogPrice*100).toFixed(0)}¢` };
+  },
+  shouldExit() { return null; },   // НЕ выходим рано — держим до SETTLE (резолв окна)
+};
+
+const STRAT_DEFINITIONS = [STRAT_MOMENTUM, STRAT_MOM_SCRATCH, STRAT_ANTI_MOM, STRAT_MEAN_REV, STRAT_LATE_FAV, STRAT_BOOK_IMB, STRAT_MOM_HI, STRAT_EMA_TREND, STRAT_RSI_REV, STRAT_CVD, STRAT_CONFLUENCE, STRAT_UNDERDOG_HOLD];
 
 // ─── REAL-TRADING RISK CONTROLS ──────────────────────────────────────────────
 // These guards exist to prevent the bot from spamming trades on dead markets
