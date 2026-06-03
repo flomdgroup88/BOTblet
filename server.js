@@ -1285,7 +1285,7 @@ const STRAT_BOOK_IMB = {
   id: 'bookImb',
   name: 'Order-Book Imbalance (стакан)',
   desc: 'направление по дисбалансу стакана BTC > порога',
-  defaults: { imbThresh: 0.40, minTimeMs: 30000, tpPct: 0.30, slPct: 0.30, advMovePct: 0.25, kellyFrac: 0.20, maxFrac: 0.08 },
+  defaults: { imbThresh: 0.40, maxPerWindow: 2, minTimeMs: 30000, tpPct: 0.30, slPct: 0.30, advMovePct: 0.25, kellyFrac: 0.20, maxFrac: 0.08 },
   shouldEnter(ctx, p) {
     if (ctx.msToEnd < p.minTimeMs) return null;
     const imb = bookImbalance(10);
@@ -1313,7 +1313,7 @@ const STRAT_MOM_HI = {
 const STRAT_EMA_TREND = {
   id: 'emaTrend', name: 'EMA Trend (пересечение скользящих)',
   desc: 'направление по EMA fast vs slow',
-  defaults: { emaThresh: 0.02, minTimeMs: 60000, tpPct: 0.40, slPct: 0.35, advMovePct: 0.30, kellyFrac: 0.20, maxFrac: 0.08 },
+  defaults: { emaThresh: 0.02, maxPerWindow: 2, minTimeMs: 60000, tpPct: 0.40, slPct: 0.35, advMovePct: 0.30, kellyFrac: 0.20, maxFrac: 0.08 },
   shouldEnter(ctx, p) {
     if (ctx.msToEnd < p.minTimeMs) return null;
     const e = getEMACross();
@@ -1372,7 +1372,7 @@ const STRAT_CVD = {
 const STRAT_CONFLUENCE = {
   id: 'confluence', name: 'Trend Confluence (3 индикатора)',
   desc: 'вход только когда импульс, EMA и CVD смотрят в одну сторону',
-  defaults: { minTimeMs: 60000, tpPct: 0.45, slPct: 0.30, advMovePct: 0.30, kellyFrac: 0.22, maxFrac: 0.09 },
+  defaults: { maxPerWindow: 2, minTimeMs: 60000, tpPct: 0.45, slPct: 0.30, advMovePct: 0.30, kellyFrac: 0.22, maxFrac: 0.09 },
   shouldEnter(ctx, p) {
     if (ctx.msToEnd < p.minTimeMs) return null;
     const m = getMom(60), e = getEMACross(), cv = getCVDSlope(60);
@@ -1408,7 +1408,63 @@ const STRAT_UNDERDOG_HOLD = {
   shouldExit() { return null; },   // НЕ выходим рано — держим до SETTLE (резолв окна)
 };
 
-const STRAT_DEFINITIONS = [STRAT_MOMENTUM, STRAT_MOM_SCRATCH, STRAT_ANTI_MOM, STRAT_MEAN_REV, STRAT_LATE_FAV, STRAT_BOOK_IMB, STRAT_MOM_HI, STRAT_EMA_TREND, STRAT_RSI_REV, STRAT_CVD, STRAT_CONFLUENCE, STRAT_UNDERDOG_HOLD];
+// ── NEW: MOMENTUM HOLD — вход по моменту, держим до резолва (без TP/SL). ──────
+const STRAT_MOM_HOLD = {
+  id: 'momHold', name: 'Momentum Hold (до резолва)',
+  desc: 'вход по сигналу момента, держим до SETTLE — даём выигрышу доехать',
+  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, kellyFrac: 0.20, maxFrac: 0.08 },
+  shouldEnter(ctx, p) { return _momentumEntry(ctx, p, INVERT_SIGNAL); },
+  shouldExit() { return null; },   // держим до конца окна (бэктест: додержка добавляет прибыль)
+};
+
+// ── NEW: MOMENTUM WIDE — momentum с широкими порогами (бэктест: лучший TP/SL). ─
+const STRAT_MOM_WIDE = {
+  id: 'momWide', name: 'Momentum Wide (TP60/SL40)',
+  desc: 'momentum с широкими TP/SL — по симуляции на живых ценах даёт больше всего',
+  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, tpPct: 0.60, slPct: 0.40, flipConf: 50, advMovePct: 0.30, kellyFrac: 0.22, maxFrac: 0.09 },
+  shouldEnter(ctx, p) { return _momentumEntry(ctx, p, INVERT_SIGNAL); },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
+};
+
+// ── NEW: BREAKOUT — сильный устойчивый импульс (mom30 и mom120 согласны). ─────
+const STRAT_BREAKOUT = {
+  id: 'breakout', name: 'Breakout (устойчивый импульс)',
+  desc: 'вход когда краткий и средний импульс BTC согласны и сильны',
+  defaults: { momThresh: 0.05, minTimeMs: 60000, tpPct: 0.50, slPct: 0.40, advMovePct: 0.30, kellyFrac: 0.20, maxFrac: 0.08 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const m30 = getMom(30), m120 = getMom(120);
+    if (m30 == null || m120 == null) return null;
+    if (Math.sign(m30) !== Math.sign(m120)) return null;     // импульс не разворачивается
+    if (Math.abs(m30) < p.momThresh) return null;
+    const dir = m30 > 0 ? 'UP' : 'DOWN';
+    const np = _normPoly(ctx); if (!np) return null;
+    const price = dir === 'UP' ? np.up : np.dn;
+    if (price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.08, price);
+    return { side: dir, polyPrice: price, ourProb, edge: ourProb - price, info: `brk m30=${m30.toFixed(2)}% → ${dir}` };
+  },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
+};
+
+// ── NEW: MOM CONFIRM — сигнал момента + согласие стакана (цена и стакан вместе). ─
+const STRAT_MOM_CONFIRM = {
+  id: 'momConfirm', name: 'Mom Confirm (момент + стакан)',
+  desc: 'вход по моменту только если дисбаланс стакана подтверждает сторону',
+  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, imbMin: 0.15, tpPct: 0.50, slPct: 0.40, flipConf: 50, advMovePct: 0.30, kellyFrac: 0.22, maxFrac: 0.09 },
+  shouldEnter(ctx, p) {
+    const e = _momentumEntry(ctx, p, INVERT_SIGNAL);
+    if (!e) return null;
+    const imb = bookImbalance(10);
+    if (imb == null) return null;
+    if (e.side === 'UP'   && imb <  p.imbMin) return null;    // стакан должен давить вверх
+    if (e.side === 'DOWN' && imb > -p.imbMin) return null;    // ... или вниз
+    return { ...e, info: e.info + ` +imb=${imb.toFixed(2)}` };
+  },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
+};
+
+const STRAT_DEFINITIONS = [STRAT_MOMENTUM, STRAT_MOM_SCRATCH, STRAT_LATE_FAV, STRAT_BOOK_IMB, STRAT_MOM_HI, STRAT_EMA_TREND, STRAT_CONFLUENCE, STRAT_UNDERDOG_HOLD, STRAT_MOM_HOLD, STRAT_MOM_WIDE, STRAT_BREAKOUT, STRAT_MOM_CONFIRM];
 
 // ─── REAL-TRADING RISK CONTROLS ──────────────────────────────────────────────
 // These guards exist to prevent the bot from spamming trades on dead markets
@@ -1583,6 +1639,15 @@ function resolveCalib(ctx) {
 }
 
 function stratOpen(s, ctx, entry, acct, isReal) {
+  // ── Кулдаун: лимит входов в одно окно (борьба с churn). Работает для любого
+  // аккаунта (demo и real). Порог задаётся параметром maxPerWindow; если не задан
+  // — лимита нет. Счётчик на самом аккаунте, сбрасывается со сменой окна.
+  const maxPW = s.params.maxPerWindow;
+  if (maxPW) {
+    if (acct._cdWindow !== ctx.win.slug) { acct._cdWindow = ctx.win.slug; acct._cdCount = 0; }
+    if ((acct._cdCount || 0) >= maxPW) return;   // уже исчерпан лимит входов в этом окне
+  }
+
   // ── Safety guard: never size a real trade from the default $1000 placeholder ──
   // If the USDC balance was never successfully fetched from CLOB, bail out.
   if (isReal && REAL_TRADING && realBalance === null) {
@@ -1730,6 +1795,7 @@ function stratOpen(s, ctx, entry, acct, isReal) {
     actualShares:       null,           // ← filled after BUY response confirms
   };
   acct.balance    -= sizeUSDC;
+  if (s.params.maxPerWindow) acct._cdCount = (acct._cdCount || 0) + 1;
   if (isRealOrder) {
     s.pendingReal = true;
     s.realTradesThisWindow = (s.realTradesThisWindow || 0) + 1;
