@@ -171,6 +171,7 @@ function saveState() {
         params: s.params,
         customEnabled: s.customEnabled,
         customParams:  s.customParams,
+        name: s.def.name, desc: s.def.desc, manual: !!s.def.manual,
       };
     }
     out.__global = {
@@ -1430,7 +1431,7 @@ const STRAT_MOM_WIDE = {
 const STRAT_BREAKOUT = {
   id: 'breakout', name: 'Breakout (устойчивый импульс)',
   desc: 'вход когда краткий и средний импульс BTC согласны и сильны',
-  defaults: { momThresh: 0.05, minTimeMs: 60000, tpPct: 0.50, slPct: 0.40, advMovePct: 0.30, kellyFrac: 0.20, maxFrac: 0.08 },
+  defaults: { momThresh: 0.05, maxPerWindow: 2, minTimeMs: 60000, tpPct: 0.50, slPct: 0.40, advMovePct: 0.30, kellyFrac: 0.20, maxFrac: 0.08 },
   shouldEnter(ctx, p) {
     if (ctx.msToEnd < p.minTimeMs) return null;
     const m30 = getMom(30), m120 = getMom(120);
@@ -1451,7 +1452,7 @@ const STRAT_BREAKOUT = {
 const STRAT_MOM_CONFIRM = {
   id: 'momConfirm', name: 'Mom Confirm (момент + стакан)',
   desc: 'вход по моменту только если дисбаланс стакана подтверждает сторону',
-  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, imbMin: 0.15, tpPct: 0.50, slPct: 0.40, flipConf: 50, advMovePct: 0.30, kellyFrac: 0.22, maxFrac: 0.09 },
+  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, imbMin: 0.15, maxPerWindow: 3, tpPct: 0.50, slPct: 0.40, flipConf: 50, advMovePct: 0.30, kellyFrac: 0.22, maxFrac: 0.09 },
   shouldEnter(ctx, p) {
     const e = _momentumEntry(ctx, p, INVERT_SIGNAL);
     if (!e) return null;
@@ -1464,7 +1465,256 @@ const STRAT_MOM_CONFIRM = {
   shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
 };
 
-const STRAT_DEFINITIONS = [STRAT_MOMENTUM, STRAT_MOM_SCRATCH, STRAT_LATE_FAV, STRAT_BOOK_IMB, STRAT_MOM_HI, STRAT_EMA_TREND, STRAT_CONFLUENCE, STRAT_UNDERDOG_HOLD, STRAT_MOM_HOLD, STRAT_MOM_WIDE, STRAT_BREAKOUT, STRAT_MOM_CONFIRM];
+// ── РУЧНЫЕ ПАРАМЕТРИЧЕСКИЕ СТРАТЕГИИ ──────────────────────────────────────────
+// Вход чисто по условиям (без модели): окно времени от старта свечи, дельта BTC
+// от открытия ($), цена шэра, фикс. сумма входа, TP/SL (с тумблерами), макс. раундов.
+// Настраиваются с дашборда. По умолчанию active=0 (пустая, не торгует).
+function makeManualStrat(i) {
+  return {
+    id: `manual${i}`,
+    name: `Ручная #${i}`,
+    desc: 'вход по параметрам (время · дельта BTC · цена шэра)',
+    manual: true,
+    defaults: {
+      dir: 'UP', entryFromSec: 0, entryToSec: 0,
+      btcDeltaMin: 0, btcDeltaMax: 9999, shareMin: 0.40, shareMax: 0.65,
+      betUSD: 10, tpOn: 0, tpPct: 0.30, slOn: 0, slPct: 0.30,
+      maxPerWindow: 1, active: 0,
+    },
+    shouldEnter(ctx, p) {
+      if (!p.active) return null;
+      const winLen = (typeof POLY_WINDOW_SEC === 'number' ? POLY_WINDOW_SEC : 300) * 1000;
+      const elapsedSec = (winLen - ctx.msToEnd) / 1000;          // время от старта свечи
+      if (elapsedSec < p.entryFromSec || elapsedSec > p.entryToSec) return null;
+      if (ctx.curBTC == null || ctx.openingBTC == null) return null;
+      const np = _normPoly(ctx); if (!np) return null;
+      const delta = ctx.curBTC - ctx.openingBTC;
+      // Проверка одной стороны: движение BTC в её пользу в [min,max] И цена шэра в коридоре.
+      const trySide = (side) => {
+        const move = side === 'UP' ? delta : -delta;             // движение «в сторону side», $
+        if (move < p.btcDeltaMin || move > p.btcDeltaMax) return null;
+        const price = side === 'UP' ? np.up : np.dn;
+        if (price < p.shareMin || price > p.shareMax || price < MIN_ENTRY_PRICE) return null;
+        const ourProb = _clampProb(price + 0.05, price);
+        return { side, polyPrice: price, ourProb, edge: ourProb - price,
+                 fixedUSD: p.betUSD, info: `manual ${side} Δ${move.toFixed(0)}$ @${(price*100).toFixed(0)}¢` };
+      };
+      // BOTH: BTC в каждый момент в одну сторону, берём ту, что подходит. Лимит входов
+      // (maxPerWindow) общий на окно — обе стороны считаются вместе, плюс новый вход не
+      // откроется, пока висит открытая позиция (так UP+DOWN одновременно не наберётся).
+      if (p.dir === 'BOTH') return (delta >= 0 ? trySide('UP') : trySide('DOWN'));
+      return trySide(p.dir);
+    },
+    shouldExit(ctx, pos, p) {
+      const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+      if (mid == null) return null;
+      const mv = (mid - pos.polyEntryPrice) / pos.polyEntryPrice;
+      if (p.tpOn && mv >=  p.tpPct) return { reason: 'TP', exitPrice: mid };
+      if (p.slOn && mv <= -p.slPct) return { reason: 'SL', exitPrice: mid };
+      return null;   // оба тумблера выкл → держим до SETTLE
+    },
+  };
+}
+const MANUAL_STRATS = [1,2,3,4,5,6,7,8].map(makeManualStrat);
+
+// ── НОВЫЕ СИГНАЛЬНЫЕ (обоснованы калибровкой/персистентностью на чистых данных) ─
+// favHold — бэк сильного фаворита под закрытие, держим до резолва. Данные: рынок
+// чуть недооценивает почти-верные исходы (85-95¢ дали +$0.05/сделку). Высокая
+// дисперсия: редкий разворот = крупный минус. Тест.
+const STRAT_FAV_HOLD = {
+  id: 'favHold', name: 'Favorite Hold (бэк фаворита до резолва)',
+  desc: 'покупка сильного фаворита 70-92¢ под закрытие, держим до SETTLE',
+  defaults: { favLo: 0.70, favHi: 0.92, lateMs: 150000, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd > p.lateMs) return null;            // только под закрытие
+    const np = _normPoly(ctx); if (!np) return null;
+    const side = np.up >= np.dn ? 'UP' : 'DOWN';
+    const price = Math.max(np.up, np.dn);
+    if (price < p.favLo || price > p.favHi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.03, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `favHold ${side} @${(price*100).toFixed(0)}¢` };
+  },
+  shouldExit() { return null; },
+};
+// longHold — очень дешёвый лонгшот рано, держим до резолва. Данные: 15-30¢ слегка
+// недооценены (+$0.027). Очень высокая дисперсия (редкие крупные выигрыши).
+const STRAT_LONG_HOLD = {
+  id: 'longHold', name: 'Longshot Hold (дёшево рано, до резолва)',
+  desc: 'покупка очень дешёвой стороны 12-28¢ при запасе времени, держим до SETTLE',
+  defaults: { lo: 0.12, hi: 0.28, minTimeLeftMs: 120000, maxPerWindow: 1, kellyFrac: 0.06, maxFrac: 0.03 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeLeftMs) return null;     // нужен запас времени на разворот
+    const np = _normPoly(ctx); if (!np) return null;
+    const side = np.up <= np.dn ? 'UP' : 'DOWN';
+    const price = Math.min(np.up, np.dn);
+    if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.06, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `longHold ${side} @${(price*100).toFixed(0)}¢` };
+  },
+  shouldExit() { return null; },
+};
+// lateMom — сигнал момента, но вход только в последней трети окна (цена сформирована,
+// исход яснее). Персистентность направления к концу выше.
+const STRAT_LATE_MOM = {
+  id: 'lateMom', name: 'Late Momentum (момент под закрытие)',
+  desc: 'вход по сигналу момента только в последней трети окна',
+  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 8000, lateMs: 120000, tpPct: 0.40, slPct: 0.40, flipConf: 50, advMovePct: 0.30, kellyFrac: 0.20, maxFrac: 0.08, maxPerWindow: 1 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd > p.lateMs) return null;            // только поздно
+    return _momentumEntry(ctx, p, INVERT_SIGNAL);
+  },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
+};
+// momScratchHi — momHi (только сильные сигналы) + ранняя фиксация прибыли (scratch).
+// Комбинация двух вещей, что помогали: селективность входа и ранний выход в плюс.
+const STRAT_MOM_SCRATCH_HI = {
+  id: 'momScratchHi', name: 'Mom Scratch HI (сильный сигнал + scratch)',
+  desc: 'вход только на сильном сигнале (conf≥48), ранняя фиксация прибыли',
+  defaults: { minConf: 48, minEdge: 0.05, minTimeMs: 60000, tpPct: 0.50, slPct: 0.30, flipConf: 55, advMovePct: 0.30, kellyFrac: 0.22, maxFrac: 0.09, scratchMin: 0.08, scratchTimeMs: 120000 },
+  shouldEnter(ctx, p) { return _momentumEntry(ctx, p, INVERT_SIGNAL); },
+  shouldExit(ctx, pos, p) {
+    const curMid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (curMid != null) {
+      const mv = (curMid - pos.polyEntryPrice) / pos.polyEntryPrice;
+      if (curMid >= TP_ABS_PRICE) return { reason: 'TP', exitPrice: curMid };
+      if (mv >= p.tpPct)          return { reason: 'TP', exitPrice: curMid };
+      if (mv >= p.scratchMin && mv < p.tpPct) {
+        let effDir = ctx.sigP.dir;
+        if (INVERT_SIGNAL && effDir !== 'WAIT') effDir = effDir === 'UP' ? 'DOWN' : 'UP';
+        const fading = (effDir !== pos.side) || (ctx.sigP.conf < p.minConf);
+        if (fading || ctx.msToEnd < p.scratchTimeMs) return { reason: 'SCRATCH', exitPrice: curMid };
+      }
+      if (mv <= -p.slPct) return { reason: 'SL', exitPrice: curMid };
+    }
+    return _advExit(ctx, pos, p);
+  },
+};
+// bigMove — вход в сторону КРУПНОГО движения BTC от открытия ($, не %). Идея:
+// большие движения персистентнее мелких. Отличается от breakout (тот был по %).
+const STRAT_BIG_MOVE = {
+  id: 'bigMove', name: 'Big Move (крупное движение от открытия)',
+  desc: 'вход в сторону движения BTC, если оно крупное ($ от открытия свечи)',
+  defaults: { moveUSD: 30, minTimeMs: 30000, tpPct: 0.50, slPct: 0.40, advMovePct: 0.35, kellyFrac: 0.20, maxFrac: 0.08, maxPerWindow: 2 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    if (ctx.curBTC == null || ctx.openingBTC == null) return null;
+    const delta = ctx.curBTC - ctx.openingBTC;
+    if (Math.abs(delta) < p.moveUSD) return null;
+    const dir = delta > 0 ? 'UP' : 'DOWN';
+    const np = _normPoly(ctx); if (!np) return null;
+    const price = dir === 'UP' ? np.up : np.dn;
+    if (price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.07, price);
+    return { side: dir, polyPrice: price, ourProb, edge: ourProb - price, info: `bigMove Δ${delta.toFixed(0)}$ → ${dir}` };
+  },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
+};
+
+// ── ЕЩЁ 6 АВТО-СТРАТЕГИЙ (без ручных настроек) ───────────────────────────────
+// timeSession — momentum только в US-сессию (13:30–20:00 UTC, высокая волатильность).
+const STRAT_TIME_SESSION = {
+  id: 'timeSession', name: 'Time Session (US-часы)',
+  desc: 'momentum только в активные часы (13:30–20:00 UTC)',
+  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, tpPct: 0.45, slPct: 0.35, flipConf: 50, advMovePct: 0.30, kellyFrac: 0.20, maxFrac: 0.08, maxPerWindow: 2 },
+  shouldEnter(ctx, p) {
+    const d = new Date(); const h = d.getUTCHours() + d.getUTCMinutes() / 60;
+    if (h < 13.5 || h > 20) return null;                // только US-сессия
+    return _momentumEntry(ctx, p, INVERT_SIGNAL);
+  },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
+};
+// fadeBigMove — фейд крупного рывка (обратная гипотеза к bigMove): ставка на откат.
+const STRAT_FADE_BIG = {
+  id: 'fadeBigMove', name: 'Fade Big Move (фейд рывка)',
+  desc: 'после крупного движения BTC ставим ПРОТИВ него (на откат)',
+  defaults: { moveUSD: 40, minTimeMs: 90000, tpPct: 0.30, slPct: 0.35, kellyFrac: 0.15, maxFrac: 0.06, maxPerWindow: 1 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    if (ctx.curBTC == null || ctx.openingBTC == null) return null;
+    const delta = ctx.curBTC - ctx.openingBTC;
+    if (Math.abs(delta) < p.moveUSD) return null;
+    const dir = delta > 0 ? 'DOWN' : 'UP';              // против движения
+    const np = _normPoly(ctx); if (!np) return null;
+    const price = dir === 'UP' ? np.up : np.dn;
+    if (price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.06, price);
+    return { side: dir, polyPrice: price, ourProb, edge: ourProb - price, info: `fade Δ${delta.toFixed(0)}$ → ${dir}` };
+  },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p); },
+};
+// bigMoveFav — крупное движение И цена шэра уже в зоне фаворита (двойное подтверждение).
+const STRAT_BIGMOVE_FAV = {
+  id: 'bigMoveFav', name: 'Big Move + Favorite (подтверждение)',
+  desc: 'крупное движение BTC + сторона уже фаворит по цене (60-90¢)',
+  defaults: { moveUSD: 30, favLo: 0.60, favHi: 0.90, minTimeMs: 30000, tpPct: 0.40, slPct: 0.40, advMovePct: 0.35, kellyFrac: 0.20, maxFrac: 0.08, maxPerWindow: 2 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    if (ctx.curBTC == null || ctx.openingBTC == null) return null;
+    const delta = ctx.curBTC - ctx.openingBTC;
+    if (Math.abs(delta) < p.moveUSD) return null;
+    const dir = delta > 0 ? 'UP' : 'DOWN';
+    const np = _normPoly(ctx); if (!np) return null;
+    const price = dir === 'UP' ? np.up : np.dn;
+    if (price < p.favLo || price > p.favHi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.05, price);
+    return { side: dir, polyPrice: price, ourProb, edge: ourProb - price, info: `bigFav Δ${delta.toFixed(0)}$ @${(price*100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
+};
+// favHoldX — узкая зона фаворита 88-96¢ (где per-trade эдж был максимален), до резолва.
+const STRAT_FAV_HOLD_X = {
+  id: 'favHoldX', name: 'Favorite Hold X (88-96¢)',
+  desc: 'бэк сильного фаворита 88-96¢ под закрытие, держим до SETTLE',
+  defaults: { favLo: 0.88, favHi: 0.96, lateMs: 150000, maxPerWindow: 1, kellyFrac: 0.08, maxFrac: 0.04 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd > p.lateMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const side = np.up >= np.dn ? 'UP' : 'DOWN';
+    const price = Math.max(np.up, np.dn);
+    if (price < p.favLo || price > p.favHi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.02, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `favX ${side} @${(price*100).toFixed(0)}¢` };
+  },
+  shouldExit() { return null; },
+};
+// longHoldX — узкая зона лонгшота 12-20¢ (самая дешёвая), до резолва.
+const STRAT_LONG_HOLD_X = {
+  id: 'longHoldX', name: 'Longshot Hold X (12-20¢)',
+  desc: 'покупка очень дешёвой стороны 12-20¢ при запасе времени, до SETTLE',
+  defaults: { lo: 0.12, hi: 0.20, minTimeLeftMs: 120000, maxPerWindow: 1, kellyFrac: 0.05, maxFrac: 0.025 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeLeftMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const side = np.up <= np.dn ? 'UP' : 'DOWN';
+    const price = Math.min(np.up, np.dn);
+    if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.05, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `longX ${side} @${(price*100).toFixed(0)}¢` };
+  },
+  shouldExit() { return null; },
+};
+// calmRev — фейд дорогого фаворита при ШТИЛЕ (мало движения + дорогая сторона → возврат к 50/50).
+const STRAT_CALM_REV = {
+  id: 'calmRev', name: 'Calm Reversion (фейд при штиле)',
+  desc: 'при малом движении BTC фейдим переоценённого фаворита (>78¢)',
+  defaults: { maxMoveUSD: 15, hotMin: 0.78, minTimeMs: 90000, tpPct: 0.30, slPct: 0.30, kellyFrac: 0.12, maxFrac: 0.05, maxPerWindow: 1 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    if (ctx.curBTC == null || ctx.openingBTC == null) return null;
+    if (Math.abs(ctx.curBTC - ctx.openingBTC) > p.maxMoveUSD) return null;   // только штиль
+    const np = _normPoly(ctx); if (!np) return null;
+    const hot = Math.max(np.up, np.dn);
+    if (hot < p.hotMin) return null;
+    const betSide = np.up >= np.dn ? 'DOWN' : 'UP';     // против дорогого
+    const price = Math.min(np.up, np.dn);
+    if (price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.07, price);
+    return { side: betSide, polyPrice: price, ourProb, edge: ourProb - price, info: `calmRev fade @${(hot*100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p); },
+};
+
+const STRAT_DEFINITIONS = [STRAT_MOMENTUM, STRAT_MOM_SCRATCH, STRAT_MOM_HI, STRAT_MOM_CONFIRM, STRAT_UNDERDOG_HOLD, STRAT_FAV_HOLD, STRAT_LONG_HOLD, STRAT_LATE_MOM, STRAT_MOM_SCRATCH_HI, STRAT_BIG_MOVE, STRAT_TIME_SESSION, STRAT_FADE_BIG, STRAT_BIGMOVE_FAV, STRAT_FAV_HOLD_X, STRAT_LONG_HOLD_X, STRAT_CALM_REV, ...MANUAL_STRATS];
 
 // ─── REAL-TRADING RISK CONTROLS ──────────────────────────────────────────────
 // These guards exist to prevent the bot from spamming trades on dead markets
@@ -1510,7 +1760,7 @@ const BUY_SLIPPAGE = Math.max(0, Math.min(0.20,
 // Активные параметры: база (def.defaults) или кастом (с дашборда), если включён.
 // Движок всегда читает s.params — здесь просто пересобираем его при изменениях.
 function applyParams(s) {
-  s.params = s.customEnabled ? { ...s.def.defaults, ...s.customParams } : { ...s.def.defaults };
+  s.params = (s.def.manual || s.customEnabled) ? { ...s.def.defaults, ...s.customParams } : { ...s.def.defaults };
 }
 
 // Инверсия сигнала: торгуем ПРОТИВ модели (UP↔DOWN). Переключается с дашборда
@@ -1664,6 +1914,7 @@ function stratOpen(s, ctx, entry, acct, isReal) {
     if (q.ask != null) entry = { ...entry, polyPrice: q.ask };
   }
   let sizeUSDC = sizingByKelly(effectiveBalance, entry.ourProb, entry.polyPrice, s.params.kellyFrac, s.params.maxFrac);
+  if (entry.fixedUSD != null && entry.fixedUSD > 0) sizeUSDC = entry.fixedUSD;   // ручные стратегии: фикс. сумма входа
   // For sim: reject tiny sizes immediately. For real: check AFTER the 5-share
   // bump below, so a $0.94 Kelly still becomes $3.03 (5 shares × 60.5¢) and passes.
   if (!isReal && sizeUSDC < 1)            return;
@@ -1944,7 +2195,7 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
   }
 
   const pnl   = proceeds - o.sizeUSDC;
-  const entry = { ...o, closeTime: Date.now(), reason, proceeds, pnl, won, btcAtClose: ctx.curBTC, polyExitPrice: exitPolyPrice, strategy: s.def.id };
+  const entry = { ...o, closeTime: Date.now(), reason, proceeds, pnl, won, btcAtClose: ctx.curBTC, polyExitPrice: exitPolyPrice, strategy: s.def.id, dirty: wsStatus === 'sim' ? 1 : 0 };
   acct.balance    += proceeds;
   acct.peakBalance = Math.max(acct.peakBalance, acct.balance);
   acct.log.push(entry);
@@ -2547,6 +2798,25 @@ app.post('/api/strategy/:id/custom/toggle', (req, res) => {
   res.json({ ok: true, customEnabled: s.customEnabled, params: s.params });
 });
 
+// Настроить РУЧНУЮ параметрическую стратегию (manual1..8): строка dir, булевы
+// тумблеры (tpOn/slOn/active) и числовые поля.
+app.post('/api/strategy/:id/manual', (req, res) => {
+  const s = STRATEGIES[req.params.id];
+  if (!s || !s.def.manual) return res.status(404).json({ error: 'not a manual strategy' });
+  const b = req.body || {};
+  const cp = s.customParams;
+  if (b.dir === 'UP' || b.dir === 'DOWN' || b.dir === 'BOTH') cp.dir = b.dir;
+  for (const k of ['entryFromSec','entryToSec','btcDeltaMin','btcDeltaMax','shareMin','shareMax','betUSD','tpPct','slPct','maxPerWindow']) {
+    if (b[k] === undefined || b[k] === null || b[k] === '') continue;
+    const v = Number(b[k]); if (Number.isFinite(v)) cp[k] = v;
+  }
+  for (const k of ['tpOn','slOn','active']) { if (b[k] !== undefined) cp[k] = b[k] ? 1 : 0; }
+  s.customEnabled = true;
+  applyParams(s);
+  saveState();
+  res.json({ ok: true, params: s.params });
+});
+
 // Сбросить кастомные параметры к базовым.
 app.post('/api/strategy/:id/params/reset', (req, res) => {
   const s = STRATEGIES[req.params.id];
@@ -2686,7 +2956,7 @@ app.post('/api/strategy/:id/real/reset', (req, res) => {
 
 // API: export CSV
 app.get('/api/export/csv', (_, res) => {
-  const rows = [['mode','strategy','time_open','time_close','side','market','poly_entry','poly_exit','btc_open','btc_close','size','pnl','edge','reason','won','entry_info','real_order_id']];
+  const rows = [['mode','strategy','time_open','time_close','side','market','poly_entry','poly_exit','btc_open','btc_close','size','pnl','edge','reason','won','entry_info','real_order_id','dirty']];
   for (const id in STRATEGIES) {
     for (const [mode, acct] of [['demo', STRATEGIES[id].demo], ['real', STRATEGIES[id].real]]) {
       for (const t of acct.log) {
@@ -2704,6 +2974,7 @@ app.get('/api/export/csv', (_, res) => {
           t.reason, t.won ? 1 : 0,
           (t.entryInfo || '').replace(/,/g, ';'),
           t.realOrderId || '',
+          t.dirty ? 1 : 0,
         ]);
       }
     }
