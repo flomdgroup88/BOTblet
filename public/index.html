@@ -896,6 +896,7 @@ function acctPanelHtml(id, mode, label) {
 function updateStratCards(strats, polyData, realTrading) {
   const grid = $('strat-grid');
   for (const [id, s] of Object.entries(strats)) {
+    if (s.manual) continue;   // ручные стратегии рендерятся в отдельной панели настройки внизу
     if (!renderedCards.has(id)) {
       const card = document.createElement('div');
       card.id = 'scard-' + id;

@@ -2672,6 +2672,8 @@ function buildSnapshot() {
     const s = STRATEGIES[id];
     strats[id] = {
       name:        s.def.name,
+      desc:        s.def.desc,
+      manual:      !!s.def.manual,
       demoEnabled: s.demoEnabled,
       realEnabled: s.realEnabled,
       demo:        accountSummary(s.demo),
