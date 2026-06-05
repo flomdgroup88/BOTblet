@@ -1,4 +1,4 @@
-# BTC Scalp Bot v6 — Server Edition
+# BTC Scalp Bot v6 — Server Edition.
 
 Серверный порт браузерного скальп-бота. Работает 24/7 на Railway.
 
