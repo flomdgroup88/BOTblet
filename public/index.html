@@ -642,9 +642,9 @@ table.log tr:hover td { background: var(--bg3); }
 <!-- РУЧНЫЕ ПАРАМЕТРИЧЕСКИЕ СТРАТЕГИИ -->
 <div style="padding:16px;background:var(--bg);border-top:1px solid var(--bd);">
   <div class="lbl" style="cursor:pointer;" onclick="document.getElementById('manualWrap').style.display = document.getElementById('manualWrap').style.display==='none'?'block':'none';">
-    🎛 Ручные стратегии — вход по параметрам (нажми, чтобы свернуть)
+    🎛 Ручные стратегии — единая форма настройки (нажми, чтобы свернуть)
   </div>
-  <div style="font-size:11px;color:var(--tx3);margin:6px 0 12px;">Вход чисто по условиям: окно времени от старта свечи, дельта BTC от открытия ($), цена шэра, фикс. сумма, TP/SL. Работают в demo с задержкой и спредом. Пустые (active выкл) не торгуют.</div>
+  <div style="font-size:11px;color:var(--tx3);margin:6px 0 12px;">Настрой параметры → выбери слот → «Сохранить». Форма не сбрасывается — меняй слот и сохраняй следующую. Работа каждой видна карточкой в общей сетке выше (баланс, сделки, спред и задержка — как у авто-стратегий).</div>
   <div id="manualWrap"></div>
   <span id="manMsg" style="font-size:11px;color:var(--up);min-height:14px;display:block;margin-top:6px;"></span>
 </div>
@@ -896,7 +896,6 @@ function acctPanelHtml(id, mode, label) {
 function updateStratCards(strats, polyData, realTrading) {
   const grid = $('strat-grid');
   for (const [id, s] of Object.entries(strats)) {
-    if (s.manual) continue;   // ручные стратегии рендерятся в отдельной панели настройки внизу
     if (!renderedCards.has(id)) {
       const card = document.createElement('div');
       card.id = 'scard-' + id;
@@ -1130,84 +1129,91 @@ function updateConfigPanel(d) {
   _setIfBlur('p-minTimeSec', Math.round(p.minTimeMs / 1000));
   _beNote();
 }
-// ── РУЧНЫЕ СТРАТЕГИИ ─────────────────────────────────────────────────────────
-let _manBuilt = false;
-function buildManualCards(strats) {
-  const wrap = document.getElementById('manualWrap');
-  if (!wrap) return;
-  const ids = Object.keys(strats).filter(k => strats[k].manual).sort();
-  if (!ids.length) return;
-  wrap.innerHTML = '';
-  for (const id of ids) {
-    const p = strats[id].params || {};
-    const c = document.createElement('div');
-    c.className = 'man-card' + (p.active ? ' act' : '');
-    c.id = 'mc-' + id;
-    c.innerHTML = `
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-        <b style="font-size:13px;">${strats[id].name || id}</b>
-        <span style="font-size:11px;color:${p.active?'var(--up)':'var(--tx3)'}" id="mst-${id}">${p.active?'● активна':'○ выкл'}</span>
-      </div>
-      <div class="man-dir" style="margin-bottom:8px;">
-        <button type="button" class="${p.dir==='UP'?'up':''}" onclick="manSetDir('${id}','UP')" id="mdu-${id}">📈 UP</button>
-        <button type="button" class="${p.dir==='DOWN'?'dn':''}" onclick="manSetDir('${id}','DOWN')" id="mdd-${id}">📉 DOWN</button>
-        <button type="button" class="${p.dir==='BOTH'?'both':''}" onclick="manSetDir('${id}','BOTH')" id="mdb-${id}">↕ ОБА</button>
-      </div>
-      <div class="man-row">
-        <div class="cfg-field"><label>Время от старта, сек ОТ</label><input class="cfg-input" id="mp-${id}-entryFromSec" type="number" min="0" value="${p.entryFromSec??0}"></div>
-        <div class="cfg-field"><label>ДО</label><input class="cfg-input" id="mp-${id}-entryToSec" type="number" min="0" value="${p.entryToSec??0}"></div>
-        <div class="cfg-field"><label>Δ BTC от откр., $ МИН</label><input class="cfg-input" id="mp-${id}-btcDeltaMin" type="number" value="${p.btcDeltaMin??0}"></div>
-        <div class="cfg-field"><label>МАКС</label><input class="cfg-input" id="mp-${id}-btcDeltaMax" type="number" value="${p.btcDeltaMax??9999}"></div>
-      </div>
-      <div class="man-row">
-        <div class="cfg-field"><label>Цена шэра МИН</label><input class="cfg-input" id="mp-${id}-shareMin" type="number" step="0.01" min="0" max="1" value="${p.shareMin??0.4}"></div>
-        <div class="cfg-field"><label>МАКС</label><input class="cfg-input" id="mp-${id}-shareMax" type="number" step="0.01" min="0" max="1" value="${p.shareMax??0.65}"></div>
-        <div class="cfg-field"><label>Сумma входа $</label><input class="cfg-input" id="mp-${id}-betUSD" type="number" min="1" value="${p.betUSD??10}"></div>
-        <div class="cfg-field"><label>Макс. раундов/окно</label><input class="cfg-input" id="mp-${id}-maxPerWindow" type="number" min="1" value="${p.maxPerWindow??1}"></div>
-      </div>
-      <div class="man-row">
-        <div class="cfg-field" style="flex:0 0 auto;"><label>Take Profit</label><button type="button" class="cfg-btn ${p.tpOn?'on':''}" id="mtp-${id}" onclick="manTog('${id}','tp')" style="min-width:70px;">${p.tpOn?'ON':'OFF'}</button></div>
-        <div class="cfg-field"><label>TP %</label><input class="cfg-input" id="mp-${id}-tpPct" type="number" step="0.05" value="${p.tpPct??0.3}"></div>
-        <div class="cfg-field" style="flex:0 0 auto;"><label>Stop Loss</label><button type="button" class="cfg-btn ${p.slOn?'on':''}" id="msl-${id}" onclick="manTog('${id}','sl')" style="min-width:70px;">${p.slOn?'ON':'OFF'}</button></div>
-        <div class="cfg-field"><label>SL %</label><input class="cfg-input" id="mp-${id}-slPct" type="number" step="0.05" value="${p.slPct??0.3}"></div>
-      </div>
-      <div style="display:flex;gap:10px;align-items:center;margin-top:6px;">
-        <button type="button" class="cfg-btn" id="mact-${id}" onclick="manTog('${id}','active')" style="border-color:${p.active?'rgba(0,232,122,.6)':'var(--bd)'};color:${p.active?'var(--up)':'var(--tx3)'};">${p.active?'АКТИВНА':'ВЫКЛ'}</button>
-        <button type="button" class="cfg-btn" onclick="manSave('${id}')" style="border-color:rgba(0,232,122,.5);color:var(--up);">💾 Сохранить</button>
-        <span style="font-size:10px;color:var(--tx3);">dir=<b id="mdv-${id}">${p.dir||'UP'}</b></span>
+// ── РУЧНЫЕ СТРАТЕГИИ: единая форма + слот-селектор ───────────────────────────
+let _manBuilt=false, _manSlot='manual1', _manStrats={};
+function buildManualCards(strats){
+  const wrap=document.getElementById('manualWrap'); if(!wrap) return;
+  const ids=Object.keys(strats).filter(k=>strats[k].manual).sort();
+  if(!ids.length) return;
+  _manStrats=strats;
+  if(!_manBuilt){
+    wrap.innerHTML=`
+      <div class="man-card" style="max-width:760px;">
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;" id="manSlots"></div>
+        <div class="man-dir" style="margin-bottom:10px;">
+          <button type="button" id="fdu" onclick="manFormDir('UP')">📈 UP</button>
+          <button type="button" id="fdd" onclick="manFormDir('DOWN')">📉 DOWN</button>
+          <button type="button" id="fdb" onclick="manFormDir('BOTH')">↕ ОБА</button>
+        </div>
+        <div class="man-row">
+          <div class="cfg-field"><label>Время от старта, сек ОТ</label><input class="cfg-input" id="f-entryFromSec" type="number" min="0" value="0"></div>
+          <div class="cfg-field"><label>ДО</label><input class="cfg-input" id="f-entryToSec" type="number" min="0" value="180"></div>
+          <div class="cfg-field"><label>Δ BTC от откр., $ МИН</label><input class="cfg-input" id="f-btcDeltaMin" type="number" value="0"></div>
+          <div class="cfg-field"><label>МАКС</label><input class="cfg-input" id="f-btcDeltaMax" type="number" value="9999"></div>
+        </div>
+        <div class="man-row">
+          <div class="cfg-field"><label>Цена шэра МИН</label><input class="cfg-input" id="f-shareMin" type="number" step="0.01" min="0" max="1" value="0.40"></div>
+          <div class="cfg-field"><label>МАКС</label><input class="cfg-input" id="f-shareMax" type="number" step="0.01" min="0" max="1" value="0.65"></div>
+          <div class="cfg-field"><label>Сумма входа $</label><input class="cfg-input" id="f-betUSD" type="number" min="1" value="10"></div>
+          <div class="cfg-field"><label>Макс. раундов/окно</label><input class="cfg-input" id="f-maxPerWindow" type="number" min="1" value="1"></div>
+        </div>
+        <div class="man-row">
+          <div class="cfg-field" style="flex:0 0 auto;"><label>Take Profit</label><button type="button" class="cfg-btn" id="f-tpBtn" onclick="manFormTog('tp')" style="min-width:70px;">OFF</button></div>
+          <div class="cfg-field"><label>TP %</label><input class="cfg-input" id="f-tpPct" type="number" step="0.05" value="0.30"></div>
+          <div class="cfg-field" style="flex:0 0 auto;"><label>Stop Loss</label><button type="button" class="cfg-btn" id="f-slBtn" onclick="manFormTog('sl')" style="min-width:70px;">OFF</button></div>
+          <div class="cfg-field"><label>SL %</label><input class="cfg-input" id="f-slPct" type="number" step="0.05" value="0.30"></div>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap;">
+          <button type="button" class="cfg-btn" id="f-actBtn" onclick="manFormTog('active')">ВКЛ при сохранении: ДА</button>
+          <button type="button" class="cfg-btn" onclick="manFormSave()" style="border-color:rgba(0,232,122,.6);color:var(--up);font-weight:bold;">💾 Сохранить слот <b id="f-slotLbl">#1</b></button>
+          <button type="button" class="cfg-btn" onclick="manFormLoad()" style="color:var(--tx2);">↻ загрузить из слота</button>
+          <span style="font-size:10px;color:var(--tx3);">dir=<b id="f-dirLbl">UP</b></span>
+        </div>
       </div>`;
-    wrap.appendChild(c);
-    c.dataset.dir = p.dir || 'UP';
-    c.dataset.tp = p.tpOn ? '1':'0';
-    c.dataset.sl = p.slOn ? '1':'0';
-    c.dataset.active = p.active ? '1':'0';
+    wrap.dataset.dir='UP'; wrap.dataset.tp='0'; wrap.dataset.sl='0'; wrap.dataset.active='1';
+    _manBuilt=true;
   }
-  _manBuilt = true;
+  // обновляем кнопки слотов (active подсвечен)
+  const sl=document.getElementById('manSlots'); if(sl){
+    sl.innerHTML=ids.map(id=>{const a=strats[id].params&&strats[id].params.active;const n=id.replace('manual','');
+      return `<button type="button" onclick="manPickSlot('${id}')" class="cfg-btn" style="min-width:42px;${id===_manSlot?'border-color:rgba(120,140,255,.8);color:#7c8cff;':''}${a?'background:rgba(0,232,122,.10);':''}">${a?'●':''}${n}</button>`;}).join('');
+  }
 }
-function manSetDir(id,dir){const c=document.getElementById('mc-'+id);c.dataset.dir=dir;
-  document.getElementById('mdu-'+id).className=dir==='UP'?'up':'';
-  document.getElementById('mdd-'+id).className=dir==='DOWN'?'dn':'';
-  document.getElementById('mdb-'+id).className=dir==='BOTH'?'both':'';
-  document.getElementById('mdv-'+id).textContent=dir;}
-function manTog(id,what){const c=document.getElementById('mc-'+id);const cur=c.dataset[what]==='1';c.dataset[what]=cur?'0':'1';
-  const map={tp:'mtp-',sl:'msl-',active:'mact-'};const btn=document.getElementById(map[what]+id);
-  if(what==='active'){btn.textContent=!cur?'АКТИВНА':'ВЫКЛ';btn.style.color=!cur?'var(--up)':'var(--tx3)';btn.style.borderColor=!cur?'rgba(0,232,122,.6)':'var(--bd)';}
-  else{btn.textContent=!cur?'ON':'OFF';btn.className='cfg-btn'+(!cur?' on':'');}}
-async function manSave(id){
-  const c=document.getElementById('mc-'+id);const g=k=>document.getElementById('mp-'+id+'-'+k);
-  const body={dir:c.dataset.dir,
+function manPickSlot(id){_manSlot=id;document.getElementById('f-slotLbl').textContent='#'+id.replace('manual','');buildManualCards(_manStrats);}
+function manFormDir(d){const w=document.getElementById('manualWrap');w.dataset.dir=d;document.getElementById('f-dirLbl').textContent=d;
+  document.getElementById('fdu').className=d==='UP'?'up':'';document.getElementById('fdd').className=d==='DOWN'?'dn':'';document.getElementById('fdb').className=d==='BOTH'?'both':'';}
+function manFormTog(w){const wr=document.getElementById('manualWrap');const cur=wr.dataset[w]==='1';wr.dataset[w]=cur?'0':'1';
+  if(w==='active'){const b=document.getElementById('f-actBtn');b.textContent='ВКЛ при сохранении: '+(!cur?'ДА':'НЕТ');b.style.color=!cur?'var(--up)':'var(--tx3)';}
+  else{const b=document.getElementById(w==='tp'?'f-tpBtn':'f-slBtn');b.textContent=!cur?'ON':'OFF';b.className='cfg-btn'+(!cur?' on':'');}}
+function manFormLoad(){const p=(_manStrats[_manSlot]||{}).params||{};const g=k=>document.getElementById('f-'+k);
+  manFormDir(p.dir||'UP');
+  g('entryFromSec').value=p.entryFromSec??0; g('entryToSec').value=p.entryToSec??0;
+  g('btcDeltaMin').value=p.btcDeltaMin??0; g('btcDeltaMax').value=p.btcDeltaMax??9999;
+  g('shareMin').value=p.shareMin??0.4; g('shareMax').value=p.shareMax??0.65;
+  g('betUSD').value=p.betUSD??10; g('maxPerWindow').value=p.maxPerWindow??1;
+  g('tpPct').value=p.tpPct??0.3; g('slPct').value=p.slPct??0.3;
+  const wr=document.getElementById('manualWrap');
+  wr.dataset.tp=p.tpOn?'1':'0'; document.getElementById('f-tpBtn').textContent=p.tpOn?'ON':'OFF'; document.getElementById('f-tpBtn').className='cfg-btn'+(p.tpOn?' on':'');
+  wr.dataset.sl=p.slOn?'1':'0'; document.getElementById('f-slBtn').textContent=p.slOn?'ON':'OFF'; document.getElementById('f-slBtn').className='cfg-btn'+(p.slOn?' on':'');
+  document.getElementById('manMsg').textContent='↻ загружены параметры '+_manSlot;}
+async function manFormSave(){
+  const wr=document.getElementById('manualWrap');const g=k=>document.getElementById('f-'+k);
+  const body={dir:wr.dataset.dir,
     entryFromSec:g('entryFromSec').value,entryToSec:g('entryToSec').value,
     btcDeltaMin:g('btcDeltaMin').value,btcDeltaMax:g('btcDeltaMax').value,
     shareMin:g('shareMin').value,shareMax:g('shareMax').value,
     betUSD:g('betUSD').value,maxPerWindow:g('maxPerWindow').value,
     tpPct:g('tpPct').value,slPct:g('slPct').value,
-    tpOn:c.dataset.tp==='1',slOn:c.dataset.sl==='1',active:c.dataset.active==='1'};
+    tpOn:wr.dataset.tp==='1',slOn:wr.dataset.sl==='1',active:wr.dataset.active==='1'};
+  const slot=_manSlot;
   document.getElementById('manMsg').textContent='...';
-  await fetch('/api/strategy/'+id+'/manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  // активна → включаем demo-торговлю этой стратегии автоматически
-  if(body.active){await fetch('/api/strategy/'+id+'/demo/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:true})});}
-  document.getElementById('manMsg').textContent='✅ '+(strats_last[id]?.name||id)+' сохранена'+(body.active?' и включена в demo':'');
-  document.getElementById('mst-'+id).textContent=body.active?'● активна':'○ выкл';
+  await fetch('/api/strategy/'+slot+'/manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(body.active) await fetch('/api/strategy/'+slot+'/demo/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:true})});
+  document.getElementById('manMsg').textContent='✅ '+slot+' сохранена'+(body.active?' и включена (demo)':'')+' — карточка в сетке выше. Форма не сброшена, выбери след. слот.';
+  // авто-переход на следующий свободный слот (значения формы сохраняются)
+  const ids=Object.keys(_manStrats).filter(k=>_manStrats[k].manual).sort();
+  const free=ids.find(id=>id!==slot && !(_manStrats[id].params&&_manStrats[id].params.active));
+  if(free){_manSlot=free;document.getElementById('f-slotLbl').textContent='#'+free.replace('manual','');}
 }
 let strats_last={};
 async function toggleDemoSpread() {
