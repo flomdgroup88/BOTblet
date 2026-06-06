@@ -2543,12 +2543,13 @@ function processStrategies() {
 
 // ─── COINBASE WEBSOCKET ──────────────────────────────────────────────────────
 let ws_ = null;
+let simInterval = null, simRetry = null;   // хэндлы цикла симуляции и таймера авто-переподключения
 
 function connectCoinbase() {
   wsStatus = 'connecting';
   try {
     ws_ = new WebSocket('wss://advanced-trade-ws.coinbase.com');
-    const timeout = setTimeout(() => { if (wsStatus !== 'live') { ws_.terminate(); startSim(); } }, 10000);
+    const timeout = setTimeout(() => { if (wsStatus !== 'live') { try { ws_.terminate(); } catch (_) {} if (!isSim) startSim(); } }, 10000);
 
     ws_.on('open', () => {
       const sub = {
@@ -2567,6 +2568,7 @@ function connectCoinbase() {
       if (!wsStatus.startsWith('live') && d.channel) {
         wsStatus = 'live';
         clearTimeout(timeout);
+        exitSim();                       // вернулись из SIM в реальные цены
         console.log('[coinbase] ws connected');
       }
       if (d.channel === 'market_trades' && d.events) {
@@ -2590,7 +2592,7 @@ function connectCoinbase() {
       }
     });
 
-    ws_.on('error', () => { if (wsStatus !== 'live') startSim(); });
+    ws_.on('error', () => { if (wsStatus !== 'live' && !isSim) startSim(); });
     ws_.on('close', () => {
       if (wsStatus === 'live') {
         wsStatus = 'reconnecting';
@@ -2598,15 +2600,26 @@ function connectCoinbase() {
         setTimeout(connectCoinbase, 3000);
       }
     });
-  } catch (e) { startSim(); }
+  } catch (e) { if (!isSim) startSim(); }
 }
 
 // ─── SIMULATION MODE ─────────────────────────────────────────────────────────
+function exitSim() {
+  if (!isSim) return;
+  isSim = false;
+  if (simInterval) { clearInterval(simInterval); simInterval = null; }
+  if (simRetry)    { clearInterval(simRetry);    simRetry = null; }
+  console.log('[sim] stopped — back to live Coinbase');
+}
+
 function startSim() {
   if (isSim) return;
   isSim    = true;
   wsStatus = 'sim';
-  console.log('[sim] started (ws blocked/failed)');
+  console.log('[sim] started (ws blocked/failed) — будет пробовать вернуться в live каждые 30с');
+  // Авто-восстановление: пока в SIM, периодически пробуем переподключиться к Coinbase.
+  // Как только WS оживёт, message-handler вызовет exitSim() и SIM остановится.
+  if (!simRetry) simRetry = setInterval(() => { if (isSim) { console.log('[sim] retry coinbase…'); connectCoinbase(); } }, 30000);
   let price = 107650;
   sessionStart = price;
   bestBid = price - 0.5; bestAsk = price + 0.5;
@@ -2621,7 +2634,7 @@ function startSim() {
   };
   seedBook();
 
-  setInterval(() => {
+  simInterval = setInterval(() => {
     if (Math.random() < 0.005) regime = ['trending', 'ranging', 'volatile'][Math.floor(Math.random() * 3)];
     if (Math.random() < 0.015) { trend = (Math.random() - 0.46) * 2; trendLife = Math.random() * 50 + 10; }
     trendLife > 0 ? trendLife-- : (trend *= 0.97);
