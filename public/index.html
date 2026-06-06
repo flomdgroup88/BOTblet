@@ -915,7 +915,10 @@ function updateStratCards(strats, polyData, realTrading) {
       card.innerHTML = `
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
           <div class="lbl" style="margin-bottom:0;">${s.name}</div>
-          <div id="spos-${id}" style="font-size:9px;"></div>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <button id="sell-${id}" onclick="marketSell('${id}')" style="display:none;font-size:9px;padding:2px 8px;border:1px solid #e0556a;background:#e0556a;color:#fff;border-radius:4px;cursor:pointer;font-family:inherit;font-weight:600;">⚡ ПРОДАТЬ ПО РЫНКУ</button>
+            <div id="spos-${id}" style="font-size:9px;"></div>
+          </div>
         </div>
         <div class="acct-panels">
           ${acctPanelHtml(id, 'demo', '▣ DEMO')}
@@ -1012,6 +1015,18 @@ function updateStratCards(strats, polyData, realTrading) {
       const o = s.demo.open || s.real.open;
       posB.innerHTML = `<span class="pos-badge pos-${o.side.toLowerCase()}">${o.side}</span>`;
     } else { posB.innerHTML = ''; }
+    // Кнопка рыночной продажи: только при открытой РЕАЛЬНОЙ позиции (и не в процессе подтверждения входа)
+    const sellB = $('sell-' + id);
+    if (sellB) {
+      const ro = s.real.open && s.real.open.isReal ? s.real.open : null;
+      if (ro) {
+        const pend = ro.realOrderStatus === 'pending';
+        sellB.style.display = 'inline-block';
+        sellB.disabled = pend;
+        sellB.style.opacity = pend ? '0.5' : '1';
+        sellB.textContent = pend ? 'ВХОД ПОДТВЕРЖДАЕТСЯ…' : '⚡ ПРОДАТЬ ПО РЫНКУ';
+      } else { sellB.style.display = 'none'; }
+    }
   }
 }
 
@@ -1256,6 +1271,16 @@ async function saveSchedule() {
   const r = await (await fetch('/api/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
   _dirty.delete('p-schedFrom'); _dirty.delete('p-schedTo');
   $('schedMsg').textContent = r.ok ? `✅ Сохранено: ${r.schedFrom}→${r.schedTo} МСК` : 'Ошибка';
+}
+async function marketSell(id){
+  const b=document.getElementById('sell-'+id); if(!b) return;
+  if(!confirm('Продать реальную позицию '+id+' по рынку сейчас?')) return;
+  b.disabled=true; const old=b.textContent; b.textContent='ЗАКРЫВАЮ…';
+  try{
+    const r=await (await fetch('/api/strategy/'+id+'/panic',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
+    if(!r.ok){ alert('Ошибка: '+(r.error||'')); b.textContent=old; b.disabled=false; }
+    // при успехе кнопка скроется со следующим снапшотом (позиция закроется)
+  }catch(e){ alert('Ошибка запроса'); b.textContent=old; b.disabled=false; }
 }
 async function panicSell() {
   const btn = $('panicBtn'); btn.disabled = true; btn.textContent = 'ЗАКРЫВАЮ…';
