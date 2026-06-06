@@ -1920,7 +1920,9 @@ function stratOpen(s, ctx, entry, acct, isReal) {
   if (!isReal && sizeUSDC < 1)            return;
   if (sizeUSDC > effectiveBalance * 0.95) return;
 
-  const isRealOrder = isReal && s.def.id === 'momentum' && !!polyWallet && !!polyApiCreds;
+  // Реальный ордер размещается для ЛЮБОЙ стратегии с включённым тумблером REAL
+  // (isReal истинно только когда s.realEnabled И REAL_TRADING И есть кошелёк/ключи).
+  const isRealOrder = isReal && !!polyWallet && !!polyApiCreds;
   const tokenId     = entry.side === 'UP' ? poly.market?.tokenIdUp : poly.market?.tokenIdDown;
 
   // For real orders: need tokenId
