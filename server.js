@@ -1399,8 +1399,8 @@ const STRAT_CONFLUENCE = {
 // НО только если додерживать до резолва (без раннего TP/SL). Высокая дисперсия.
 const STRAT_UNDERDOG_HOLD = {
   id: 'underdogHold', name: 'Underdog Hold (дёшево, до резолва)',
-  desc: 'покупка дешёвой стороны 15–45¢ и удержание до SETTLE (тест эджа калибровки)',
-  defaults: { lo: 0.15, hi: 0.45, minTimeMs: 60000, kellyFrac: 0.10, maxFrac: 0.05 },
+  desc: 'покупка дешёвой стороны 15–40¢, держим до SETTLE, но фиксируем если дошла до 96¢',
+  defaults: { lo: 0.15, hi: 0.40, minTimeMs: 60000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
   shouldEnter(ctx, p) {
     if (ctx.msToEnd < p.minTimeMs) return null;
     const np = _normPoly(ctx); if (!np) return null;
@@ -1410,7 +1410,13 @@ const STRAT_UNDERDOG_HOLD = {
     const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
     return { side: dogSide, polyPrice: dogPrice, ourProb, edge: ourProb - dogPrice, info: `hold ${dogSide} @${(dogPrice*100).toFixed(0)}¢` };
   },
-  shouldExit() { return null; },   // НЕ выходим рано — держим до SETTLE (резолв окна)
+  // Держим до SETTLE, но если дешёвая сторона почти выиграла (цена дошла до tpAbs≈96¢)
+  // — фиксируем: оставшийся апсайд (≤4¢) не стоит риска отката на последних секундах.
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
 };
 
 // ── NEW: MOMENTUM HOLD — вход по моменту, держим до резолва (без TP/SL). ──────
