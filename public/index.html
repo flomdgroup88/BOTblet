@@ -1018,7 +1018,7 @@ function updateStratCards(strats, polyData, realTrading) {
     // Кнопка рыночной продажи: только при открытой РЕАЛЬНОЙ позиции (и не в процессе подтверждения входа)
     const sellB = $('sell-' + id);
     if (sellB) {
-      const ro = s.real.open && s.real.open.isReal ? s.real.open : null;
+      const ro = s.real.open ? s.real.open : null;   // любая открытая real-позиция (сервер перепроверит)
       if (ro) {
         const pend = ro.realOrderStatus === 'pending';
         sellB.style.display = 'inline-block';
@@ -1274,7 +1274,6 @@ async function saveSchedule() {
 }
 async function marketSell(id){
   const b=document.getElementById('sell-'+id); if(!b) return;
-  if(!confirm('Продать реальную позицию '+id+' по рынку сейчас?')) return;
   b.disabled=true; const old=b.textContent; b.textContent='ЗАКРЫВАЮ…';
   try{
     const r=await (await fetch('/api/strategy/'+id+'/panic',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
