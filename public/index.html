@@ -866,6 +866,18 @@ function updateAll(d) {
 // ─── STRATEGY CARDS ───────────────────────────────────────────────────────────
 const renderedCards = new Set();
 
+function schedTog(id){const b=document.getElementById('sch-btn-'+id);const on=b.dataset.on==='1';b.dataset.on=on?'0':'1';
+  if(on){b.className='toggle-btn off';b.textContent='⏰ 24/7';}
+  else{const f=document.getElementById('sch-from-'+id).value,t=document.getElementById('sch-to-'+id).value;b.className='toggle-btn on';b.textContent='⏰ '+f+'-'+t;}}
+async function schedSave(id){
+  const b=document.getElementById('sch-btn-'+id);const on=b.dataset.on==='1';
+  const f=document.getElementById('sch-from-'+id).value,t=document.getElementById('sch-to-'+id).value;
+  const m=document.getElementById('sch-msg-'+id);m.textContent='...';
+  await fetch('/api/strategy/'+id+'/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:on,from:f,to:t})});
+  if(on)b.textContent='⏰ '+f+'-'+t;
+  m.textContent=on?('✅ '+f+'-'+t+' МСК'):'✅ 24/7 (глобальное)';
+  setTimeout(()=>{m.textContent='';},4000);
+}
 function acctPanelHtml(id, mode, label) {
   const lockBadge = mode === 'real'
     ? `<span id="slock-${id}-real" class="lock-badge" title="Кошелёк не готов: проверь REAL_TRADING=true и POLY_PRIVATE_KEY в Railway env" style="display:none;">🔒 нет кошелька</span>`
@@ -908,6 +920,14 @@ function updateStratCards(strats, polyData, realTrading) {
         <div class="acct-panels">
           ${acctPanelHtml(id, 'demo', '▣ DEMO')}
           ${acctPanelHtml(id, 'real', '◈ REAL')}
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;margin-top:5px;font-size:10px;color:var(--tx3);flex-wrap:wrap;">
+          <button id="sch-btn-${id}" data-on="${s.schedEnabled?1:0}" class="toggle-btn ${s.schedEnabled?'on':'off'}" onclick="schedTog('${id}')" style="font-size:9px;padding:2px 7px;">${s.schedEnabled?('⏰ '+(s.schedFrom??7)+'-'+(s.schedTo??24)):'⏰ 24/7'}</button>
+          <span>с</span><input id="sch-from-${id}" type="number" min="0" max="24" value="${s.schedFrom??7}" style="width:42px;background:var(--bg);border:1px solid var(--bd);border-radius:4px;color:var(--tx1);padding:2px 4px;font-family:inherit;">
+          <span>до</span><input id="sch-to-${id}" type="number" min="0" max="24" value="${s.schedTo??24}" style="width:42px;background:var(--bg);border:1px solid var(--bd);border-radius:4px;color:var(--tx1);padding:2px 4px;font-family:inherit;">
+          <span>МСК</span>
+          <button onclick="schedSave('${id}')" style="font-size:9px;padding:2px 7px;border:1px solid rgba(0,232,122,.5);background:transparent;color:var(--up);border-radius:4px;cursor:pointer;font-family:inherit;">💾</button>
+          <span id="sch-msg-${id}" style="color:var(--tx3);"></span>
         </div>`;
       grid.appendChild(card);
       renderedCards.add(id);

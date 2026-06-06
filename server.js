@@ -156,6 +156,7 @@ function saveState() {
       out[id] = {
         demoEnabled: s.demoEnabled,
         realEnabled: s.realEnabled,
+        schedEnabled: s.schedEnabled, schedFrom: s.schedFrom, schedTo: s.schedTo,
         demo: {
           balance:     s.demo.balance,
           peakBalance: s.demo.peakBalance,
@@ -198,6 +199,9 @@ function loadState() {
         // New dual-account format
         s.demoEnabled      = st.demoEnabled      ?? false;
         s.realEnabled      = st.realEnabled      ?? false;
+        s.schedEnabled     = st.schedEnabled     ?? false;
+        s.schedFrom        = st.schedFrom        ?? 7;
+        s.schedTo          = st.schedTo          ?? 24;
         s.demo.balance     = st.demo.balance     ?? 1000;
         s.demo.peakBalance = st.demo.peakBalance ?? 1000;
         s.demo.open        = st.demo.open        ?? null;
@@ -1794,7 +1798,7 @@ let SCHEDULE_ENABLED = ['true', '1', 'yes', 'on']
 let SCHEDULE_FROM = Math.max(0, Math.min(24, parseInt(process.env.SCHEDULE_FROM || '9', 10)));
 let SCHEDULE_TO   = Math.max(0, Math.min(24, parseInt(process.env.SCHEDULE_TO   || '23', 10)));
 
-// Разрешено ли СЕЙЧАС открывать сделки (по расписанию). Выходы это не трогает.
+// Разрешено ли СЕЙЧАС открывать сделки ПО ГЛОБАЛЬНОМУ расписанию. Выходы не трогает.
 function entriesAllowedNow() {
   if (!SCHEDULE_ENABLED) return true;
   if (SCHEDULE_FROM === SCHEDULE_TO) return true; // круглосуточно
@@ -1804,12 +1808,27 @@ function entriesAllowedNow() {
     : (mskHour >= SCHEDULE_FROM || mskHour < SCHEDULE_TO);       // через полночь
 }
 
+// Разрешено ли открывать сделки КОНКРЕТНОЙ стратегии. Если у стратегии включено
+// своё расписание — оно имеет приоритет; иначе действует глобальное расписание.
+function strategyEntriesAllowed(s) {
+  if (s && s.schedEnabled) {
+    const f = s.schedFrom, t = s.schedTo;
+    if (f === t) return true;                          // 0/0 (или равные) = круглосуточно
+    const h = (new Date().getUTCHours() + 3) % 24;     // МСК
+    return f < t ? (h >= f && h < t) : (h >= f || h < t);
+  }
+  return entriesAllowedNow();
+}
+
 function initStrategies() {
   for (const def of STRAT_DEFINITIONS) {
     STRATEGIES[def.id] = {
       def,
       demoEnabled:  false,
       realEnabled:  false,
+      schedEnabled: false,   // своё расписание выкл → действует глобальное
+      schedFrom:    7,       // час МСК «от»
+      schedTo:      24,      // час МСК «до» (24 = до полуночи)
       demo: { balance: 1000, peakBalance: 1000, open: null, log: [] },
       real: { balance: 1000, peakBalance: 1000, open: null, log: [] },
       params:       { ...def.defaults },
@@ -2494,7 +2513,7 @@ function processAccount(s, ctx, acct, isReal) {
     }
   } else {
     if (ctx.polyUp === null) return;
-    if (!entriesAllowedNow()) { acct.pendingEntry = null; return; } // расписание: вне окна не открываем
+    if (!strategyEntriesAllowed(s)) { acct.pendingEntry = null; return; } // расписание (своё или глобальное): вне окна не открываем
 
     // DEMO: реалистичный вход с задержкой и отсечкой «улетевшей» цены.
     if (acct === s.demo && DEMO_ENTRY_DELAY_MS > 0) {
@@ -2691,6 +2710,7 @@ function buildSnapshot() {
       manual:      !!s.def.manual,
       demoEnabled: s.demoEnabled,
       realEnabled: s.realEnabled,
+      schedEnabled: s.schedEnabled, schedFrom: s.schedFrom, schedTo: s.schedTo,
       demo:        accountSummary(s.demo),
       real:        accountSummary(s.real),
       pendingReal: s.pendingReal,
@@ -2859,6 +2879,20 @@ app.post('/api/demo-spread/toggle', (req, res) => {
   saveState();
   console.warn(`[config] DEMO_REAL_SPREAD → ${DEMO_REAL_SPREAD ? 'ON (demo платит спред)' : 'OFF (demo по mid)'}`);
   res.json({ ok: true, demoRealSpread: DEMO_REAL_SPREAD });
+});
+
+// API: ИНДИВИДУАЛЬНОЕ расписание стратегии (часы МСК). Приоритет над глобальным.
+// enabled=false → стратегия следует глобальному расписанию. from===to → круглосуточно.
+app.post('/api/strategy/:id/schedule', (req, res) => {
+  const s = STRATEGIES[req.params.id];
+  if (!s) return res.status(404).json({ error: 'not found' });
+  const b = req.body || {};
+  if (typeof b.enabled === 'boolean') s.schedEnabled = b.enabled;
+  if (b.from !== undefined && b.from !== '') { const v = Math.max(0, Math.min(24, Math.floor(Number(b.from)))); if (Number.isFinite(v)) s.schedFrom = v; }
+  if (b.to   !== undefined && b.to   !== '') { const v = Math.max(0, Math.min(24, Math.floor(Number(b.to))));   if (Number.isFinite(v)) s.schedTo   = v; }
+  applyParams(s); saveState();
+  console.log(`[schedule] ${req.params.id} своё=${s.schedEnabled} ${s.schedFrom}->${s.schedTo} МСК · открытие сейчас: ${strategyEntriesAllowed(s)}`);
+  res.json({ ok: true, schedEnabled: s.schedEnabled, schedFrom: s.schedFrom, schedTo: s.schedTo, allowedNow: strategyEntriesAllowed(s) });
 });
 
 // API: расписание торговли (часы МСК; выходы всегда работают).
