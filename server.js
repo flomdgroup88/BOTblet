@@ -1399,8 +1399,8 @@ const STRAT_CONFLUENCE = {
 // НО только если додерживать до резолва (без раннего TP/SL). Высокая дисперсия.
 const STRAT_UNDERDOG_HOLD = {
   id: 'underdogHold', name: 'Underdog Hold (дёшево, до резолва)',
-  desc: 'покупка дешёвой стороны 15–40¢, держим до SETTLE, но фиксируем если дошла до 96¢',
-  defaults: { lo: 0.15, hi: 0.40, minTimeMs: 60000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  desc: 'покупка дешёвой стороны 15–35¢, держим до SETTLE, но фиксируем если дошла до 96¢',
+  defaults: { lo: 0.15, hi: 0.35, minTimeMs: 60000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
   shouldEnter(ctx, p) {
     if (ctx.msToEnd < p.minTimeMs) return null;
     const np = _normPoly(ctx); if (!np) return null;
