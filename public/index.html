@@ -392,6 +392,7 @@ table.log tr:hover td { background: var(--bg3); }
   <div class="stat-cell">
     <div class="lbl">BTC / USD</div>
     <div id="btc-price" class="num-xl">—</div>
+    <div id="btc-delta" style="font-size:13px;font-weight:600;margin-top:2px;">—</div>
     <div id="btc-src" class="lbl" style="margin-top:4px;margin-bottom:0;">—</div>
   </div>
   <div class="stat-cell">
@@ -725,6 +726,15 @@ function updateAll(d) {
   // BTC Price
   if (d.btc) {
     $('btc-price').textContent = '$' + fmt2(d.btc);
+    // движение от открытия свечи (в долларах)
+    const op = d.poly && d.poly.opening;
+    const dl = $('btc-delta');
+    if (op && dl) {
+      const diff = d.btc - op;
+      const sign = diff >= 0 ? '+' : '−';
+      dl.style.color = diff >= 0 ? 'var(--up)' : 'var(--dn)';
+      dl.textContent = `${sign}$${fmt2(Math.abs(diff))} от откр.`;
+    } else if (dl) { dl.textContent = '—'; }
     const src = d.ws === 'live' ? 'Coinbase WS'
               : d.ws === 'binance' ? 'Binance WS'
               : d.ws === 'kraken' ? 'Kraken WS'
