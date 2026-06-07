@@ -1525,7 +1525,7 @@ function makeManualStrat(i) {
     },
   };
 }
-const MANUAL_STRATS = [1,2,3,4,5,6,7,8].map(makeManualStrat);
+const MANUAL_STRATS = [1,2,3,4,5].map(makeManualStrat);
 
 // ── НОВЫЕ СИГНАЛЬНЫЕ (обоснованы калибровкой/персистентностью на чистых данных) ─
 // favHold — бэк сильного фаворита под закрытие, держим до резолва. Данные: рынок
@@ -1724,7 +1724,56 @@ const STRAT_CALM_REV = {
   shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p); },
 };
 
-const STRAT_DEFINITIONS = [STRAT_MOMENTUM, STRAT_MOM_SCRATCH, STRAT_MOM_HI, STRAT_MOM_CONFIRM, STRAT_UNDERDOG_HOLD, STRAT_FAV_HOLD, STRAT_LONG_HOLD, STRAT_LATE_MOM, STRAT_MOM_SCRATCH_HI, STRAT_BIG_MOVE, STRAT_TIME_SESSION, STRAT_FADE_BIG, STRAT_BIGMOVE_FAV, STRAT_FAV_HOLD_X, STRAT_LONG_HOLD_X, STRAT_CALM_REV, ...MANUAL_STRATS];
+// ── РЕЗОЛВ ОКНА ПО РЫНКУ (Chainlink-следящая цена), НЕ по нашему BTC-фиду ──────
+// Polymarket резолвит по потоку Chainlink BTC/USD. Наш Coinbase/Binance фид
+// расходится с ним на десятки $ и на ТОНКИХ окнах переворачивает знак движения →
+// в логах появлялись фантомные «победы» на SETTLE (доказано на реальной истории).
+// Истина: на закрытии окна выигравшая сторона книги стоит ~1.0. Её и берём.
+const RESOLVE_CONFIRM    = 0.90;    // сторона = победитель, если её норм-цена ≥ этого
+const SETTLE_MAX_WAIT_MS = 45000;   // ждём дорезолва рынка после конца окна, потом фолбэк на фид
+function marketResolvedWinner(ctx) {
+  const np = _normPoly(ctx);
+  if (!np) return null;
+  if (Math.max(np.up, np.dn) < RESOLVE_CONFIRM) return null;  // ещё не определился
+  return np.up > np.dn ? 'UP' : 'DOWN';
+}
+
+// ── UNDERDOG LOCK — как Underdog Hold, но за lockLeadMs до конца окна продаём
+// по РЫНКУ (bid), фиксируя ИЗВЕСТНУЮ цену вместо непроверяемого SETTLE. Убирает
+// фантомные исходы (всегда есть реальная цена выхода). Платой идёт асимметричный
+// апсайд андердога (продаём просадку, не дожидаясь возможного разворота к 1.0) —
+// поэтому это ОТДЕЛЬНАЯ стратегия для A/B-сравнения с Underdog Hold, а не замена.
+const STRAT_UNDERDOG_LOCK = {
+  id: 'underdogLock', name: 'Underdog Lock (фикс цены до резолва)',
+  desc: 'вход как Underdog Hold (дёшево 15–35¢), но за lockLeadMs до конца продаём по рынку — фиксируем известную цену вместо SETTLE',
+  defaults: { lo: 0.15, hi: 0.35, minTimeMs: 60000, tpAbs: 0.96, lockLeadMs: 20000, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) { return STRAT_UNDERDOG_HOLD.shouldEnter(ctx, p); },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    if (ctx.msToEnd <= p.lockLeadMs) {
+      const q = _sideQuote(pos.side);
+      const px = (q && q.bid != null) ? q.bid : mid;
+      return { reason: 'LOCK', exitPrice: px };
+    }
+    return null;
+  },
+};
+
+// Вариант Underdog Lock с фиксацией за 10с до конца (A/B против 20с-версии). Только 5m.
+// Ближе к концу — точнее цена, но выше риск, что продажа не зальётся до закрытия.
+const STRAT_UNDERDOG_LOCK10 = {
+  id: 'underdogLock10', name: 'Underdog Lock-10 (фикс за 10с)',
+  desc: 'как Underdog Lock, но продаём по рынку за 10с до конца окна — A/B против 20с-версии',
+  defaults: { ...STRAT_UNDERDOG_LOCK.defaults, lockLeadMs: 10000 },
+  shouldEnter(ctx, p) { return STRAT_UNDERDOG_HOLD.shouldEnter(ctx, p); },
+  shouldExit(ctx, pos, p) { return STRAT_UNDERDOG_LOCK.shouldExit(ctx, pos, p); },
+};
+
+// Активный набор: убраны мусорные стратегии (favHold/favHoldX/bigMove/bigMoveFav/
+// fadeBigMove/calmRev/longHoldX/timeSession — стабильный минус на всех чистых данных).
+// Ядро: momentum, momScratch, momHi, momConfirm, underdogHold(+Lock/Lock10), longHold, lateMom, momScratchHi.
+const STRAT_DEFINITIONS = [STRAT_MOMENTUM, STRAT_MOM_SCRATCH, STRAT_MOM_HI, STRAT_MOM_CONFIRM, STRAT_UNDERDOG_HOLD, STRAT_UNDERDOG_LOCK, STRAT_UNDERDOG_LOCK10, STRAT_LONG_HOLD, STRAT_LATE_MOM, STRAT_MOM_SCRATCH_HI, ...MANUAL_STRATS];
 
 // ─── REAL-TRADING RISK CONTROLS ──────────────────────────────────────────────
 // These guards exist to prevent the bot from spamming trades on dead markets
@@ -2210,10 +2259,21 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
   // adjustment), not a recomputed estimate. Falls back gracefully for sim.
   const shares = o.actualShares || o.plannedShares || (o.sizeUSDC / o.polyEntryPrice);
   let proceeds, won;
+  let settleViaFeed = false;
 
   if (reason === 'SETTLE') {
-    const settleBTC = ctx.curBTC;
-    won           = o.side === 'UP' ? settleBTC > o.btcAtEntry : settleBTC < o.btcAtEntry;
+    // НАСТОЯЩИЙ резолв: на закрытии выигравшая сторона книги стоит ~1.0 (следует за
+    // Chainlink). Берём ЕЁ, а не наш BTC-фид — фид расходится с Chainlink и на тонких
+    // окнах давал фантомные «победы». Фолбэк на фид только если рынок ещё не решился
+    // (помечаем dirty, такие записи отфильтровываются при анализе статистики).
+    const winner = marketResolvedWinner(ctx);
+    if (winner !== null) {
+      won = (o.side === winner);
+    } else {
+      const openRef = (ctx.openingBTC != null) ? ctx.openingBTC : o.btcAtEntry;
+      won = o.side === 'UP' ? ctx.curBTC > openRef : ctx.curBTC < openRef;
+      settleViaFeed = true;
+    }
     proceeds      = won ? shares * 1.0 : 0;
     exitPolyPrice = won ? 1.0 : 0.0;
   } else {
@@ -2222,7 +2282,7 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
   }
 
   const pnl   = proceeds - o.sizeUSDC;
-  const entry = { ...o, closeTime: Date.now(), reason, proceeds, pnl, won, btcAtClose: ctx.curBTC, polyExitPrice: exitPolyPrice, strategy: s.def.id, dirty: wsStatus === 'sim' ? 1 : 0 };
+  const entry = { ...o, closeTime: Date.now(), reason, proceeds, pnl, won, btcAtClose: ctx.curBTC, polyExitPrice: exitPolyPrice, strategy: s.def.id, dirty: (wsStatus === 'sim' || settleViaFeed) ? 1 : 0 };
   acct.balance    += proceeds;
   acct.peakBalance = Math.max(acct.peakBalance, acct.balance);
   acct.log.push(entry);
@@ -2505,6 +2565,11 @@ function processAccount(s, ctx, acct, isReal) {
       return;
     }
     if (Date.now() >= acct.open.expiryTime) {
+      // Ждём, пока рынок дорезолвится (выигравшая сторона дойдёт до ~1.0), чтобы
+      // зафиксировать НАСТОЯЩИЙ исход, а не гадать по BTC-фиду. Потолок ожидания —
+      // SETTLE_MAX_WAIT_MS, дальше закрываем с фолбэком на фид (запись помечается dirty).
+      const decisive = marketResolvedWinner(ctx) !== null;
+      if (!decisive && (Date.now() - acct.open.expiryTime) < SETTLE_MAX_WAIT_MS) return;
       stratClose(s, ctx, 'SETTLE', null, acct, isReal); return;
     }
     const exit = s.def.shouldExit(ctx, acct.open, s.params);

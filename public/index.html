@@ -179,6 +179,9 @@ body::before {
   padding: 14px;
   position: relative;
 }
+/* Ручные стратегии — фиолетовый акцент, чтобы отличать от авто */
+.manual-card { box-shadow: inset 4px 0 0 #9b78ff; border-color: rgba(155,120,255,.5) !important; }
+.manual-card .lbl { color: #b9a3ff; }
 
 /* DUAL ACCOUNT PANELS inside a strategy card */
 .acct-panels {
@@ -921,7 +924,7 @@ function updateStratCards(strats, polyData, realTrading) {
     if (!renderedCards.has(id)) {
       const card = document.createElement('div');
       card.id = 'scard-' + id;
-      card.className = 'strat-card';
+      card.className = s.manual ? 'strat-card manual-card' : 'strat-card';
       card.innerHTML = `
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
           <div class="lbl" style="margin-bottom:0;">${s.name}</div>
