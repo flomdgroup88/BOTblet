@@ -1525,7 +1525,7 @@ function makeManualStrat(i) {
     },
   };
 }
-const MANUAL_STRATS = [1,2,3,4,5].map(makeManualStrat);
+const MANUAL_STRATS = [1,2].map(makeManualStrat);  // 2 слота ручных стратегий
 
 // ── НОВЫЕ СИГНАЛЬНЫЕ (обоснованы калибровкой/персистентностью на чистых данных) ─
 // favHold — бэк сильного фаворита под закрытие, держим до резолва. Данные: рынок
@@ -1770,10 +1770,231 @@ const STRAT_UNDERDOG_LOCK10 = {
   shouldExit(ctx, pos, p) { return STRAT_UNDERDOG_LOCK.shouldExit(ctx, pos, p); },
 };
 
+// ─── НОВЫЕ UNDERDOG-ВАРИАЦИИ (A/B-тест ценовых коридоров и логики входа) ──────
+
+// UDG-A: узкий горб 0.27–0.35 (рынок ещё не уверен, но уже не крайний лузер)
+const STRAT_UDG_A = {
+  id: 'udgA', name: 'UDG-A (0.27–0.35)',
+  desc: 'underdog-вход в коридоре 27–35¢ — середина неопределённости',
+  defaults: { lo: 0.27, hi: 0.35, minTimeMs: 60000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const side  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const price = Math.min(np.up, np.dn);
+    if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.10, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `udgA ${side} @${(price*100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
+// UDG-B: широкий коридор 0.15–0.40 (максимальное покрытие андердогов)
+const STRAT_UDG_B = {
+  id: 'udgB', name: 'UDG-B (0.15–0.40)',
+  desc: 'underdog-вход 15–40¢ — широкий захват всего диапазона',
+  defaults: { lo: 0.15, hi: 0.40, minTimeMs: 60000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.09, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const side  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const price = Math.min(np.up, np.dn);
+    if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.10, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `udgB ${side} @${(price*100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
+// UDG-C: 0.20–0.35 (чуть отрезаем совсем дешёвые, берём середину)
+const STRAT_UDG_C = {
+  id: 'udgC', name: 'UDG-C (0.20–0.35)',
+  desc: 'underdog-вход 20–35¢ — без экстремально дешёвых',
+  defaults: { lo: 0.20, hi: 0.35, minTimeMs: 60000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const side  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const price = Math.min(np.up, np.dn);
+    if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.10, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `udgC ${side} @${(price*100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
+// UDG-D: 0.22–0.35 (ещё один срез — чуть выше нижней границы)
+const STRAT_UDG_D = {
+  id: 'udgD', name: 'UDG-D (0.22–0.35)',
+  desc: 'underdog-вход 22–35¢',
+  defaults: { lo: 0.22, hi: 0.35, minTimeMs: 60000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const side  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const price = Math.min(np.up, np.dn);
+    if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.10, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `udgD ${side} @${(price*100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
+// UDG-E: 0.22–0.40 (срез D, но с расширенным верхом)
+const STRAT_UDG_E = {
+  id: 'udgE', name: 'UDG-E (0.22–0.40)',
+  desc: 'underdog-вход 22–40¢ — от середины до верхней границы',
+  defaults: { lo: 0.22, hi: 0.40, minTimeMs: 60000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.09, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const side  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const price = Math.min(np.up, np.dn);
+    if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.10, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `udgE ${side} @${(price*100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
+// UDG-FAV: Реверсионный — берём СИЛЬНУЮ сторону 0.63–0.73 (фаворит, но не экстремальный).
+// Логика: рынок иногда переоценивает фаворита; входим против андердога, держим до резолва.
+const STRAT_UDG_FAV = {
+  id: 'udgFav', name: 'UDG-Fav (фаворит 0.63–0.73)',
+  desc: 'реверсионная: берём сильную сторону 63–73¢ — фаворит, но не перегретый',
+  defaults: { lo: 0.63, hi: 0.73, minTimeMs: 60000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.09, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    // Берём сильную сторону (фаворита) — ту, у которой цена выше
+    const favSide  = np.up >= np.dn ? 'UP' : 'DOWN';
+    const favPrice = Math.max(np.up, np.dn);
+    if (favPrice < p.lo || favPrice > p.hi) return null;
+    if (favPrice < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(favPrice + 0.08, favPrice);
+    return { side: favSide, polyPrice: favPrice, ourProb, edge: ourProb - favPrice, info: `udgFav ${favSide} @${(favPrice*100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
+// UDG-FLIP: «Первый разворот».
+// «Первый удар» = одна из сторон зашла в диапазон hitLo–hitHi (0.35→0.15).
+// Запоминаем эту сторону. Потом берём ДРУГУЮ сторону, когда она тоже зайдёт
+// в диапазон entryLo–entryHi (0.15–0.35). Не заходим за 3 мин до конца.
+const STRAT_UDG_FLIP = {
+  id: 'udgFlip', name: 'UDG-Flip (первый разворот)',
+  desc: 'первая сторона уходит в 0.15–0.35 (первый удар), берём другую сторону в 0.15–0.35; не за 3 мин до конца',
+  defaults: { hitLo: 0.15, hitHi: 0.35, entryLo: 0.15, entryHi: 0.35, minTimeMs: 180000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  _state: { seenHit: null },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const s = STRAT_UDG_FLIP._state;
+    // Сброс при смене окна
+    if (s.seenHit && ctx.win?.slug && s.seenHit.windowSlug !== ctx.win.slug) s.seenHit = null;
+    // Фиксируем «первый удар»: какая сторона сейчас в диапазоне hitLo–hitHi
+    // (только одна может быть андердогом в этом коридоре — та, что дешевле)
+    if (!s.seenHit) {
+      const dogPrice = Math.min(np.up, np.dn);
+      const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
+      if (dogPrice >= p.hitLo && dogPrice <= p.hitHi) {
+        s.seenHit = { side: dogSide, windowSlug: ctx.win?.slug };
+      }
+      return null;  // ждём — пока просто фиксируем первый удар
+    }
+    // Теперь ищем: ДРУГАЯ сторона (не та, что была первым ударом) вошла в entryLo–entryHi
+    const flipSide  = s.seenHit.side === 'UP' ? 'DOWN' : 'UP';
+    const flipPrice = flipSide === 'UP' ? np.up : np.dn;
+    if (flipPrice < p.entryLo || flipPrice > p.entryHi || flipPrice < MIN_ENTRY_PRICE) return null;
+    s.seenHit = null;  // входим один раз
+    const ourProb = _clampProb(flipPrice + 0.10, flipPrice);
+    return { side: flipSide, polyPrice: flipPrice, ourProb, edge: ourProb - flipPrice,
+             info: `udgFlip ${flipSide} @${(flipPrice*100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
+// UDG-FLIP-FAV: «Первый разворот реверсионный».
+// «Первый удар» = сторона зашла в диапазон 0.15–0.35 (hitLo–hitHi).
+// Потом ТА ЖЕ сторона вышла в коридор фаворита 0.63–0.73 — берём её.
+// Не заходим за 3 минуты до конца.
+const STRAT_UDG_FLIP_FAV = {
+  id: 'udgFlipFav', name: 'UDG-Flip Fav (разворот → фаворит)',
+  desc: 'сторона сначала в 0.15–0.35 (первый удар), потом вышла в 0.63–0.73 — берём её',
+  defaults: { hitLo: 0.15, hitHi: 0.35, favLo: 0.63, favHi: 0.73, minTimeMs: 180000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.09, maxFrac: 0.05 },
+  _state: { seenHit: null },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const s = STRAT_UDG_FLIP_FAV._state;
+    // Сброс при смене окна
+    if (s.seenHit && ctx.win?.slug && s.seenHit.windowSlug !== ctx.win.slug) s.seenHit = null;
+    // Фиксируем «первый удар»: одна из сторон зашла в hitLo–hitHi
+    if (!s.seenHit) {
+      const dogPrice = Math.min(np.up, np.dn);
+      const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
+      if (dogPrice >= p.hitLo && dogPrice <= p.hitHi) {
+        s.seenHit = { side: dogSide, windowSlug: ctx.win?.slug };
+      }
+      return null;
+    }
+    // Та же сторона что была первым ударом — теперь в диапазоне фаворита 0.63–0.73
+    const hitSide  = s.seenHit.side;
+    const hitPrice = hitSide === 'UP' ? np.up : np.dn;
+    if (hitPrice < p.favLo || hitPrice > p.favHi || hitPrice < MIN_ENTRY_PRICE) return null;
+    s.seenHit = null;
+    const ourProb = _clampProb(hitPrice + 0.08, hitPrice);
+    return { side: hitSide, polyPrice: hitPrice, ourProb, edge: ourProb - hitPrice,
+             info: `udgFlipFav ${hitSide} @${(hitPrice*100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
 // Активный набор: убраны мусорные стратегии (favHold/favHoldX/bigMove/bigMoveFav/
 // fadeBigMove/calmRev/longHoldX/timeSession — стабильный минус на всех чистых данных).
-// Ядро: momentum, momScratch, momHi, momConfirm, underdogHold(+Lock/Lock10), longHold, lateMom, momScratchHi.
-const STRAT_DEFINITIONS = [STRAT_MOMENTUM, STRAT_MOM_SCRATCH, STRAT_MOM_HI, STRAT_MOM_CONFIRM, STRAT_UNDERDOG_HOLD, STRAT_UNDERDOG_LOCK, STRAT_UNDERDOG_LOCK10, STRAT_LONG_HOLD, STRAT_LATE_MOM, STRAT_MOM_SCRATCH_HI, ...MANUAL_STRATS];
+// underdogLock/underdogLock10 исключены: стабильный убыток за 7 дней логов.
+// longHold/lateMom/momScratchHi убраны по запросу (изображения на скриншотах).
+// Ядро (опора): underdogHold, momentum. Новые UDG-вариации — A/B-тест коридоров.
+// manual1/manual2 — 2 слота ручных стратегий.
+const STRAT_DEFINITIONS = [
+  STRAT_UNDERDOG_HOLD, STRAT_MOMENTUM,
+  STRAT_MOM_SCRATCH, STRAT_MOM_HI, STRAT_MOM_CONFIRM,
+  STRAT_UDG_A, STRAT_UDG_B, STRAT_UDG_C, STRAT_UDG_D, STRAT_UDG_E,
+  STRAT_UDG_FAV, STRAT_UDG_FLIP, STRAT_UDG_FLIP_FAV,
+  ...MANUAL_STRATS,
+];
 
 // ─── REAL-TRADING RISK CONTROLS ──────────────────────────────────────────────
 // These guards exist to prevent the bot from spamming trades on dead markets

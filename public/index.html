@@ -182,6 +182,10 @@ body::before {
 /* Ручные стратегии — фиолетовый акцент, чтобы отличать от авто */
 .manual-card { box-shadow: inset 4px 0 0 #9b78ff; border-color: rgba(155,120,255,.5) !important; }
 .manual-card .lbl { color: #b9a3ff; }
+/* ОПОРНЫЕ стратегии (underdogHold, momentum) — золотой акцент, идут первыми */
+.pinned-card { box-shadow: inset 4px 0 0 #f0b429; background: rgba(240,180,41,.04) !important; }
+.pinned-card .lbl { color: #f0c060; }
+.pinned-badge { display:inline-block; font-size:8px; font-weight:700; letter-spacing:.05em; padding:1px 5px; border-radius:3px; background:rgba(240,180,41,.18); color:#f0b429; border:1px solid rgba(240,180,41,.35); margin-left:6px; vertical-align:middle; text-transform:uppercase; }
 
 /* DUAL ACCOUNT PANELS inside a strategy card */
 .acct-panels {
@@ -918,16 +922,29 @@ function acctPanelHtml(id, mode, label) {
     </div>`;
 }
 
+const PINNED_STRATS = new Set(['underdogHold', 'momentum']);
+
 function updateStratCards(strats, polyData, realTrading) {
   const grid = $('strat-grid');
-  for (const [id, s] of Object.entries(strats)) {
+  // Pinned стратегии — всегда первые в сетке
+  const pinnedOrder = ['underdogHold', 'momentum'];
+  const sortedEntries = Object.entries(strats).sort(([a], [b]) => {
+    const ai = pinnedOrder.indexOf(a), bi = pinnedOrder.indexOf(b);
+    if (ai !== -1 && bi !== -1) return ai - bi;
+    if (ai !== -1) return -1;
+    if (bi !== -1) return 1;
+    return 0;
+  });
+  for (const [id, s] of sortedEntries) {
     if (!renderedCards.has(id)) {
+      const isPinned = PINNED_STRATS.has(id);
       const card = document.createElement('div');
       card.id = 'scard-' + id;
-      card.className = s.manual ? 'strat-card manual-card' : 'strat-card';
+      card.className = s.manual ? 'strat-card manual-card' : (isPinned ? 'strat-card pinned-card' : 'strat-card');
+      const badge = isPinned ? '<span class="pinned-badge">★ опора</span>' : '';
       card.innerHTML = `
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
-          <div class="lbl" style="margin-bottom:0;">${s.name}</div>
+          <div class="lbl" style="margin-bottom:0;">${s.name}${badge}</div>
           <div style="display:flex;align-items:center;gap:6px;">
             <button id="sell-${id}" onclick="marketSell('${id}')" style="display:none;font-size:9px;padding:2px 8px;border:1px solid #e0556a;background:#e0556a;color:#fff;border-radius:4px;cursor:pointer;font-family:inherit;font-weight:600;">⚡ ПРОДАТЬ ПО РЫНКУ</button>
             <div id="spos-${id}" style="font-size:9px;"></div>
