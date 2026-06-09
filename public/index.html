@@ -176,6 +176,11 @@ body::before {
 }
 #strat-header:hover { background: var(--bg2); }
 #strat-header:hover #strat-chevron { color: var(--tx2); }
+.strat-card-header { cursor: pointer; user-select: none; }
+.strat-card-header:hover { opacity: .85; }
+.strat-card-chevron { font-size: 9px; color: var(--tx3); transition: transform .2s; flex-shrink: 0; }
+.strat-card-body { }
+.strat-card-body.collapsed { display: none; }
 .strat-card {
   background: var(--bg2);
   padding: 14px;
@@ -219,6 +224,16 @@ body::before {
   border-color: var(--bd) !important;
   box-shadow: none !important;
 }
+.acct-panel.acct-real {
+  background: rgba(255, 160, 50, 0.05) !important;
+  border-color: rgba(255, 160, 50, 0.3) !important;
+  box-shadow: inset 0 0 0 0 transparent !important;
+}
+.acct-panel.acct-real.acct-active {
+  background: rgba(255, 160, 50, 0.09) !important;
+  border-color: rgba(255, 160, 50, 0.55) !important;
+  box-shadow: 0 0 0 1px rgba(255, 160, 50, 0.18) !important;
+}
 .acct-panel.has-pos {
 }
 .acct-label {
@@ -229,7 +244,7 @@ body::before {
   margin-bottom: 6px;
 }
 .acct-demo .acct-label { color: var(--tx3); }
-.acct-real .acct-label { color: var(--tx3); }
+.acct-real .acct-label { color: #ffa032; letter-spacing: 2.5px; }
 
 .acct-header {
   display: flex;
@@ -530,13 +545,19 @@ table.log tr:hover td { background: var(--bg3); }
 </div>
 
 <!-- ⚙️ НАСТРОЙКИ СТРАТЕГИИ + ИНВЕРСИЯ -->
-<div style="padding:16px;background:var(--bg);border-top:1px solid var(--bd);">
-  <div onclick="document.getElementById('cfgBody').style.display = document.getElementById('cfgBody').style.display==='none'?'block':'none';" style="cursor:pointer;display:flex;align-items:center;gap:8px;margin-bottom:12px;">
-    <div class="lbl" style="margin-bottom:0;">⚙️ Настройки — параметры входа и режим торговли</div>
-    <span style="color:var(--tx3);font-size:10px;">(нажми, чтобы свернуть)</span>
+<div style="background:var(--bg);border-top:1px solid var(--bd);">
+  <div onclick="toggleCfgSection()" id="cfg-header" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:8px 14px;border-bottom:1px solid var(--bd);user-select:none;">
+    <div style="display:flex;align-items:center;gap:8px;">
+      <span style="font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--tx2);text-transform:uppercase;">⚙️ Настройки — параметры входа и режим торговли</span>
+      <span style="color:var(--tx3);font-size:9px;">(нажми, чтобы свернуть)</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span id="cfg-collapse-hint" style="font-size:9px;color:var(--tx3);">скрыть</span>
+      <span id="cfg-chevron" style="font-size:11px;color:var(--tx3);transition:transform .2s;">▲</span>
+    </div>
   </div>
 
-  <div id="cfgBody">
+  <div id="cfgBody" style="padding:16px;">
     <!-- 🆘 РУЧНОЙ ВЫХОД ПО РЫНКУ (видно только при открытой реальной позиции) -->
     <div id="panicBlock" style="display:none;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px;padding:14px;background:rgba(224,85,106,.08);border:1px solid rgba(224,85,106,.5);border-radius:8px;">
       <div style="flex:1;min-width:220px;">
@@ -660,13 +681,22 @@ table.log tr:hover td { background: var(--bg3); }
 </style>
 
 <!-- РУЧНЫЕ ПАРАМЕТРИЧЕСКИЕ СТРАТЕГИИ -->
-<div style="padding:16px;background:var(--bg);border-top:1px solid var(--bd);">
-  <div class="lbl" style="cursor:pointer;" onclick="document.getElementById('manualWrap').style.display = document.getElementById('manualWrap').style.display==='none'?'block':'none';">
-    🎛 Ручные стратегии — единая форма настройки (нажми, чтобы свернуть)
+<div style="background:var(--bg);border-top:1px solid var(--bd);">
+  <div onclick="toggleManualSection()" id="manual-header" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:8px 14px;border-bottom:1px solid var(--bd);user-select:none;">
+    <div style="display:flex;align-items:center;gap:8px;">
+      <span style="font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--tx2);text-transform:uppercase;">🎛 Ручные стратегии — единая форма настройки</span>
+      <span style="color:var(--tx3);font-size:9px;">(нажми, чтобы свернуть)</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span id="manual-collapse-hint" style="font-size:9px;color:var(--tx3);">скрыть</span>
+      <span id="manual-chevron" style="font-size:11px;color:var(--tx3);transition:transform .2s;">▲</span>
+    </div>
   </div>
-  <div style="font-size:11px;color:var(--tx3);margin:6px 0 12px;">Настрой параметры → выбери слот → «Сохранить». Форма не сбрасывается — меняй слот и сохраняй следующую. Работа каждой видна карточкой в общей сетке выше (баланс, сделки, спред и задержка — как у авто-стратегий).</div>
-  <div id="manualWrap"></div>
-  <span id="manMsg" style="font-size:11px;color:var(--up);min-height:14px;display:block;margin-top:6px;"></span>
+  <div id="manualBody" style="padding:16px;">
+    <div style="font-size:11px;color:var(--tx3);margin-bottom:12px;">Настрой параметры → выбери слот → «Сохранить». Форма не сбрасывается — меняй слот и сохраняй следующую. Работа каждой видна карточкой в общей сетке выше (баланс, сделки, спред и задержка — как у авто-стратегий).</div>
+    <div id="manualWrap"></div>
+    <span id="manMsg" style="font-size:11px;color:var(--up);min-height:14px;display:block;margin-top:6px;"></span>
+  </div>
 </div>
 
 <!-- RECENT TRADES LOG -->
@@ -917,8 +947,75 @@ function _applyStratGridVisibility() {
   }
 }
 
+function _isCardCollapsed(id) {
+  return localStorage.getItem('cardCollapsed:' + id) === '1';
+}
+
+function _applyCardCollapse(id) {
+  const body    = document.getElementById('scbody-' + id);
+  const chevron = document.getElementById('schev-' + id);
+  if (!body) return;
+  const collapsed = _isCardCollapsed(id);
+  body.classList.toggle('collapsed', collapsed);
+  if (chevron) chevron.style.transform = collapsed ? 'rotate(180deg)' : 'rotate(0deg)';
+}
+
+function toggleCardCollapse(id) {
+  const collapsed = _isCardCollapsed(id);
+  localStorage.setItem('cardCollapsed:' + id, collapsed ? '0' : '1');
+  _applyCardCollapse(id);
+}
+
 // Apply immediately on page load
 document.addEventListener('DOMContentLoaded', _applyStratGridVisibility);
+
+// ── CFG SECTION COLLAPSE ──────────────────────────────────────────────────────
+let _cfgVisible = localStorage.getItem('cfgVisible') !== '0';
+function _applyCfgVisibility() {
+  const body    = document.getElementById('cfgBody');
+  const hint    = document.getElementById('cfg-collapse-hint');
+  const chevron = document.getElementById('cfg-chevron');
+  if (!body) return;
+  if (_cfgVisible) {
+    body.style.display = '';
+    if (hint)    hint.textContent = 'скрыть';
+    if (chevron) chevron.style.transform = 'rotate(0deg)';
+  } else {
+    body.style.display = 'none';
+    if (hint)    hint.textContent = 'показать';
+    if (chevron) chevron.style.transform = 'rotate(180deg)';
+  }
+}
+function toggleCfgSection() {
+  _cfgVisible = !_cfgVisible;
+  localStorage.setItem('cfgVisible', _cfgVisible ? '1' : '0');
+  _applyCfgVisibility();
+}
+document.addEventListener('DOMContentLoaded', _applyCfgVisibility);
+
+// ── MANUAL SECTION COLLAPSE ───────────────────────────────────────────────────
+let _manualVisible = localStorage.getItem('manualVisible') !== '0';
+function _applyManualVisibility() {
+  const body    = document.getElementById('manualBody');
+  const hint    = document.getElementById('manual-collapse-hint');
+  const chevron = document.getElementById('manual-chevron');
+  if (!body) return;
+  if (_manualVisible) {
+    body.style.display = '';
+    if (hint)    hint.textContent = 'скрыть';
+    if (chevron) chevron.style.transform = 'rotate(0deg)';
+  } else {
+    body.style.display = 'none';
+    if (hint)    hint.textContent = 'показать';
+    if (chevron) chevron.style.transform = 'rotate(180deg)';
+  }
+}
+function toggleManualSection() {
+  _manualVisible = !_manualVisible;
+  localStorage.setItem('manualVisible', _manualVisible ? '1' : '0');
+  _applyManualVisibility();
+}
+document.addEventListener('DOMContentLoaded', _applyManualVisibility);
 
 const renderedCards = new Set();
 
@@ -1002,24 +1099,27 @@ function updateStratCards(strats, polyData, realTrading) {
                      : 'strat-card';
       const badge = isPinned ? '<span class="pinned-badge">★ опора</span>' : '';
       card.innerHTML = `
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+        <div class="strat-card-header" onclick="toggleCardCollapse('${id}')" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
           <div class="lbl" style="margin-bottom:0;">${s.name}${badge}</div>
           <div style="display:flex;align-items:center;gap:6px;">
-            <button id="sell-${id}" onclick="marketSell('${id}')" style="display:none;font-size:9px;padding:2px 8px;border:1px solid #e0556a;background:#e0556a;color:#fff;border-radius:4px;cursor:pointer;font-family:inherit;font-weight:600;">⚡ ПРОДАТЬ ПО РЫНКУ</button>
+            <button id="sell-${id}" onclick="event.stopPropagation();marketSell('${id}')" style="display:none;font-size:9px;padding:2px 8px;border:1px solid #e0556a;background:#e0556a;color:#fff;border-radius:4px;cursor:pointer;font-family:inherit;font-weight:600;">⚡ ПРОДАТЬ ПО РЫНКУ</button>
             <div id="spos-${id}" style="font-size:9px;"></div>
+            <span id="schev-${id}" class="strat-card-chevron">▲</span>
           </div>
         </div>
-        <div class="acct-panels">
-          ${acctPanelHtml(id, 'demo', '▣ DEMO')}
-          ${acctPanelHtml(id, 'real', '◈ REAL')}
-        </div>
-        <div style="display:flex;align-items:center;gap:6px;margin-top:5px;font-size:10px;color:var(--tx3);flex-wrap:wrap;">
-          <button id="sch-btn-${id}" data-on="${s.schedEnabled?1:0}" class="toggle-btn ${s.schedEnabled?'on':'off'}" onclick="schedTog('${id}')" style="font-size:9px;padding:2px 7px;">${s.schedEnabled?('⏰ '+(s.schedFrom??7)+'-'+(s.schedTo??24)):'⏰ 24/7'}</button>
-          <span>с</span><input id="sch-from-${id}" type="number" min="0" max="24" value="${s.schedFrom??7}" style="width:42px;background:var(--bg);border:1px solid var(--bd);border-radius:4px;color:var(--tx1);padding:2px 4px;font-family:inherit;">
-          <span>до</span><input id="sch-to-${id}" type="number" min="0" max="24" value="${s.schedTo??24}" style="width:42px;background:var(--bg);border:1px solid var(--bd);border-radius:4px;color:var(--tx1);padding:2px 4px;font-family:inherit;">
-          <span>МСК</span>
-          <button onclick="schedSave('${id}')" style="font-size:9px;padding:2px 7px;border:1px solid rgba(0,232,122,.5);background:transparent;color:var(--up);border-radius:4px;cursor:pointer;font-family:inherit;">💾</button>
-          <span id="sch-msg-${id}" style="color:var(--tx3);"></span>
+        <div id="scbody-${id}" class="strat-card-body">
+          <div class="acct-panels">
+            ${acctPanelHtml(id, 'demo', '▣ DEMO')}
+            ${acctPanelHtml(id, 'real', '◈ REAL')}
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;margin-top:5px;font-size:10px;color:var(--tx3);flex-wrap:wrap;">
+            <button id="sch-btn-${id}" data-on="${s.schedEnabled?1:0}" class="toggle-btn ${s.schedEnabled?'on':'off'}" onclick="schedTog('${id}')" style="font-size:9px;padding:2px 7px;">${s.schedEnabled?('⏰ '+(s.schedFrom??7)+'-'+(s.schedTo??24)):'⏰ 24/7'}</button>
+            <span>с</span><input id="sch-from-${id}" type="number" min="0" max="24" value="${s.schedFrom??7}" style="width:42px;background:var(--bg);border:1px solid var(--bd);border-radius:4px;color:var(--tx1);padding:2px 4px;font-family:inherit;">
+            <span>до</span><input id="sch-to-${id}" type="number" min="0" max="24" value="${s.schedTo??24}" style="width:42px;background:var(--bg);border:1px solid var(--bd);border-radius:4px;color:var(--tx1);padding:2px 4px;font-family:inherit;">
+            <span>МСК</span>
+            <button onclick="schedSave('${id}')" style="font-size:9px;padding:2px 7px;border:1px solid rgba(0,232,122,.5);background:transparent;color:var(--up);border-radius:4px;cursor:pointer;font-family:inherit;">💾</button>
+            <span id="sch-msg-${id}" style="color:var(--tx3);"></span>
+          </div>
         </div>`;
       // Insert in sorted position instead of always appending
       const myOrder = orderOf(id);
@@ -1031,6 +1131,7 @@ function updateStratCards(strats, polyData, realTrading) {
       if (insertBefore) grid.insertBefore(card, insertBefore);
       else grid.appendChild(card);
       renderedCards.add(id);
+      _applyCardCollapse(id);
     }
 
     // Update each account panel
