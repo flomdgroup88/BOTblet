@@ -2174,8 +2174,9 @@ const STRAT_UDG_SKIP3 = {
     }
     if (losses < p.skipAfter) return null; // серия ещё не набралась — ждём
 
-    // Серия набралась — сбрасываем счётчик: новые лузы будем считать с текущего конца лога
-    if (selfStrat) selfStrat._skip3ResetIdx = log.length;
+    // НЕ сбрасываем _skip3ResetIdx здесь: shouldEnter вызывается дважды при demo-delay
+    // (1й раз — фиксируем pendingEntry, 2й — верифицируем перед входом).
+    // Сброс происходит в stratOpen() — только когда вход реально состоялся.
 
     const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
     return {
@@ -2230,7 +2231,7 @@ const STRAT_UDG_SKIP3_B = {
     }
     if (losses < p.skipAfter) return null;
 
-    if (selfStrat) selfStrat._skip3ResetIdx = log.length;
+    // Сброс _skip3ResetIdx — в stratOpen(), не здесь (см. комментарий в udgSkip3).
 
     const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
     return {
@@ -2285,7 +2286,7 @@ const STRAT_UDG_SKIP3_C = {
     }
     if (losses < p.skipAfter) return null;
 
-    if (selfStrat) selfStrat._skip3ResetIdx = log.length;
+    // Сброс _skip3ResetIdx — в stratOpen(), не здесь (см. комментарий в udgSkip3).
 
     const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
     return {
@@ -2341,7 +2342,7 @@ const STRAT_UDG_SKIP3_D = {
     }
     if (losses < p.skipAfter) return null;
 
-    if (selfStrat) selfStrat._skip3ResetIdx = log.length;
+    // Сброс _skip3ResetIdx — в stratOpen(), не здесь (см. комментарий в udgSkip3).
 
     const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
     return {
@@ -2396,7 +2397,7 @@ const STRAT_UDG_SKIP3_E = {
     }
     if (losses < p.skipAfter) return null;
 
-    if (selfStrat) selfStrat._skip3ResetIdx = log.length;
+    // Сброс _skip3ResetIdx — в stratOpen(), не здесь (см. комментарий в udgSkip3).
 
     const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
     return {
@@ -2792,6 +2793,20 @@ function stratOpen(s, ctx, entry, acct, isReal) {
     s.pendingReal = true;
     s.realTradesThisWindow = (s.realTradesThisWindow || 0) + 1;
   }
+  // ── Skip-фильтр: сбрасываем точку отсчёта лузов только здесь, при реальном входе.
+  // Нельзя делать это в shouldEnter: demo-delay вызывает shouldEnter дважды
+  // (1й раз — фиксирует pendingEntry, 2й — верифицирует сигнал перед входом).
+  // Если сбрасывать в shouldEnter, 2й вызов видит resetIdx уже сдвинутым → сигнал
+  // исчезает → вход никогда не происходит. Все 5 UDG-SKIP-стратегий используют
+  // поле _skip3ResetIdx на своём объекте стратегии.
+  if (s._skip3ResetIdx != null) {
+    const ref = STRATEGIES['underdogHold'];
+    if (ref && ref.demo) {
+      s._skip3ResetIdx = ref.demo.log.length;
+      console.log(`[${s.def.id}] skip-reset → _skip3ResetIdx=${s._skip3ResetIdx}`);
+    }
+  }
+
   logCalibEntry(s, ctx, entry, acct, isReal);
   saveState();
   console.log(`[${s.def.id}] ${isRealOrder ? 'REAL' : 'SIM'} OPEN ${entry.side} @ ${entry.polyPrice.toFixed(3)} size=$${sizeUSDC.toFixed(2)} (balance=$${effectiveBalance.toFixed(2)}) | ${entry.info}`);
