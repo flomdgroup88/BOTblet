@@ -122,7 +122,12 @@ let poly = {
   lastErr: null,
   windowOpeningBTC: null,
   windowOpeningSource: null,
+  // История окон для стрик/волатильность-фильтров (только новые стратегии используют).
+  winHist: [],        // [{slug, winner:'UP'|'DOWN', move, range}] — самые свежие в конце
+  winHi: null,        // max BTC в текущем окне (для range)
+  winLo: null,        // min BTC в текущем окне
 };
+const WINHIST_MAX = 40;
 let polyClobOk = true;
 
 // Chainlink
@@ -617,6 +622,24 @@ async function fetchPolyMarket() {
 
   if (slugChanged) {
     poly.status = 'searching';
+    // ── Зафиксировать ЗАВЕРШЁННОЕ окно в историю (до перезаписи opening/prices) ──
+    // Победитель — по последней цене книги (≥98¢, как настоящий резолв). Если окно
+    // не дорезолвилось в книге — пропускаем запись (не засоряем историю догадкой).
+    try {
+      if (poly.market && poly.prices && poly.prices.up != null && poly.prices.down != null) {
+        const u = poly.prices.up, d = poly.prices.down;
+        const hi = Math.max(u, d), lo = Math.min(u, d);
+        if (hi >= RESOLVE_CONFIRM && lo <= (1 - RESOLVE_CONFIRM)) {
+          const curBTC = chain.currentPrice || (ticks.length ? ticks[ticks.length - 1].price : null);
+          const move = (curBTC != null && poly.windowOpeningBTC != null) ? (curBTC - poly.windowOpeningBTC) : 0;
+          const range = (poly.winHi != null && poly.winLo != null) ? (poly.winHi - poly.winLo) : Math.abs(move);
+          poly.winHist.push({ slug: poly.market.eventSlug, winner: u > d ? 'UP' : 'DOWN',
+                              move: +move.toFixed(2), range: +range.toFixed(2) });
+          if (poly.winHist.length > WINHIST_MAX) poly.winHist.shift();
+        }
+      }
+    } catch (_) {}
+    poly.winHi = null; poly.winLo = null;   // сброс экстремумов под новое окно
     try {
       const ev     = await fetchPolyEvent(win.slug);
       const parsed = parseEventMarket(ev);
@@ -1729,13 +1752,17 @@ const STRAT_CALM_REV = {
 // расходится с ним на десятки $ и на ТОНКИХ окнах переворачивает знак движения →
 // в логах появлялись фантомные «победы» на SETTLE (доказано на реальной истории).
 // Истина: на закрытии окна выигравшая сторона книги стоит ~1.0. Её и берём.
-const RESOLVE_CONFIRM    = 0.90;    // сторона = победитель, если её норм-цена ≥ этого
-const SETTLE_MAX_WAIT_MS = 45000;   // ждём дорезолва рынка после конца окна, потом фолбэк на фид
+const RESOLVE_CONFIRM    = 0.98;    // сторона = ПОБЕДИТЕЛЬ только если её цена ≥ 98¢ И проигравший ≤ 2¢.
+                                    // 90¢ — это НЕ резолв: на тонком окне сторона может коснуться
+                                    // 90–95¢ и всё равно проиграть → раньше это давало фантомные победы.
+const SETTLE_MAX_WAIT_MS = 60000;   // ждём ИСТИННОГО дорезолва (до ~1.0/0.0), затем фолбэк на фид (dirty=1)
 function marketResolvedWinner(ctx) {
-  const np = _normPoly(ctx);
-  if (!np) return null;
-  if (Math.max(np.up, np.dn) < RESOLVE_CONFIRM) return null;  // ещё не определился
-  return np.up > np.dn ? 'UP' : 'DOWN';
+  const up = ctx.polyUp, dn = ctx.polyDn;
+  if (up == null || dn == null) return null;
+  const hi = Math.max(up, dn), lo = Math.min(up, dn);
+  // Истинный резолв книги: победитель ~1.0 И проигравший ~0.0. Иначе окно ещё не решилось.
+  if (hi < RESOLVE_CONFIRM || lo > (1 - RESOLVE_CONFIRM)) return null;
+  return up > dn ? 'UP' : 'DOWN';
 }
 
 // ── UNDERDOG LOCK — как Underdog Hold, но за lockLeadMs до конца окна продаём
@@ -1907,33 +1934,30 @@ const STRAT_UDG_FAV = {
 // в диапазон entryLo–entryHi (0.15–0.35). Не заходим за 3 мин до конца.
 const STRAT_UDG_FLIP = {
   id: 'udgFlip', name: 'UDG-Flip (первый разворот)',
-  desc: 'первая сторона уходит в 0.15–0.35 (первый удар), берём другую сторону в 0.15–0.35; не за 3 мин до конца',
-  defaults: { hitLo: 0.15, hitHi: 0.35, entryLo: 0.15, entryHi: 0.35, minTimeMs: 180000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
-  _state: { seenHit: null },
+  desc: 'одна сторона коснулась 0.15–0.35 в первые 2 мин (НЕ берём) → ждём → когда ПРОТИВОПОЛОЖНАЯ сторона входит в 0.15–0.35, берём её. Вход не в последние 60с.',
+  defaults: { hitLo: 0.15, hitHi: 0.35, entryLo: 0.15, entryHi: 0.35, setupMaxElapsedMs: 120000, minTimeMs: 60000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  _state: { slug: null, hitSide: null, entered: false },
   shouldEnter(ctx, p) {
-    if (ctx.msToEnd < p.minTimeMs) return null;
     const np = _normPoly(ctx); if (!np) return null;
-    const s = STRAT_UDG_FLIP._state;
-    // Сброс при смене окна
-    if (s.seenHit && ctx.win?.slug && s.seenHit.windowSlug !== ctx.win.slug) s.seenHit = null;
-    // Фиксируем «первый удар»: какая сторона сейчас в диапазоне hitLo–hitHi
-    // (только одна может быть андердогом в этом коридоре — та, что дешевле)
-    if (!s.seenHit) {
-      const dogPrice = Math.min(np.up, np.dn);
-      const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
-      if (dogPrice >= p.hitLo && dogPrice <= p.hitHi) {
-        s.seenHit = { side: dogSide, windowSlug: ctx.win?.slug };
-      }
-      return null;  // ждём — пока просто фиксируем первый удар
+    const st = STRAT_UDG_FLIP._state;
+    if (st.slug !== ctx.win?.slug) { st.slug = ctx.win?.slug; st.hitSide = null; st.entered = false; }  // новое окно → сброс
+    if (st.entered) return null;
+    const elapsed  = (POLY_WINDOW_SEC * 1000) - ctx.msToEnd;
+    const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const dogPrice = Math.min(np.up, np.dn);
+    // 1) АРМ: первый удар одной стороны в коридор — только в первые 2 мин, вход НЕ делаем
+    if (st.hitSide === null) {
+      if (elapsed <= p.setupMaxElapsedMs && dogPrice >= p.hitLo && dogPrice <= p.hitHi) st.hitSide = dogSide;
+      return null;
     }
-    // Теперь ищем: ДРУГАЯ сторона (не та, что была первым ударом) вошла в entryLo–entryHi
-    const flipSide  = s.seenHit.side === 'UP' ? 'DOWN' : 'UP';
-    const flipPrice = flipSide === 'UP' ? np.up : np.dn;
-    if (flipPrice < p.entryLo || flipPrice > p.entryHi || flipPrice < MIN_ENTRY_PRICE) return null;
-    s.seenHit = null;  // входим один раз
-    const ourProb = _clampProb(flipPrice + 0.10, flipPrice);
-    return { side: flipSide, polyPrice: flipPrice, ourProb, edge: ourProb - flipPrice,
-             info: `udgFlip ${flipSide} @${(flipPrice*100).toFixed(0)}¢` };
+    // 2) РАЗВОРОТ: дешёвой стала ПРОТИВОПОЛОЖНАЯ сторона → берём её
+    if (ctx.msToEnd < p.minTimeMs) return null;        // не входим в последние 60с
+    if (dogSide === st.hitSide) return null;           // та же сторона ещё дешёвая — ждём флип
+    if (dogPrice < p.entryLo || dogPrice > p.entryHi || dogPrice < MIN_ENTRY_PRICE) return null;
+    st.entered = true;                                 // один вход за окно
+    const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
+    return { side: dogSide, polyPrice: dogPrice, ourProb, edge: ourProb - dogPrice,
+             info: `udgFlip ${dogSide} @${(dogPrice*100).toFixed(0)}¢ flip←${st.hitSide}` };
   },
   shouldExit(ctx, pos, p) {
     const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
@@ -1942,38 +1966,33 @@ const STRAT_UDG_FLIP = {
   },
 };
 
-// UDG-FLIP-FAV: «Первый разворот реверсионный».
-// «Первый удар» = сторона зашла в диапазон 0.15–0.35 (hitLo–hitHi).
-// Потом ТА ЖЕ сторона вышла в коридор фаворита 0.63–0.73 — берём её.
-// Не заходим за 3 минуты до конца.
+// UDG-FLIP-FAV: «Первый удар → берём восстановившуюся сторону как ФАВОРИТА».
+// Сторона коснулась 0.15–0.35 в первые 2 мин (первый удар), затем ТА ЖЕ сторона
+// восстановилась в коридор фаворита 0.63–0.73 — берём её (ставка, что разворот держится).
 const STRAT_UDG_FLIP_FAV = {
   id: 'udgFlipFav', name: 'UDG-Flip Fav (разворот → фаворит)',
-  desc: 'сторона сначала в 0.15–0.35 (первый удар), потом вышла в 0.63–0.73 — берём её',
-  defaults: { hitLo: 0.15, hitHi: 0.35, favLo: 0.63, favHi: 0.73, minTimeMs: 180000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.09, maxFrac: 0.05 },
-  _state: { seenHit: null },
+  desc: 'сторона коснулась 0.15–0.35 в первые 2 мин, затем ВЫШЛА в 0.63–0.73 (восстановилась) — берём её. Вход не в последние 60с.',
+  defaults: { hitLo: 0.15, hitHi: 0.35, favLo: 0.63, favHi: 0.73, setupMaxElapsedMs: 120000, minTimeMs: 60000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.09, maxFrac: 0.05 },
+  _state: { slug: null, hitSide: null, entered: false },
   shouldEnter(ctx, p) {
-    if (ctx.msToEnd < p.minTimeMs) return null;
     const np = _normPoly(ctx); if (!np) return null;
-    const s = STRAT_UDG_FLIP_FAV._state;
-    // Сброс при смене окна
-    if (s.seenHit && ctx.win?.slug && s.seenHit.windowSlug !== ctx.win.slug) s.seenHit = null;
-    // Фиксируем «первый удар»: одна из сторон зашла в hitLo–hitHi
-    if (!s.seenHit) {
-      const dogPrice = Math.min(np.up, np.dn);
-      const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
-      if (dogPrice >= p.hitLo && dogPrice <= p.hitHi) {
-        s.seenHit = { side: dogSide, windowSlug: ctx.win?.slug };
-      }
+    const st = STRAT_UDG_FLIP_FAV._state;
+    if (st.slug !== ctx.win?.slug) { st.slug = ctx.win?.slug; st.hitSide = null; st.entered = false; }
+    if (st.entered) return null;
+    const elapsed  = (POLY_WINDOW_SEC * 1000) - ctx.msToEnd;
+    const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const dogPrice = Math.min(np.up, np.dn);
+    if (st.hitSide === null) {
+      if (elapsed <= p.setupMaxElapsedMs && dogPrice >= p.hitLo && dogPrice <= p.hitHi) st.hitSide = dogSide;
       return null;
     }
-    // Та же сторона что была первым ударом — теперь в диапазоне фаворита 0.63–0.73
-    const hitSide  = s.seenHit.side;
-    const hitPrice = hitSide === 'UP' ? np.up : np.dn;
-    if (hitPrice < p.favLo || hitPrice > p.favHi || hitPrice < MIN_ENTRY_PRICE) return null;
-    s.seenHit = null;
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const hitPrice = st.hitSide === 'UP' ? np.up : np.dn;     // цена стороны первого удара
+    if (hitPrice < p.favLo || hitPrice > p.favHi || hitPrice < MIN_ENTRY_PRICE) return null;  // ждём её восстановления в коридор фаворита
+    st.entered = true;
     const ourProb = _clampProb(hitPrice + 0.08, hitPrice);
-    return { side: hitSide, polyPrice: hitPrice, ourProb, edge: ourProb - hitPrice,
-             info: `udgFlipFav ${hitSide} @${(hitPrice*100).toFixed(0)}¢` };
+    return { side: st.hitSide, polyPrice: hitPrice, ourProb, edge: ourProb - hitPrice,
+             info: `udgFlipFav ${st.hitSide} @${(hitPrice*100).toFixed(0)}¢ recovered` };
   },
   shouldExit(ctx, pos, p) {
     const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
@@ -1988,11 +2007,124 @@ const STRAT_UDG_FLIP_FAV = {
 // longHold/lateMom/momScratchHi убраны по запросу (изображения на скриншотах).
 // Ядро (опора): underdogHold, momentum. Новые UDG-вариации — A/B-тест коридоров.
 // manual1/manual2 — 2 слота ручных стратегий.
+// ── НОВЫЕ ТЕСТ-СТРАТЕГИИ (торгуют демо; рабочее ядро не трогают) ──────────────
+// udgVol: тугой коридор 0.22–0.35 + НЕ входим в «штиль». Фильтр активности пред.
+// окна подтверждён на твоих данных (ROI +8%→+16%). minPrevMove — порог |движения| $.
+const STRAT_UDG_VOL = {
+  id: 'udgVol', name: 'UDG-Vol (фильтр волатильности)',
+  desc: 'underdog 0.22–0.35; вход ТОЛЬКО если предыдущее окно было активным (|move| ≥ minPrevMove). Пропускает штиль.',
+  defaults: { lo: 0.22, hi: 0.35, minTimeMs: 60000, tpAbs: 0.96, minPrevMove: 60, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    if (ctx.prevMove == null || ctx.prevMove < p.minPrevMove) return null;   // штиль / нет истории → пропуск
+    const np = _normPoly(ctx); if (!np) return null;
+    const side  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const price = Math.min(np.up, np.dn);
+    if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.10, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `udgVol ${side} @${(price*100).toFixed(0)}¢ prev$${ctx.prevMove.toFixed(0)}` };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
+// udgStreak: ЭКСПЕРИМЕНТ. Вход только когда серия одинаковых исходов подряд в полосе
+// [minStreak..maxStreak]. Сигнал серии НЕСТАБИЛЕН на историч. данных (разные выборки —
+// разный знак), поэтому это стратегия для сбора чистого форвард-теста. Всё настраивается.
+const STRAT_UDG_STREAK = {
+  id: 'udgStreak', name: 'UDG-Streak (по серии исходов)',
+  desc: 'underdog 0.22–0.35; вход только если предыдущие исходы шли подряд в одну сторону: streak в [minStreak..maxStreak]. Тест «после серии — разворот».',
+  defaults: { lo: 0.22, hi: 0.35, minTimeMs: 60000, tpAbs: 0.96, minStreak: 3, maxStreak: 6, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    if (ctx.outcomeStreak < p.minStreak || ctx.outcomeStreak > p.maxStreak) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const side  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const price = Math.min(np.up, np.dn);
+    if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.10, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `udgStreak ${side} @${(price*100).toFixed(0)}¢ strk${ctx.outcomeStreak}${ctx.streakDir||''}` };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
+// udgBest: лучший коридор по бектесту — узкий центр 0.22–0.32 (ROI +23–26% за июнь).
+const STRAT_UDG_BEST = {
+  id: 'udgBest', name: 'UDG-Best (0.22–0.32)',
+  desc: 'underdog-вход 0.22–0.32 — самый сильный коридор по бектесту (узкий центр).',
+  defaults: { lo: 0.22, hi: 0.32, minTimeMs: 60000, tpAbs: 0.96, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const side  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const price = Math.min(np.up, np.dn);
+    if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.10, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `udgBest ${side} @${(price*100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
+// udgScore: КОМПЛЕКСНАЯ мультифакторная стратегия. Считает балл качества входа из
+// трёх подтверждённых факторов (волатильность пред. окна + центральность цены в
+// коридоре + US-сессия), штрафует слишком дешёвый андердог. Входит только если
+// score ≥ minScore, а РАЗМЕР масштабируется баллом — через ourProb (его двигает Kelly):
+// чем выше score, тем выше ourProb → больше ставка. Книжный дисбаланс (obi) пока не
+// учитываем — он не считается вживую без доп. данных стакана.
+const STRAT_UDG_SCORE = {
+  id: 'udgScore', name: 'UDG-Score (мультифактор + Kelly)',
+  desc: 'балл качества: волатильность пред. окна + центр коридора 0.22–0.32 + US-сессия (14–23 UTC). Вход при score ≥ minScore, размер растёт с баллом.',
+  defaults: { lo: 0.15, hi: 0.40, minTimeMs: 60000, tpAbs: 0.96,
+              volLo: 30, volHi: 90, center: 0.27, halfW: 0.10,
+              wVol: 1.0, wCorr: 1.0, wSess: 0.6, minScore: 0.45, edgeMax: 0.14,
+              maxPerWindow: 1, kellyFrac: 0.12, maxFrac: 0.06 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const side  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const price = Math.min(np.up, np.dn);
+    if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+    // Фактор 1: волатильность предыдущего окна (0..1)
+    const vol      = (ctx.prevMove != null) ? ctx.prevMove : 0;
+    const volScore = Math.max(0, Math.min(1, (vol - p.volLo) / (p.volHi - p.volLo)));
+    // Фактор 2: центральность цены в коридоре (пик у center, 0 на краях ±halfW)
+    const corrScore = Math.max(0, 1 - Math.abs(price - p.center) / p.halfW);
+    // Фактор 3: US-сессия (14–23 UTC лучше)
+    const hr        = new Date().getUTCHours();
+    const sessScore = (hr >= 14 && hr <= 23) ? 1 : 0.5;
+    // Штраф за слишком дешёвый андердог (капкан)
+    const deepPen   = price < 0.20 ? 0.5 : 1;
+    const score = (p.wVol*volScore + p.wCorr*corrScore + p.wSess*sessScore)
+                / (p.wVol + p.wCorr + p.wSess) * deepPen;
+    if (score < p.minScore) return null;                       // гейт качества
+    const ourProb = _clampProb(price + p.edgeMax * score, price);  // размер ∝ score (через Kelly)
+    return { side, polyPrice: price, ourProb, edge: ourProb - price,
+             info: `udgScore ${side} @${(price*100).toFixed(0)}¢ s=${score.toFixed(2)}` };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
 const STRAT_DEFINITIONS = [
   STRAT_UNDERDOG_HOLD, STRAT_MOMENTUM,
   STRAT_MOM_SCRATCH, STRAT_MOM_HI, STRAT_MOM_CONFIRM,
   STRAT_UDG_A, STRAT_UDG_B, STRAT_UDG_C, STRAT_UDG_D, STRAT_UDG_E,
   STRAT_UDG_FAV, STRAT_UDG_FLIP, STRAT_UDG_FLIP_FAV,
+  STRAT_UDG_VOL, STRAT_UDG_STREAK, STRAT_UDG_BEST, STRAT_UDG_SCORE,
   ...MANUAL_STRATS,
 ];
 
@@ -2125,6 +2257,17 @@ function getStratContext() {
   const win    = currentPolyWindow();
   const sigP   = predictPoly();
   const curBTC = chain.currentPrice || (ticks.length ? ticks[ticks.length - 1].price : null);
+  // ── Признаки из истории окон (для новых тест-стратегий udgVol / udgStreak) ──
+  const H = poly.winHist;
+  let outcomeStreak = 0, streakDir = null, prevMove = null, prevRange = null, vol5 = null;
+  if (H.length) {
+    streakDir = H[H.length - 1].winner;
+    for (let i = H.length - 1; i >= 0 && H[i].winner === streakDir; i--) outcomeStreak++;
+    prevMove  = Math.abs(H[H.length - 1].move);
+    prevRange = H[H.length - 1].range;
+    const last5 = H.slice(-5);
+    vol5 = last5.reduce((a, w) => a + Math.abs(w.move), 0) / last5.length;
+  }
   return {
     win,
     msToEnd:     Math.max(0, win.endTs - Date.now()),
@@ -2134,6 +2277,11 @@ function getStratContext() {
     curBTC,
     openingBTC:  poly.windowOpeningBTC,
     openingSource: poly.windowOpeningSource,
+    outcomeStreak,        // сколько окон ПОДРЯД закрылись в одну сторону (до текущего)
+    streakDir,            // направление этой серии ('UP'/'DOWN')
+    prevMove,             // |движение| предыдущего окна, $
+    prevRange,            // диапазон (hi-lo) предыдущего окна, $
+    vol5,                 // среднее |движение| за 5 последних окон, $
   };
 }
 
@@ -2837,6 +2985,11 @@ function processAccount(s, ctx, acct, isReal) {
 function processStrategies() {
   const ctx = getStratContext();
   resolveCalib(ctx);
+  // Трекаем экстремумы BTC текущего окна (для range/волатильность-фильтров новых стратегий)
+  if (ctx.curBTC != null) {
+    poly.winHi = (poly.winHi == null) ? ctx.curBTC : Math.max(poly.winHi, ctx.curBTC);
+    poly.winLo = (poly.winLo == null) ? ctx.curBTC : Math.min(poly.winLo, ctx.curBTC);
+  }
   for (const id in STRATEGIES) {
     const s = STRATEGIES[id];
     if (ticks.length < 60) continue;
@@ -3609,9 +3762,9 @@ setInterval(() => {
 }, 500);
 
 // Polymarket every 2s
-setInterval(() => { if (poly.autoFetch) fetchPolyMarket().catch(e => console.error('[poly]', e.message)); }, 2000);
+setInterval(() => { if (poly.autoFetch) fetchPolyMarket().catch(e => console.error('[poly]', e.message)); }, 1500);
 // Chainlink every 4s
-setInterval(() => { if (chain.enabled && !isSim) refreshChainlinkPrice().catch(() => {}); }, 4000);
+setInterval(() => { if (chain.enabled && !isSim) refreshChainlinkPrice().catch(() => {}); }, 1500);
 // Strategy engine every 1s
 setInterval(() => { try { processStrategies(); } catch (e) { console.error('[strategies]', e.message); } }, 1000);
 // SSE broadcast every 1s

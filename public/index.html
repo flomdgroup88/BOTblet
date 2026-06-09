@@ -186,6 +186,14 @@ body::before {
 .pinned-card { box-shadow: inset 4px 0 0 #f0b429; background: rgba(240,180,41,.04) !important; }
 .pinned-card .lbl { color: #f0c060; }
 .pinned-badge { display:inline-block; font-size:8px; font-weight:700; letter-spacing:.05em; padding:1px 5px; border-radius:3px; background:rgba(240,180,41,.18); color:#f0b429; border:1px solid rgba(240,180,41,.35); margin-left:6px; vertical-align:middle; text-transform:uppercase; }
+/* Ряд 2 — UDG-стратегии с диапазоном 0.40 (бирюзовый акцент) */
+.row2-card { box-shadow: inset 4px 0 0 #2bc4d4; background: rgba(43,196,212,.05) !important; }
+.row2-card .lbl { color: #5fd3e0; }
+/* Активная РЕАЛЬНАЯ сделка — всплывает наверх, зелёная подсветка */
+.real-live-card { box-shadow: inset 4px 0 0 var(--up), 0 0 0 1px rgba(0,232,122,.55) !important; background: rgba(0,232,122,.06) !important; }
+.real-live-card .lbl { color: var(--up); }
+.live-readout { font-size:11px; font-weight:600; padding:2px 7px; border-radius:4px; background:rgba(0,232,122,.14); color:var(--up); border:1px solid rgba(0,232,122,.4); }
+.row2-badge { display:inline-block; font-size:8px; font-weight:700; letter-spacing:.05em; padding:1px 5px; border-radius:3px; background:rgba(43,196,212,.18); color:#2bc4d4; border:1px solid rgba(43,196,212,.35); margin-left:6px; vertical-align:middle; }
 
 /* DUAL ACCOUNT PANELS inside a strategy card */
 .acct-panels {
@@ -923,25 +931,31 @@ function acctPanelHtml(id, mode, label) {
 }
 
 const PINNED_STRATS = new Set(['underdogHold', 'momentum']);
+const SECOND_ROW    = new Set(['udgB', 'udgE']);   // ряд 2 — UDG с диапазоном 0.40
 
 function updateStratCards(strats, polyData, realTrading) {
   const grid = $('strat-grid');
-  // Pinned стратегии — всегда первые в сетке
-  const pinnedOrder = ['underdogHold', 'momentum'];
-  const sortedEntries = Object.entries(strats).sort(([a], [b]) => {
-    const ai = pinnedOrder.indexOf(a), bi = pinnedOrder.indexOf(b);
-    if (ai !== -1 && bi !== -1) return ai - bi;
-    if (ai !== -1) return -1;
-    if (bi !== -1) return 1;
-    return 0;
-  });
+  // Порядок: ряд 1 — опорные; ряд 2 — UDG с диапазоном 0.40 (по просьбе); далее остальные
+  const pinnedOrder = ['underdogHold', 'momentum'];   // ряд 1 (сетка в 2 колонки)
+  const secondRow   = ['udgB', 'udgE'];               // ряд 2 — диапазон 0.40
+  const orderOf = (id) => {
+    let i = pinnedOrder.indexOf(id); if (i !== -1) return i;        // 0,1 → ряд 1
+    i = secondRow.indexOf(id);       if (i !== -1) return 2 + i;    // 2,3 → ряд 2
+    return 100;                                                     // остальные (порядок стабильный)
+  };
+  const sortedEntries = Object.entries(strats).sort(([a], [b]) => orderOf(a) - orderOf(b));
   for (const [id, s] of sortedEntries) {
     if (!renderedCards.has(id)) {
       const isPinned = PINNED_STRATS.has(id);
+      const isRow2   = SECOND_ROW.has(id);
       const card = document.createElement('div');
       card.id = 'scard-' + id;
-      card.className = s.manual ? 'strat-card manual-card' : (isPinned ? 'strat-card pinned-card' : 'strat-card');
-      const badge = isPinned ? '<span class="pinned-badge">★ опора</span>' : '';
+      card.className = s.manual ? 'strat-card manual-card'
+                     : isPinned ? 'strat-card pinned-card'
+                     : isRow2   ? 'strat-card row2-card'
+                     : 'strat-card';
+      const badge = isPinned ? '<span class="pinned-badge">★ опора</span>'
+                  : isRow2   ? '<span class="row2-badge">0.40</span>' : '';
       card.innerHTML = `
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
           <div class="lbl" style="margin-bottom:0;">${s.name}${badge}</div>
@@ -1040,11 +1054,27 @@ function updateStratCards(strats, polyData, realTrading) {
 
     // Combined position badge in card header
     const posB = $('spos-' + id);
-    const anyOpen = s.demo.open || s.real.open;
-    if (anyOpen) {
-      const o = s.demo.open || s.real.open;
-      posB.innerHTML = `<span class="pos-badge pos-${o.side.toLowerCase()}">${o.side}</span>`;
-    } else { posB.innerHTML = ''; }
+    const card = $('scard-' + id);
+    // ── Реальная сделка открыта → карточка всплывает наверх + живой ценник ──
+    if (s.real.open) {
+      const o = s.real.open;
+      const cur = (o.side === 'UP' ? polyData.up : polyData.down);   // текущая цена шэра нашей стороны
+      const entry = o.polyEntryPrice;
+      let read = `<span class="pos-badge pos-${o.side.toLowerCase()}">${o.side}</span>`;
+      if (cur != null && entry) {
+        const pct = ((cur / entry - 1) * 100);
+        const pcol = pct >= 0 ? 'var(--up)' : 'var(--dn)';
+        read += ` <span class="live-readout">${Math.round(entry*100)}¢ → ${Math.round(cur*100)}¢ <span style="color:${pcol}">(${pct>=0?'+':''}${pct.toFixed(0)}%)</span></span>`;
+      }
+      posB.innerHTML = read;
+      if (card) { card.style.order = '-2'; card.classList.add('real-live-card'); }
+    } else {
+      if (card) { card.style.order = ''; card.classList.remove('real-live-card'); }
+      const anyOpen = s.demo.open;
+      if (anyOpen) {
+        posB.innerHTML = `<span class="pos-badge pos-${anyOpen.side.toLowerCase()}">${anyOpen.side}</span>`;
+      } else { posB.innerHTML = ''; }
+    }
     // Кнопка рыночной продажи: только при открытой РЕАЛЬНОЙ позиции (и не в процессе подтверждения входа)
     const sellB = $('sell-' + id);
     if (sellB) {
