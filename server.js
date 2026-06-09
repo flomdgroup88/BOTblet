@@ -2150,17 +2150,32 @@ const STRAT_UDG_SKIP3 = {
     if (dogPrice < p.lo || dogPrice > p.hi || dogPrice < MIN_ENTRY_PRICE) return null;
 
     // ── Skip-фильтр: читаем лог демо-аккаунта underdogHold ──────────────────
-    // Логика: входим ТОЛЬКО если последние skipAfter сделок underdogHold подряд — проигрыши.
-    // После одного входа ждём следующей серии из skipAfter проигрышей.
+    // Логика: входим ТОЛЬКО если после последнего нашего входа накопилось
+    // skipAfter новых лузов подряд в логе underdogHold.
+    // Как только мы входим — запоминаем текущую длину лога как «точку сброса».
+    // Следующая серия считается только с этой точки, старые лузы не учитываются.
     const ref = STRATEGIES['underdogHold'];
     if (!ref || !ref.demo || ref.demo.log.length < p.skipAfter) return null; // мало истории — ждём
     const log = ref.demo.log;
+
+    // Точка сброса: индекс в логе, начиная с которого считаем новую серию.
+    // Хранится на объекте стратегии udgSkip3.
+    const selfStrat = STRATEGIES['udgSkip3'];
+    // Если точки сброса нет — начинаем счёт с начала лога.
+    const resetIdx = (selfStrat && selfStrat._skip3ResetIdx != null)
+      ? selfStrat._skip3ResetIdx
+      : 0;
+
+    // Считаем лузы подряд начиная с конца, но не раньше resetIdx
     let losses = 0;
-    for (let i = log.length - 1; i >= 0; i--) {
+    for (let i = log.length - 1; i >= resetIdx; i--) {
       if (!log[i].won) losses++;
       else break;
     }
     if (losses < p.skipAfter) return null; // серия ещё не набралась — ждём
+
+    // Серия набралась — сбрасываем счётчик: новые лузы будем считать с текущего конца лога
+    if (selfStrat) selfStrat._skip3ResetIdx = log.length;
 
     const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
     return {
@@ -2176,13 +2191,235 @@ const STRAT_UDG_SKIP3 = {
   },
 };
 
+// ── UDG-SKIP3-B — диапазон 0.10-0.30, лучший Profit Factor (1.47) ────────────
+// Бэктест Jun 1-9 2026, 135 сделок, WR 36.3%, ROI на стейк +26.7%, PF 1.47
+// Более широкий нижний порог: берём всех андердогов от 10¢, TP 96¢.
+const STRAT_UDG_SKIP3_B = {
+  id: 'udgSkip3B',
+  name: 'UDG-Skip-3-B (0.10–0.30, PF 1.47)',
+  desc: 'Underdog Hold 10–30¢ + Skip-3 фильтр. Лучший Profit Factor (1.47) по бэктесту Jun 2026.',
+  defaults: {
+    lo: 0.10, hi: 0.30,
+    minTimeMs: 60000,
+    tpAbs: 0.96,
+    skipAfter: 3,
+    maxPerWindow: 1,
+    kellyFrac: 0.10,
+    maxFrac: 0.05,
+  },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const dogPrice = Math.min(np.up, np.dn);
+    if (dogPrice < p.lo || dogPrice > p.hi || dogPrice < MIN_ENTRY_PRICE) return null;
+
+    const ref = STRATEGIES['underdogHold'];
+    if (!ref || !ref.demo || ref.demo.log.length < p.skipAfter) return null;
+    const log = ref.demo.log;
+
+    const selfStrat = STRATEGIES['udgSkip3B'];
+    const resetIdx = (selfStrat && selfStrat._skip3ResetIdx != null)
+      ? selfStrat._skip3ResetIdx
+      : 0;
+
+    let losses = 0;
+    for (let i = log.length - 1; i >= resetIdx; i--) {
+      if (!log[i].won) losses++;
+      else break;
+    }
+    if (losses < p.skipAfter) return null;
+
+    if (selfStrat) selfStrat._skip3ResetIdx = log.length;
+
+    const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
+    return {
+      side: dogSide, polyPrice: dogPrice, ourProb,
+      edge: ourProb - dogPrice,
+      info: `udgSkip3B ${dogSide} @${(dogPrice * 100).toFixed(0)}¢`,
+    };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
+// ── UDG-SKIP3-C — диапазон 0.20-0.30, топ-3 ROI + минимальная просадка ───────
+// Бэктест Jun 1-9 2026, 132 сделки, WR 36.4%, ROI на стейк +26.1%, PF 1.38
+// Узкий диапазон: только «середина рынка», меньше экстремальных ставок.
+const STRAT_UDG_SKIP3_C = {
+  id: 'udgSkip3C',
+  name: 'UDG-Skip-3-C (0.20–0.30, ROI +26%)',
+  desc: 'Underdog Hold 20–30¢ + Skip-3 фильтр. Топ-3 по ROI, минимальная просадка среди лидеров.',
+  defaults: {
+    lo: 0.20, hi: 0.30,
+    minTimeMs: 60000,
+    tpAbs: 0.96,
+    skipAfter: 3,
+    maxPerWindow: 1,
+    kellyFrac: 0.10,
+    maxFrac: 0.05,
+  },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const dogPrice = Math.min(np.up, np.dn);
+    if (dogPrice < p.lo || dogPrice > p.hi || dogPrice < MIN_ENTRY_PRICE) return null;
+
+    const ref = STRATEGIES['underdogHold'];
+    if (!ref || !ref.demo || ref.demo.log.length < p.skipAfter) return null;
+    const log = ref.demo.log;
+
+    const selfStrat = STRATEGIES['udgSkip3C'];
+    const resetIdx = (selfStrat && selfStrat._skip3ResetIdx != null)
+      ? selfStrat._skip3ResetIdx
+      : 0;
+
+    let losses = 0;
+    for (let i = log.length - 1; i >= resetIdx; i--) {
+      if (!log[i].won) losses++;
+      else break;
+    }
+    if (losses < p.skipAfter) return null;
+
+    if (selfStrat) selfStrat._skip3ResetIdx = log.length;
+
+    const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
+    return {
+      side: dogSide, polyPrice: dogPrice, ourProb,
+      edge: ourProb - dogPrice,
+      info: `udgSkip3C ${dogSide} @${(dogPrice * 100).toFixed(0)}¢`,
+    };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
+
+// ── UDG-SKIP3-D — диапазон 0.22-0.30 (топ-1 по ROI, WR 36.9%, PF 1.40) ──────
+// Бэктест Jun 1-9 2026, 130 сделок, WR 36.9%, ROI +27.2%, PF 1.40, MaxDD -$971
+// Лучший результат среди всех диапазонов по соотношению ROI/Drawdown.
+const STRAT_UDG_SKIP3_D = {
+  id: 'udgSkip3D',
+  name: 'UDG-Skip-3-D (0.22–0.30, топ ROI)',
+  desc: 'Underdog Hold 22–30¢ + Skip-3 фильтр. Лучший диапазон: ROI +27.2%, PF 1.40, MaxDD -$971.',
+  defaults: {
+    lo: 0.22, hi: 0.30,
+    minTimeMs: 60000,
+    tpAbs: 0.96,
+    skipAfter: 3,
+    maxPerWindow: 1,
+    kellyFrac: 0.10,
+    maxFrac: 0.05,
+  },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const dogPrice = Math.min(np.up, np.dn);
+    if (dogPrice < p.lo || dogPrice > p.hi || dogPrice < MIN_ENTRY_PRICE) return null;
+
+    const ref = STRATEGIES['underdogHold'];
+    if (!ref || !ref.demo || ref.demo.log.length < p.skipAfter) return null;
+    const log = ref.demo.log;
+
+    const selfStrat = STRATEGIES['udgSkip3D'];
+    const resetIdx = (selfStrat && selfStrat._skip3ResetIdx != null)
+      ? selfStrat._skip3ResetIdx
+      : 0;
+
+    let losses = 0;
+    for (let i = log.length - 1; i >= resetIdx; i--) {
+      if (!log[i].won) losses++;
+      else break;
+    }
+    if (losses < p.skipAfter) return null;
+
+    if (selfStrat) selfStrat._skip3ResetIdx = log.length;
+
+    const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
+    return {
+      side: dogSide, polyPrice: dogPrice, ourProb,
+      edge: ourProb - dogPrice,
+      info: `udgSkip3D ${dogSide} @${(dogPrice * 100).toFixed(0)}¢`,
+    };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
+// ── UDG-SKIP3-E — диапазон 0.18-0.32 (WR 37%, ROI +20.8%, PF 1.32) ──────────
+// Бэктест Jun 1-9 2026, 127 сделок, WR 37%, ROI +20.8%, PF 1.32, MaxDD -$892
+// Компромисс: самый высокий WR среди Skip-диапазонов, умеренная просадка.
+const STRAT_UDG_SKIP3_E = {
+  id: 'udgSkip3E',
+  name: 'UDG-Skip-3-E (0.18–0.32, WR 37%)',
+  desc: 'Underdog Hold 18–32¢ + Skip-3 фильтр. Лучший Win Rate 37%, PF 1.32, MaxDD -$892.',
+  defaults: {
+    lo: 0.18, hi: 0.32,
+    minTimeMs: 60000,
+    tpAbs: 0.96,
+    skipAfter: 3,
+    maxPerWindow: 1,
+    kellyFrac: 0.10,
+    maxFrac: 0.05,
+  },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const dogPrice = Math.min(np.up, np.dn);
+    if (dogPrice < p.lo || dogPrice > p.hi || dogPrice < MIN_ENTRY_PRICE) return null;
+
+    const ref = STRATEGIES['underdogHold'];
+    if (!ref || !ref.demo || ref.demo.log.length < p.skipAfter) return null;
+    const log = ref.demo.log;
+
+    const selfStrat = STRATEGIES['udgSkip3E'];
+    const resetIdx = (selfStrat && selfStrat._skip3ResetIdx != null)
+      ? selfStrat._skip3ResetIdx
+      : 0;
+
+    let losses = 0;
+    for (let i = log.length - 1; i >= resetIdx; i--) {
+      if (!log[i].won) losses++;
+      else break;
+    }
+    if (losses < p.skipAfter) return null;
+
+    if (selfStrat) selfStrat._skip3ResetIdx = log.length;
+
+    const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
+    return {
+      side: dogSide, polyPrice: dogPrice, ourProb,
+      edge: ourProb - dogPrice,
+      info: `udgSkip3E ${dogSide} @${(dogPrice * 100).toFixed(0)}¢`,
+    };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
 const STRAT_DEFINITIONS = [
   STRAT_UNDERDOG_HOLD, STRAT_MOMENTUM,
   STRAT_MOM_SCRATCH, STRAT_MOM_HI, STRAT_MOM_CONFIRM,
   STRAT_UDG_A, STRAT_UDG_B, STRAT_UDG_C, STRAT_UDG_D, STRAT_UDG_E,
   STRAT_UDG_FAV, STRAT_UDG_FLIP, STRAT_UDG_FLIP_FAV,
   STRAT_UDG_VOL, STRAT_UDG_STREAK, STRAT_UDG_BEST, STRAT_UDG_SCORE,
-  STRAT_UDG_SKIP3,
+  STRAT_UDG_SKIP3, STRAT_UDG_SKIP3_B, STRAT_UDG_SKIP3_C,
+  STRAT_UDG_SKIP3_D, STRAT_UDG_SKIP3_E,
   ...MANUAL_STRATS,
 ];
 
@@ -2307,6 +2544,7 @@ function initStrategies() {
       realDailyLossDate:     null,     // 'YYYY-MM-DD' (UTC) — bookkeeping for the daily cap
       realDailyLossAmount:   0,        // running USD loss for the current UTC day
       realDailyAutoDisabled: false,    // user must re-enable real after the cap fires
+      _skip3ResetIdx:        0,        // udgSkip3: index in underdogHold log from which to count new loss streak
     };
   }
 }
@@ -2996,12 +3234,41 @@ function processAccount(s, ctx, acct, isReal) {
       return;
     }
     if (Date.now() >= acct.open.expiryTime) {
-      // Ждём, пока рынок дорезолвится (выигравшая сторона дойдёт до ~1.0), чтобы
-      // зафиксировать НАСТОЯЩИЙ исход, а не гадать по BTC-фиду. Потолок ожидания —
-      // SETTLE_MAX_WAIT_MS, дальше закрываем с фолбэком на фид (запись помечается dirty).
-      const decisive = marketResolvedWinner(ctx) !== null;
-      if (!decisive && (Date.now() - acct.open.expiryTime) < SETTLE_MAX_WAIT_MS) return;
-      stratClose(s, ctx, 'SETTLE', null, acct, isReal); return;
+      // ── SETTLE: закрываем позицию немедленно, не блокируя вход в новое окно ──
+      // Проблема старого подхода: ждали до 60с пока рынок «дорезолвится», но за это
+      // время новое окно уже шло и ctx.polyUp/polyDn уже принадлежали НОВОМУ рынку
+      // → фантомные победы/поражения. Плюс стратегия не могла открыть новую сделку.
+      //
+      // Новый подход:
+      // 1. При первом попадании в блок (сразу после expiryTime) — снимаем snapshot
+      //    цен этого момента и сохраняем в acct.open. Это последние котировки
+      //    старого рынка (ещё не переключились на новый).
+      // 2. Пробуем определить победителя по snapshot.
+      // 3. Если snapshot нечёткий — даём 5 секунд (не 60!) на дорезолв.
+      // 4. По истечении 5 секунд — всегда закрываем (с фолбэком на BTC-фид).
+      //    Это освобождает позицию и позволяет войти в новое окно.
+      const SETTLE_FAST_WAIT_MS = 5000; // максимум 5 сек ожидания, не 60
+
+      // Снимаем snapshot цен в момент первого попадания в блок
+      if (!acct.open._settleSnapshotUp && ctx.polyUp != null) {
+        acct.open._settleSnapshotUp = ctx.polyUp;
+        acct.open._settleSnapshotDn = ctx.polyDn;
+        acct.open._settleDetectedAt = Date.now();
+      }
+
+      // Пробуем определить победителя: сначала по snapshot, потом по текущим ценам
+      const snapshotCtx = (acct.open._settleSnapshotUp != null)
+        ? { ...ctx, polyUp: acct.open._settleSnapshotUp, polyDn: acct.open._settleSnapshotDn }
+        : ctx;
+      const decisive = marketResolvedWinner(snapshotCtx) !== null
+                    || marketResolvedWinner(ctx) !== null;
+
+      const waitedMs = Date.now() - (acct.open._settleDetectedAt || acct.open.expiryTime);
+      if (!decisive && waitedMs < SETTLE_FAST_WAIT_MS) return; // даём 5 сек — не 60
+
+      // Закрываем с лучшим из доступных контекстов
+      const closeCtx = (decisive && marketResolvedWinner(snapshotCtx) !== null) ? snapshotCtx : ctx;
+      stratClose(s, closeCtx, 'SETTLE', null, acct, isReal); return;
     }
     const exit = s.def.shouldExit(ctx, acct.open, s.params);
     if (exit && exit.exitPrice !== null) {

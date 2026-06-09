@@ -185,7 +185,25 @@ body::before {
   background: var(--bg2);
   padding: 14px;
   position: relative;
+  transition: opacity .15s, box-shadow .15s;
 }
+.strat-card.drag-over {
+  box-shadow: inset 0 0 0 2px var(--up);
+}
+.strat-card.dragging {
+  opacity: .35;
+}
+.drag-handle {
+  cursor: grab;
+  color: var(--tx3);
+  font-size: 11px;
+  padding: 0 4px 0 0;
+  user-select: none;
+  flex-shrink: 0;
+  line-height: 1;
+  letter-spacing: 1px;
+}
+.drag-handle:active { cursor: grabbing; }
 /* Ручные стратегии — фиолетовый акцент, чтобы отличать от авто */
 .manual-card { }
 .manual-card .lbl { }
@@ -535,6 +553,8 @@ table.log tr:hover td { background: var(--bg3); }
       <span id="strat-count-badge" style="font-size:9px;color:var(--tx3);"></span>
     </div>
     <div style="display:flex;align-items:center;gap:10px;">
+      <button onclick="event.stopPropagation();toggleAllDemoStrategies()" id="demo-all-btn" style="font-size:9px;padding:2px 9px;border:1px solid rgba(100,130,255,.45);background:transparent;color:#7090ff;border-radius:4px;cursor:pointer;font-family:inherit;letter-spacing:.04em;">▣ вкл все демо</button>
+      <button onclick="event.stopPropagation();toggleAllCards()" id="collapse-all-btn" style="font-size:9px;padding:2px 9px;border:1px solid var(--bd);background:var(--bg2);color:var(--tx2);border-radius:4px;cursor:pointer;font-family:inherit;letter-spacing:.04em;">свернуть все</button>
       <span id="strat-collapse-hint" style="font-size:9px;color:var(--tx3);">скрыть</span>
       <span id="strat-chevron" style="font-size:11px;color:var(--tx3);transition:transform .2s;">▲</span>
     </div>
@@ -966,8 +986,115 @@ function toggleCardCollapse(id) {
   _applyCardCollapse(id);
 }
 
+function toggleAllCards() {
+  // Determine current majority state: if most cards are expanded → collapse all, else expand all
+  const bodies = document.querySelectorAll('[id^="scbody-"]');
+  const totalCards = bodies.length;
+  if (totalCards === 0) return;
+  const collapsedCount = Array.from(bodies).filter(b => b.classList.contains('collapsed')).length;
+  const shouldCollapseAll = collapsedCount < totalCards / 2; // majority expanded → collapse all
+
+  bodies.forEach(body => {
+    const id = body.id.replace('scbody-', '');
+    localStorage.setItem('cardCollapsed:' + id, shouldCollapseAll ? '1' : '0');
+    _applyCardCollapse(id);
+  });
+
+  const btn = document.getElementById('collapse-all-btn');
+  if (btn) btn.textContent = shouldCollapseAll ? 'развернуть все' : 'свернуть все';
+}
+
+// ── Drag-and-drop ordering ─────────────────────────────────────────────────
+const CUSTOM_ORDER_KEY = 'stratCardOrder';
+
+function _loadCustomOrder() {
+  try { return JSON.parse(localStorage.getItem(CUSTOM_ORDER_KEY)) || []; }
+  catch { return []; }
+}
+
+function _saveCustomOrder() {
+  const grid = document.getElementById('strat-grid');
+  if (!grid) return;
+  const ids = Array.from(grid.children).map(el => el.id.replace('scard-', ''));
+  localStorage.setItem(CUSTOM_ORDER_KEY, JSON.stringify(ids));
+}
+
+function _applyCustomOrder() {
+  const order = _loadCustomOrder();
+  if (!order.length) return;
+  const grid = document.getElementById('strat-grid');
+  if (!grid) return;
+  // Re-insert cards in saved order; unknown cards stay at end
+  const cards = Object.fromEntries(
+    Array.from(grid.children).map(el => [el.id.replace('scard-', ''), el])
+  );
+  order.forEach(id => { if (cards[id]) grid.appendChild(cards[id]); });
+  // any not in saved order come last (already appended, no-op)
+}
+
+let _dragSrc = null;
+
+function _initDragOnCard(card) {
+  card.setAttribute('draggable', 'true');
+
+  const handle = card.querySelector('.drag-handle');
+
+  // Only start drag when handle is being interacted with
+  card.addEventListener('dragstart', e => {
+    if (!e.target.closest('.drag-handle') && e.target !== card) {
+      // Allow default only if from handle
+      e.preventDefault();
+      return;
+    }
+    _dragSrc = card;
+    card.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', card.id);
+  });
+
+  card.addEventListener('dragend', () => {
+    card.classList.remove('dragging');
+    document.querySelectorAll('.strat-card.drag-over').forEach(c => c.classList.remove('drag-over'));
+    _saveCustomOrder();
+  });
+
+  card.addEventListener('dragover', e => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (_dragSrc && _dragSrc !== card) card.classList.add('drag-over');
+  });
+
+  card.addEventListener('dragleave', () => card.classList.remove('drag-over'));
+
+  card.addEventListener('drop', e => {
+    e.preventDefault();
+    card.classList.remove('drag-over');
+    if (!_dragSrc || _dragSrc === card) return;
+    const grid = card.parentNode;
+    const children = Array.from(grid.children);
+    const srcIdx  = children.indexOf(_dragSrc);
+    const destIdx = children.indexOf(card);
+    if (srcIdx < destIdx) grid.insertBefore(_dragSrc, card.nextSibling);
+    else grid.insertBefore(_dragSrc, card);
+    _saveCustomOrder();
+  });
+}
+
+function initAllCardDrag() {
+  document.querySelectorAll('.strat-card').forEach(_initDragOnCard);
+}
+
 // Apply immediately on page load
-document.addEventListener('DOMContentLoaded', _applyStratGridVisibility);
+document.addEventListener('DOMContentLoaded', () => {
+  _applyStratGridVisibility();
+  // Sync "свернуть все / развернуть все" button label on load
+  const bodies = document.querySelectorAll('[id^="scbody-"]');
+  if (bodies.length > 0) {
+    const collapsedCount = Array.from(bodies).filter(b => b.classList.contains('collapsed')).length;
+    const btn = document.getElementById('collapse-all-btn');
+    if (btn) btn.textContent = collapsedCount >= bodies.length / 2 ? 'развернуть все' : 'свернуть все';
+  }
+});
 
 // ── CFG SECTION COLLAPSE ──────────────────────────────────────────────────────
 let _cfgVisible = localStorage.getItem('cfgVisible') !== '0';
@@ -1099,8 +1226,11 @@ function updateStratCards(strats, polyData, realTrading) {
                      : 'strat-card';
       const badge = isPinned ? '<span class="pinned-badge">★ опора</span>' : '';
       card.innerHTML = `
-        <div class="strat-card-header" onclick="toggleCardCollapse('${id}')" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
-          <div class="lbl" style="margin-bottom:0;">${s.name}${badge}</div>
+        <div class="strat-card-header" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+          <div style="display:flex;align-items:center;gap:4px;min-width:0;flex:1;" onclick="toggleCardCollapse('${id}')">
+            <span class="drag-handle" title="Перетащить" onclick="event.stopPropagation()">⠿</span>
+            <div class="lbl" style="margin-bottom:0;">${s.name}${badge}</div>
+          </div>
           <div style="display:flex;align-items:center;gap:6px;">
             <button id="sell-${id}" onclick="event.stopPropagation();marketSell('${id}')" style="display:none;font-size:9px;padding:2px 8px;border:1px solid #e0556a;background:#e0556a;color:#fff;border-radius:4px;cursor:pointer;font-family:inherit;font-weight:600;">⚡ ПРОДАТЬ ПО РЫНКУ</button>
             <div id="spos-${id}" style="font-size:9px;"></div>
@@ -1132,6 +1262,7 @@ function updateStratCards(strats, polyData, realTrading) {
       else grid.appendChild(card);
       renderedCards.add(id);
       _applyCardCollapse(id);
+      _initDragOnCard(card);
     }
 
     // Update each account panel
@@ -1242,6 +1373,8 @@ function updateStratCards(strats, polyData, realTrading) {
       } else { sellB.style.display = 'none'; }
     }
   }
+  // Apply user-defined drag order (runs after new cards are added)
+  _applyCustomOrder();
 }
 
 // ─── COMBINED LOG ─────────────────────────────────────────────────────────────
@@ -1551,6 +1684,42 @@ async function saveParams() {
 
 async function toggleAcct(id, mode) {
   await fetch(`/api/strategy/${id}/${mode}/toggle`, { method: 'POST' });
+}
+
+async function toggleAllDemoStrategies() {
+  const btn = document.getElementById('demo-all-btn');
+  // Determine current state from the last known strat data
+  const allIds = Array.from(document.querySelectorAll('[id^="stgl-"][id$="-demo"]'))
+    .map(el => el.id.replace('stgl-', '').replace('-demo', ''));
+  if (!allIds.length) return;
+
+  // Check if majority are ON → turn all OFF; else turn all ON
+  const onCount = allIds.filter(id => {
+    const b = document.getElementById(`stgl-${id}-demo`);
+    return b && b.classList.contains('on');
+  }).length;
+  const shouldEnable = onCount < allIds.length / 2;
+
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = shouldEnable ? '▣ включаю…' : '▣ выключаю…';
+  }
+
+  // Fire requests sequentially to avoid hammering the server
+  for (const id of allIds) {
+    const b = document.getElementById(`stgl-${id}-demo`);
+    const isOn = b && b.classList.contains('on');
+    if (shouldEnable && !isOn) {
+      await fetch(`/api/strategy/${id}/demo/toggle`, { method: 'POST' });
+    } else if (!shouldEnable && isOn) {
+      await fetch(`/api/strategy/${id}/demo/toggle`, { method: 'POST' });
+    }
+  }
+
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = shouldEnable ? '▣ выкл все демо' : '▣ вкл все демо';
+  }
 }
 
 async function resetAcct(id, mode) {
