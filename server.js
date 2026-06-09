@@ -2544,13 +2544,17 @@ function stratOpen(s, ctx, entry, acct, isReal) {
       acct.open.realOrderStatus = 'matched';
       acct.open.actualShares    = actualShares;
       saveState();
-      sendTg(
+      sendTgButtons(
         `🔵 <b>ОТКРЫТА</b> — ${entry.side}\n` +
         `Стратегия: <i>${_tgEsc(s.def.id)}</i>\n` +
         `Цена входа: <b>≤ ${(ceiling * 100).toFixed(0)}¢</b> (по рынку)\n` +
         `Размер: <b>${actualShares} shares = $${sizeUSDC.toFixed(2)}</b> (${(sizeUSDC / effectiveBalance * 100).toFixed(1)}% от баланса)\n` +
         `Edge: ${(entry.edge * 100).toFixed(1)}pp\n` +
-        `Баланс: $${effectiveBalance.toFixed(2)}`
+        `Баланс: $${effectiveBalance.toFixed(2)}`,
+        [
+          [{ text: `⚡ ПРОДАТЬ ${_tgEsc(s.def.id)} по рынку`, callback_data: `panic:${s.def.id}` }],
+          [{ text: '📊 Статус позиций', callback_data: 'status' }],
+        ]
       );
     };
 
@@ -3824,6 +3828,218 @@ setInterval(() => {
   );
   console.log(`[alert] no trades for ${silenceMin}min — TG sent`);
 }, NO_TRADE_CHECK_MS);
+
+// ─── TELEGRAM BOT: INCOMING UPDATES (команды и кнопки) ───────────────────────
+//
+// Регистрирует webhook: POST /tg/webhook  (путь задаётся в env TG_WEBHOOK_PATH,
+// по умолчанию «/tg/webhook»). После деплоя один раз вызови:
+//   GET /api/tg/register-webhook
+// — и Telegram начнёт присылать обновления сюда.
+//
+// Поддерживаемые команды:
+//   /panic              — паник-сел всех открытых реальных позиций
+//   /panic <stratId>    — паник-сел конкретной стратегии
+//   /status             — сводка по открытым реальным позициям
+//
+// Кнопки (inline keyboard) отправляются автоматически при открытии реальной
+// позиции — кнопка «⚡ ПРОДАТЬ» прямо в уведомлении.
+
+/** Отправить сообщение с inline-клавиатурой (reply_markup). */
+async function sendTgButtons(text, buttons) {
+  if (!TG_ON) return false;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id:                  TG_CHAT,
+        text,
+        parse_mode:               'HTML',
+        disable_web_page_preview: true,
+        reply_markup:             { inline_keyboard: buttons },
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+    return r.ok;
+  } catch (e) {
+    console.warn('[tg] sendButtons error:', e.message);
+    return false;
+  }
+}
+
+/** Ответить на callback_query (убирает «часики» на кнопке). */
+async function answerCallback(callbackId, text = '') {
+  if (!TG_ON) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackId, text }),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch (e) {
+    console.warn('[tg] answerCallback error:', e.message);
+  }
+}
+
+/** Собрать сводку открытых реальных позиций. */
+function buildStatusText() {
+  const ctx = getStratContext();
+  const open = Object.entries(STRATEGIES)
+    .filter(([, s]) => s.real.open?.isReal)
+    .map(([id, s]) => {
+      const pos = s.real.open;
+      const curMid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+      const pnl = curMid && pos.entryPrice
+        ? ((curMid - pos.entryPrice) * (pos.actualShares || pos.plannedShares || 0)).toFixed(2)
+        : '?';
+      return `• <b>${_tgEsc(id)}</b> ${pos.side} @ ${(pos.entryPrice * 100).toFixed(0)}¢ | сейчас ~${curMid ? (curMid*100).toFixed(0)+'¢' : '?'} | PnL ~$${pnl}`;
+    });
+  if (!open.length) return '📭 <b>Нет открытых реальных позиций</b>';
+  return `📊 <b>Открытые позиции (${open.length}):</b>\n` + open.join('\n');
+}
+
+/** Паник-сел одной или всех стратегий. Возвращает { sold[], errors[] }. */
+function executePanic(stratId = null) {
+  const ctx  = getStratContext();
+  const sold = [];
+  const errs = [];
+  const targets = stratId
+    ? (STRATEGIES[stratId] ? [[stratId, STRATEGIES[stratId]]] : [])
+    : Object.entries(STRATEGIES);
+
+  for (const [id, s] of targets) {
+    const acct = s.real;
+    if (!acct.open?.isReal) continue;
+    if (acct.open.realOrderStatus === 'pending') { errs.push(`${id}: вход не подтверждён`); continue; }
+    try {
+      const curMid   = acct.open.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+      const exitRef  = (curMid && curMid > 0.01) ? curMid : 0.02;
+      const side     = acct.open.side;
+      console.warn(`[tg-panic] PANIC SELL ${id} ${side} @~${(exitRef*100).toFixed(0)}¢`);
+      stratClose(s, ctx, 'MANUAL', exitRef, acct, true);
+      sold.push(`${id} (${side})`);
+    } catch (e) {
+      errs.push(`${id}: ${e.message}`);
+    }
+  }
+  return { sold, errs };
+}
+
+/** Обработчик входящего update от Telegram. */
+function handleTgUpdate(update) {
+  // ── Inline-кнопка нажата ────────────────────────────────────────────────
+  if (update.callback_query) {
+    const cb   = update.callback_query;
+    const data = cb.data || '';
+    answerCallback(cb.id, '⚡ Выполняю...');
+
+    if (data === 'panic_all') {
+      const { sold, errs } = executePanic(null);
+      const msg = sold.length
+        ? `⚡ <b>ПАНИК-СЕЛ выполнен</b>\nПродано: ${sold.map(_tgEsc).join(', ')}` +
+          (errs.length ? `\n⚠️ Ошибки: ${errs.map(_tgEsc).join('; ')}` : '')
+        : `❌ Нечего продавать` + (errs.length ? `\n${errs.map(_tgEsc).join('; ')}` : '');
+      sendTg(msg);
+    } else if (data.startsWith('panic:')) {
+      const id = data.slice(6);
+      const { sold, errs } = executePanic(id);
+      const msg = sold.length
+        ? `⚡ <b>ПРОДАНО:</b> ${sold.map(_tgEsc).join(', ')}`
+        : `❌ Не продано${errs.length ? ': ' + errs.map(_tgEsc).join('; ') : ' — нет открытой позиции'}`;
+      sendTg(msg);
+    } else if (data === 'status') {
+      sendTg(buildStatusText());
+    }
+    return;
+  }
+
+  // ── Текстовая команда ────────────────────────────────────────────────────
+  const msg  = update.message;
+  if (!msg?.text) return;
+
+  // Проверяем что сообщение из нашего чата (безопасность)
+  if (String(msg.chat?.id) !== String(TG_CHAT)) {
+    console.warn(`[tg] ignoring message from unknown chat ${msg.chat?.id}`);
+    return;
+  }
+
+  const text = (msg.text || '').trim();
+
+  if (text === '/status' || text.startsWith('/status ')) {
+    sendTg(buildStatusText());
+    return;
+  }
+
+  if (text === '/panic' || text.startsWith('/panic ')) {
+    const parts  = text.split(/\s+/);
+    const stratId = parts[1] || null;
+
+    if (stratId && !STRATEGIES[stratId]) {
+      sendTg(`❌ Стратегия <code>${_tgEsc(stratId)}</code> не найдена`);
+      return;
+    }
+
+    const { sold, errs } = executePanic(stratId);
+    let reply;
+    if (sold.length) {
+      reply = `⚡ <b>ПАНИК-СЕЛ выполнен</b>\nПродано: ${sold.map(_tgEsc).join(', ')}`;
+      if (errs.length) reply += `\n⚠️ Ошибки: ${errs.map(_tgEsc).join('; ')}`;
+    } else if (errs.length) {
+      reply = `⚠️ Ошибки при продаже:\n${errs.map(_tgEsc).join('\n')}`;
+    } else {
+      reply = `📭 Нет открытых реальных позиций${stratId ? ` для <code>${_tgEsc(stratId)}</code>` : ''}`;
+    }
+    sendTg(reply);
+    return;
+  }
+
+  // /help
+  if (text === '/help' || text === '/start') {
+    sendTg(
+      `🤖 <b>BOTblet команды:</b>\n\n` +
+      `/status — открытые позиции\n` +
+      `/panic — продать всё по рынку\n` +
+      `/panic <i>stratId</i> — продать конкретную стратегию\n\n` +
+      `Или нажми кнопку <b>⚡ ПРОДАТЬ</b> прямо в уведомлении об открытии позиции.`
+    );
+  }
+}
+
+// Webhook endpoint — Telegram шлёт сюда POST при каждом update
+const TG_WEBHOOK_PATH = (process.env.TG_WEBHOOK_PATH || '/tg/webhook').trim();
+app.post(TG_WEBHOOK_PATH, (req, res) => {
+  res.sendStatus(200); // сначала ответить 200, потом обработать
+  try { handleTgUpdate(req.body); } catch (e) { console.error('[tg] update error:', e.message); }
+});
+
+// GET /api/tg/register-webhook — один раз вызвать после деплоя чтобы зарегистрировать
+app.get('/api/tg/register-webhook', async (req, res) => {
+  if (!TG_ON) return res.json({ ok: false, reason: 'Telegram disabled' });
+
+  // Определяем публичный URL: из env RAILWAY_PUBLIC_DOMAIN или из заголовка Host
+  const domain = process.env.RAILWAY_PUBLIC_DOMAIN
+    || process.env.PUBLIC_DOMAIN
+    || req.headers['x-forwarded-host']
+    || req.headers.host
+    || '';
+  if (!domain) return res.json({ ok: false, reason: 'Не удалось определить домен. Задай env PUBLIC_DOMAIN.' });
+
+  const webhookUrl = `https://${domain}${TG_WEBHOOK_PATH}`;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/setWebhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: webhookUrl, allowed_updates: ['message', 'callback_query'] }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const data = await r.json();
+    console.log('[tg] setWebhook:', data);
+    res.json({ ok: data.ok, webhookUrl, result: data });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`[server] running on port ${PORT}`);
