@@ -174,24 +174,26 @@ body::before {
   gap: 1px;
   background: var(--bd);
 }
+#strat-header:hover { background: var(--bg2); }
+#strat-header:hover #strat-chevron { color: var(--tx2); }
 .strat-card {
   background: var(--bg2);
   padding: 14px;
   position: relative;
 }
 /* Ручные стратегии — фиолетовый акцент, чтобы отличать от авто */
-.manual-card { box-shadow: inset 4px 0 0 #9b78ff; border-color: rgba(155,120,255,.5) !important; }
-.manual-card .lbl { color: #b9a3ff; }
-/* ОПОРНЫЕ стратегии (underdogHold, momentum) — золотой акцент, идут первыми */
-.pinned-card { box-shadow: inset 4px 0 0 #f0b429; background: rgba(240,180,41,.04) !important; }
-.pinned-card .lbl { color: #f0c060; }
+.manual-card { }
+.manual-card .lbl { }
+/* ОПОРНЫЕ стратегии (underdogHold, momentum) — без акцента */
+.pinned-card { }
+.pinned-card .lbl { }
 .pinned-badge { display:inline-block; font-size:8px; font-weight:700; letter-spacing:.05em; padding:1px 5px; border-radius:3px; background:rgba(240,180,41,.18); color:#f0b429; border:1px solid rgba(240,180,41,.35); margin-left:6px; vertical-align:middle; text-transform:uppercase; }
-/* Ряд 2 — UDG-стратегии с диапазоном 0.40 (бирюзовый акцент) */
-.row2-card { box-shadow: inset 4px 0 0 #2bc4d4; background: rgba(43,196,212,.05) !important; }
-.row2-card .lbl { color: #5fd3e0; }
-/* Активная РЕАЛЬНАЯ сделка — всплывает наверх, зелёная подсветка */
-.real-live-card { box-shadow: inset 4px 0 0 var(--up), 0 0 0 1px rgba(0,232,122,.55) !important; background: rgba(0,232,122,.06) !important; }
-.real-live-card .lbl { color: var(--up); }
+/* Ряд 2 — UDG-стратегии без акцента */
+.row2-card { }
+.row2-card .lbl { }
+/* Активная РЕАЛЬНАЯ сделка — без подсветки */
+.real-live-card { }
+.real-live-card .lbl { }
 .live-readout { font-size:11px; font-weight:600; padding:2px 7px; border-radius:4px; background:rgba(0,232,122,.14); color:var(--up); border:1px solid rgba(0,232,122,.4); }
 .row2-badge { display:inline-block; font-size:8px; font-weight:700; letter-spacing:.05em; padding:1px 5px; border-radius:3px; background:rgba(43,196,212,.18); color:#2bc4d4; border:1px solid rgba(43,196,212,.35); margin-left:6px; vertical-align:middle; }
 
@@ -205,29 +207,19 @@ body::before {
 .acct-panel {
   border-radius: 3px;
   border: 1px solid var(--bd);
+  background: var(--bg3);
   padding: 10px 11px;
   position: relative;
 }
-.acct-panel.acct-demo {
-  background: rgba(68,102,255,.04);
-  border-color: rgba(68,102,255,.18);
-}
-.acct-panel.acct-demo.acct-active {
-  background: rgba(68,102,255,.08);
-  border-color: rgba(68,102,255,.35);
-  box-shadow: inset 0 0 0 1px rgba(68,102,255,.2);
-}
-.acct-panel.acct-real {
-  background: rgba(255,136,51,.04);
-  border-color: rgba(255,136,51,.18);
-}
+.acct-panel.acct-demo,
+.acct-panel.acct-demo.acct-active,
+.acct-panel.acct-real,
 .acct-panel.acct-real.acct-active {
-  background: rgba(255,136,51,.08);
-  border-color: rgba(255,136,51,.35);
-  box-shadow: inset 0 0 0 1px rgba(255,136,51,.22);
+  background: var(--bg3) !important;
+  border-color: var(--bd) !important;
+  box-shadow: none !important;
 }
 .acct-panel.has-pos {
-  box-shadow: inset 3px 0 0 var(--warn);
 }
 .acct-label {
   font-size: 8px;
@@ -236,8 +228,8 @@ body::before {
   font-weight: 600;
   margin-bottom: 6px;
 }
-.acct-demo .acct-label { color: rgba(100,130,255,.8); }
-.acct-real .acct-label { color: rgba(255,160,80,.8); }
+.acct-demo .acct-label { color: var(--tx3); }
+.acct-real .acct-label { color: var(--tx3); }
 
 .acct-header {
   display: flex;
@@ -521,8 +513,20 @@ table.log tr:hover td { background: var(--bg3); }
 </div>
 
 <!-- STRATEGY CARDS -->
-<div class="strat-grid" id="strat-grid">
-  <!-- injected by JS -->
+<div id="strat-section">
+  <div onclick="toggleStratGrid()" id="strat-header" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:8px 14px;background:var(--bg);border-top:1px solid var(--bd);border-bottom:1px solid var(--bd);user-select:none;">
+    <div style="display:flex;align-items:center;gap:8px;">
+      <span style="font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--tx2);text-transform:uppercase;">Стратегии</span>
+      <span id="strat-count-badge" style="font-size:9px;color:var(--tx3);"></span>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span id="strat-collapse-hint" style="font-size:9px;color:var(--tx3);">скрыть</span>
+      <span id="strat-chevron" style="font-size:11px;color:var(--tx3);transition:transform .2s;">▲</span>
+    </div>
+  </div>
+  <div class="strat-grid" id="strat-grid">
+    <!-- injected by JS -->
+  </div>
 </div>
 
 <!-- ⚙️ НАСТРОЙКИ СТРАТЕГИИ + ИНВЕРСИЯ -->
@@ -889,6 +893,33 @@ function updateAll(d) {
 }
 
 // ─── STRATEGY CARDS ───────────────────────────────────────────────────────────
+let _stratGridVisible = localStorage.getItem('stratGridVisible') !== '0';
+
+function toggleStratGrid() {
+  _stratGridVisible = !_stratGridVisible;
+  localStorage.setItem('stratGridVisible', _stratGridVisible ? '1' : '0');
+  _applyStratGridVisibility();
+}
+
+function _applyStratGridVisibility() {
+  const grid    = document.getElementById('strat-grid');
+  const hint    = document.getElementById('strat-collapse-hint');
+  const chevron = document.getElementById('strat-chevron');
+  if (!grid) return;
+  if (_stratGridVisible) {
+    grid.style.display = '';
+    if (hint)    hint.textContent = 'скрыть';
+    if (chevron) chevron.style.transform = 'rotate(0deg)';
+  } else {
+    grid.style.display = 'none';
+    if (hint)    hint.textContent = 'показать';
+    if (chevron) chevron.style.transform = 'rotate(180deg)';
+  }
+}
+
+// Apply immediately on page load
+document.addEventListener('DOMContentLoaded', _applyStratGridVisibility);
+
 const renderedCards = new Set();
 
 function schedTog(id){const b=document.getElementById('sch-btn-'+id);const on=b.dataset.on==='1';b.dataset.on=on?'0':'1';
@@ -931,31 +962,45 @@ function acctPanelHtml(id, mode, label) {
 }
 
 const PINNED_STRATS = new Set(['underdogHold', 'momentum']);
-const SECOND_ROW    = new Set(['udgB', 'udgE']);   // ряд 2 — UDG с диапазоном 0.40
+
+// Явный порядок: база → momentum → UDG по коридору от узкого к широкому → остальные
+const STRAT_ORDER = [
+  'underdogHold',   // 0 — база
+  'momentum',       // 1
+  'udgBest',        // 2 — 0.22–0.32 (самый узкий)
+  'udgA',           // 3 — 0.27–0.35
+  'udgC',           // 4 — 0.20–0.35
+  'udgD',           // 5 — 0.22–0.35
+  'udgVol',         // 6 — 0.22–0.35 + фильтр волатильности
+  'udgE',           // 7 — 0.22–0.40
+  'udgB',           // 8 — 0.15–0.40 (самый широкий)
+  // остальные (udgScore, udgFav, udgFlip, udgFlipFav и любые новые) уходят в конец
+];
 
 function updateStratCards(strats, polyData, realTrading) {
   const grid = $('strat-grid');
-  // Порядок: ряд 1 — опорные; ряд 2 — UDG с диапазоном 0.40 (по просьбе); далее остальные
-  const pinnedOrder = ['underdogHold', 'momentum'];   // ряд 1 (сетка в 2 колонки)
-  const secondRow   = ['udgB', 'udgE'];               // ряд 2 — диапазон 0.40
   const orderOf = (id) => {
-    let i = pinnedOrder.indexOf(id); if (i !== -1) return i;        // 0,1 → ряд 1
-    i = secondRow.indexOf(id);       if (i !== -1) return 2 + i;    // 2,3 → ряд 2
-    return 100;                                                     // остальные (порядок стабильный)
+    const i = STRAT_ORDER.indexOf(id);
+    return i !== -1 ? i : 100 + Object.keys(strats).sort().indexOf(id);
   };
   const sortedEntries = Object.entries(strats).sort(([a], [b]) => orderOf(a) - orderOf(b));
+
+  // Update badge count
+  const badge = document.getElementById('strat-count-badge');
+  if (badge) badge.textContent = sortedEntries.length + ' шт.';
+
+  // Apply visibility state (needed after grid is populated)
+  _applyStratGridVisibility();
+
   for (const [id, s] of sortedEntries) {
     if (!renderedCards.has(id)) {
       const isPinned = PINNED_STRATS.has(id);
-      const isRow2   = SECOND_ROW.has(id);
       const card = document.createElement('div');
       card.id = 'scard-' + id;
       card.className = s.manual ? 'strat-card manual-card'
                      : isPinned ? 'strat-card pinned-card'
-                     : isRow2   ? 'strat-card row2-card'
                      : 'strat-card';
-      const badge = isPinned ? '<span class="pinned-badge">★ опора</span>'
-                  : isRow2   ? '<span class="row2-badge">0.40</span>' : '';
+      const badge = isPinned ? '<span class="pinned-badge">★ опора</span>' : '';
       card.innerHTML = `
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
           <div class="lbl" style="margin-bottom:0;">${s.name}${badge}</div>
@@ -976,7 +1021,15 @@ function updateStratCards(strats, polyData, realTrading) {
           <button onclick="schedSave('${id}')" style="font-size:9px;padding:2px 7px;border:1px solid rgba(0,232,122,.5);background:transparent;color:var(--up);border-radius:4px;cursor:pointer;font-family:inherit;">💾</button>
           <span id="sch-msg-${id}" style="color:var(--tx3);"></span>
         </div>`;
-      grid.appendChild(card);
+      // Insert in sorted position instead of always appending
+      const myOrder = orderOf(id);
+      const existingCards = Array.from(grid.children);
+      const insertBefore = existingCards.find(el => {
+        const elId = el.id.replace('scard-', '');
+        return orderOf(elId) > myOrder;
+      });
+      if (insertBefore) grid.insertBefore(card, insertBefore);
+      else grid.appendChild(card);
       renderedCards.add(id);
     }
 
