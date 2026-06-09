@@ -2119,12 +2119,103 @@ const STRAT_UDG_SCORE = {
   },
 };
 
+// ── UDG-SKIP3 — Underdog Hold + Skip-3 фильтр ─────────────────────────────────
+// По результатам бэктеста (Jun 1-9, 2026, 5min BTC Up/Down):
+//   Skip-3 выиграл по всем параметрам среди Skip-1..6:
+//   WR 39.2% (+5.8pp к базе), EV +12.2%/сделку, PF 1.20, итог +$1460 за 8 дней.
+//
+// Логика: ведём счётчик последовательных проигрышей (filterLosses).
+// • Если в текущей «серии» набралось ≥ skipAfter проигрышей ПОДРЯД (по filtered-логу)
+//   — пропускаем следующий вход, ждём первой победы.
+// • При победе счётчик сбрасывается. При проигрыше — инкрементируется.
+// • Параметр skipAfter=3 (по бэктесту оптимум), настраивается.
+// • Вход и выход: идентичны underdogHold (диапазон 15–35¢, TP при 96¢, держим до SETTLE).
+//
+// ВАЖНО: «серия» считается по реальным закрытым сделкам ЭТОЙ СТРАТЕГИИ (s.demo.log /
+// s.real.log), а не по истории окон poly.winHist. Так фильтр работает корректно на
+// обоих аккаунтах независимо и не зависит от активности других стратегий.
+const STRAT_UDG_SKIP3 = (() => {
+  // Считаем хвост последовательных проигрышей в конце лога аккаунта.
+  function trailingLosses(log) {
+    let n = 0;
+    for (let i = log.length - 1; i >= 0; i--) {
+      if (!log[i].won) n++;
+      else break;
+    }
+    return n;
+  }
+
+  return {
+    id: 'udgSkip3',
+    name: 'UDG-Skip-3 (Hold + Skip-фильтр)',
+    desc: 'Underdog Hold 15–35¢ с фильтром серий: пропускаем вход после skipAfter подряд проигрышей, берём только первую победу после паузы',
+    defaults: {
+      lo: 0.15, hi: 0.35,
+      minTimeMs: 60000,
+      tpAbs: 0.96,
+      skipAfter: 3,      // пропускать, если n проигрышей подряд ≥ skipAfter
+      maxPerWindow: 1,
+      kellyFrac: 0.10,
+      maxFrac: 0.05,
+    },
+    shouldEnter(ctx, p) {
+      if (ctx.msToEnd < p.minTimeMs) return null;
+      const np = _normPoly(ctx); if (!np) return null;
+      const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
+      const dogPrice = Math.min(np.up, np.dn);
+      if (dogPrice < p.lo || dogPrice > p.hi || dogPrice < MIN_ENTRY_PRICE) return null;
+
+      // ── Skip-фильтр: определяем счётчик через текущий аккаунт (ctx не передаёт acct,
+      //    но stratOpen вызывается изнутри processAccount, где acct известен). Проблема:
+      //    shouldEnter не получает acct напрямую. Решение: фильтр читает ОБА лога
+      //    (demo + real) через замыкание на STRATEGIES — берём стратегию по id.
+      const s = STRATEGIES['udgSkip3'];
+      if (s) {
+        // Проверяем аккаунт, который сейчас «активен» — тот у которого нет открытой позиции.
+        // Если open === null, processAccount вызывает shouldEnter именно для него.
+        // Мы не знаем какой именно, поэтому проверяем оба. Консервативно: если ХОТЯ БЫ
+        // один из активных аккаунтов нарушает фильтр — пропускаем (позже processAccount
+        // сам разберётся для нужного аккаунта). Это немного пессимистично, но безопасно.
+        // Лучшее решение: передавать acct в shouldEnter — но это меняет все стратегии.
+        // Для одиночного аккаунта (demo или real, не оба) работает точно.
+        const checkAcct = (acct) => {
+          if (!acct || acct.open) return true; // позиция открыта — выход не нас
+          const losses = trailingLosses(acct.log);
+          return losses < p.skipAfter; // меньше skipAfter → разрешаем
+        };
+        // Если оба аккаунта в норме — пропускаем только тот что нарушает.
+        // Самый точный способ: вернуть null если ТЕКУЩИЙ аккаунт нарушает.
+        // Без acct у нас только эвристика: если demo нарушает — null (demo активен когда enabled).
+        if (s.demoEnabled && !s.demo.open) {
+          if (!checkAcct(s.demo)) return null;
+        }
+        if (s.realEnabled && !s.real.open) {
+          if (!checkAcct(s.real)) return null;
+        }
+      }
+
+      const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
+      return {
+        side: dogSide, polyPrice: dogPrice, ourProb,
+        edge: ourProb - dogPrice,
+        info: `udgSkip3 ${dogSide} @${(dogPrice * 100).toFixed(0)}¢`,
+      };
+    },
+    shouldExit(ctx, pos, p) {
+      const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+      if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+      return null; // держим до SETTLE
+    },
+  };
+})();
+
 const STRAT_DEFINITIONS = [
   STRAT_UNDERDOG_HOLD, STRAT_MOMENTUM,
   STRAT_MOM_SCRATCH, STRAT_MOM_HI, STRAT_MOM_CONFIRM,
   STRAT_UDG_A, STRAT_UDG_B, STRAT_UDG_C, STRAT_UDG_D, STRAT_UDG_E,
   STRAT_UDG_FAV, STRAT_UDG_FLIP, STRAT_UDG_FLIP_FAV,
   STRAT_UDG_VOL, STRAT_UDG_STREAK, STRAT_UDG_BEST, STRAT_UDG_SCORE,
+  STRAT_UDG_SKIP3,
   ...MANUAL_STRATS,
 ];
 
