@@ -178,6 +178,7 @@ function saveState() {
         customEnabled: s.customEnabled,
         customParams:  s.customParams,
         name: s.def.name, desc: s.def.desc, manual: !!s.def.manual,
+        underdogHoldAutoBlocked: s.underdogHoldAutoBlocked ?? false,
       };
     }
     out.__global = {
@@ -227,6 +228,7 @@ function loadState() {
       s.params = { ...s.params, ...(st.params ?? {}) };
       s.customEnabled = st.customEnabled ?? false;
       s.customParams  = { ...s.def.defaults, ...(st.customParams ?? {}) };
+      s.underdogHoldAutoBlocked = st.underdogHoldAutoBlocked ?? false;
       applyParams(s);
     }
     if (stored.__global && typeof stored.__global.invertSignal === 'boolean') {
@@ -2424,6 +2426,17 @@ const STRAT_DEFINITIONS = [
   ...MANUAL_STRATS,
 ];
 
+// ─── UNDERDOG HOLD LOSS-STREAK CIRCUIT BREAKER ───────────────────────────────
+// Если underdogHold набирает UNDERDOG_HOLD_LOSS_LIMIT поражений подряд (в demo-логе)
+// — у всех стратегий из UNDERDOG_LOSS_DEPENDENT_IDS отключается только РЕАЛЬНАЯ
+// торговля (realEnabled → false). Demo продолжает работать — статистика копится.
+// В Telegram уходит уведомление. Флаг underdogHoldAutoBlocked снимается только
+// вручную: пользователь выключает и снова включает real на дашборде.
+const UNDERDOG_HOLD_LOSS_LIMIT = 8;
+const UNDERDOG_LOSS_DEPENDENT_IDS = [
+  'udgSkip3', 'udgSkip3B', 'udgSkip3C', 'udgSkip3D', 'udgSkip3E',
+];
+
 // ─── REAL-TRADING RISK CONTROLS ──────────────────────────────────────────────
 // These guards exist to prevent the bot from spamming trades on dead markets
 // where one side has already won and the loser-token trades at 1-5¢. On those
@@ -2545,7 +2558,8 @@ function initStrategies() {
       realDailyLossDate:     null,     // 'YYYY-MM-DD' (UTC) — bookkeeping for the daily cap
       realDailyLossAmount:   0,        // running USD loss for the current UTC day
       realDailyAutoDisabled: false,    // user must re-enable real after the cap fires
-      _skip3ResetIdx:        0,        // udgSkip3: index in underdogHold log from which to count new loss streak
+      _skip3ResetIdx:          0,        // udgSkip3: index in underdogHold log from which to count new loss streak
+      underdogHoldAutoBlocked: false,   // true = real auto-disabled by 8-loss streak breaker; cleared on manual real toggle-ON
     };
   }
 }
@@ -2974,6 +2988,42 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
   acct.open = null;
   saveState();
   console.log(`[${s.def.id}] ${o.isReal ? 'REAL' : 'SIM'} CLOSE ${o.side} reason=${reason} pnl=${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} shares=${shares}`);
+
+  // ── UnderDogHold loss-streak circuit breaker ───────────────────────────────
+  // После каждого закрытия демо-сделки underdogHold проверяем серию поражений.
+  // Если набралось UNDERDOG_HOLD_LOSS_LIMIT подряд — выключаем REAL у зависимых
+  // стратегий и шлём TG. Demo не трогаем — статистика продолжает копиться.
+  if (s.def.id === 'underdogHold' && !o.isReal) {
+    const log = s.demo.log;
+    let streak = 0;
+    for (let i = log.length - 1; i >= 0; i--) {
+      if (log[i].dirty) continue;   // dirty-записи не считаем
+      if (!log[i].won) streak++;
+      else break;
+    }
+    if (streak >= UNDERDOG_HOLD_LOSS_LIMIT) {
+      const blocked = [];
+      for (const depId of UNDERDOG_LOSS_DEPENDENT_IDS) {
+        const dep = STRATEGIES[depId];
+        if (!dep) continue;
+        if (dep.realEnabled && !dep.underdogHoldAutoBlocked) {
+          dep.realEnabled             = false;
+          dep.underdogHoldAutoBlocked = true;
+          blocked.push(depId);
+          console.warn(`[udg-breaker] ${depId} real AUTO-DISABLED — underdogHold ${streak} losses in a row`);
+        }
+      }
+      if (blocked.length > 0) {
+        saveState();
+        sendTg(
+          `🚨 <b>UnderDogHold: ${streak} поражений подряд</b>\n` +
+          `Лимит сработал (≥${UNDERDOG_HOLD_LOSS_LIMIT}). Реальная торговля выключена у:\n` +
+          blocked.map(id => `• <code>${_tgEsc(id)}</code>`).join('\n') + '\n\n' +
+          `Demo продолжает работать. Разберись вручную и включи real обратно на дашборде.`
+        );
+      }
+    }
+  }
 
   // ── Update real-trade tracking for the next-entry guards ──────────────────
   if (o.isReal) {
@@ -3753,6 +3803,12 @@ app.post('/api/strategy/:id/real/toggle', (req, res) => {
   const s = STRATEGIES[req.params.id];
   if (!s) return res.status(404).json({ error: 'not found' });
   s.realEnabled = !s.realEnabled;
+  // Если пользователь вручную включает real — снимаем блокировку стрик-брейкера.
+  // Выключение вручную блокировку не ставит (это действие самого пользователя).
+  if (s.realEnabled && s.underdogHoldAutoBlocked) {
+    s.underdogHoldAutoBlocked = false;
+    console.log(`[udg-breaker] ${req.params.id} manually re-enabled — auto-block cleared`);
+  }
   saveState();
   console.log(`[strategy] ${req.params.id} real → ${s.realEnabled ? 'ON' : 'OFF'}`);
   res.json({ id: req.params.id, realEnabled: s.realEnabled });
