@@ -128,6 +128,9 @@ let poly = {
   winLo: null,        // min BTC в текущем окне
 };
 const WINHIST_MAX = 40;
+// FIX: победители завершённых окон ПО КНИГЕ (slug → 'UP'/'DOWN') — для честной
+// разметки calibLog. Заполняется в fetchPolyMarket при смене окна.
+let winnerBySlug = {};
 let polyClobOk = true;
 
 // Chainlink
@@ -624,6 +627,10 @@ async function fetchPolyMarket() {
 
   if (slugChanged) {
     poly.status = 'searching';
+    // FIX: polyClobOk раньше «защёлкивался» после первого сбоя CLOB навсегда —
+    // цены внутри окна переставали обновляться до рестарта. Теперь каждое новое
+    // окно даёт CLOB новый шанс.
+    polyClobOk = true;
     // ── Зафиксировать ЗАВЕРШЁННОЕ окно в историю (до перезаписи opening/prices) ──
     // Победитель — по последней цене книги (≥98¢, как настоящий резолв). Если окно
     // не дорезолвилось в книге — пропускаем запись (не засоряем историю догадкой).
@@ -638,6 +645,12 @@ async function fetchPolyMarket() {
           poly.winHist.push({ slug: poly.market.eventSlug, winner: u > d ? 'UP' : 'DOWN',
                               move: +move.toFixed(2), range: +range.toFixed(2) });
           if (poly.winHist.length > WINHIST_MAX) poly.winHist.shift();
+          // FIX: победитель окна по КНИГЕ — для resolveCalib (раньше calib
+          // размечался по нашему BTC-фиду, который на тонких окнах ~4% времени
+          // расходится с резолвом Polymarket → грязные метки калибровки).
+          winnerBySlug[poly.market.eventSlug] = u > d ? 'UP' : 'DOWN';
+          const wkeys = Object.keys(winnerBySlug);
+          if (wkeys.length > 200) delete winnerBySlug[wkeys[0]];
         }
       }
     } catch (_) {}
@@ -2415,14 +2428,167 @@ const STRAT_UDG_SKIP3_E = {
   },
 };
 
+// ── LAG FAVORITE («отстающий фаворит») ────────────────────────────────────────
+// Бектест на посекундных данных 1–11 июня (вход по ASK через 0.8с после сигнала,
+// chase-отсечка 15%, SETTLE по книге): BTC уже заметно ушёл от открытия окна
+// (≥sigMin σ нормированного движения И ≥minDeltaUSD$), а ЛИДИРУЮЩАЯ сторона всё
+// ещё стоит 50–70¢ — книга отстаёт от спота. Берём лидера, держим до SETTLE.
+// 5m: IS (1–7 июня) n=71 ROI +44%/сделку PF 3.6 | OOS (8–11) n=87 ROI +14.3% PF 1.57.
+// Эдж устойчив к задержке до 5с и доп. слиппеджу +5%.
+
+// Реализованная волатильность 1-секундных ретёрнов BTC, bps (по тикам Coinbase).
+function getRV1s(sec = 60) {
+  const r = ticks.filter(t => t.time >= Date.now() - sec * 1000);
+  if (r.length < 10) return null;
+  const bySec = new Map();
+  for (const t of r) bySec.set(Math.floor(t.time / 1000), t.price);
+  const arr = [...bySec.values()];
+  if (arr.length < 10) return null;
+  let s = 0, s2 = 0, n = 0;
+  for (let i = 1; i < arr.length; i++) {
+    const ret = Math.log(arr[i] / arr[i - 1]) * 10000; // bps
+    s += ret; s2 += ret * ret; n++;
+  }
+  if (!n) return null;
+  return Math.sqrt(Math.max(0, s2 / n - (s / n) ** 2));
+}
+
+const STRAT_LAG_FAV = {
+  id: 'lagFav', name: 'Lag Favorite (отстающий фаворит)',
+  desc: 'BTC ушёл ≥2σ и ≥$25 от открытия, а лидер ещё 50–70¢ — книга отстаёт. Берём лидера, держим до SETTLE.',
+  defaults: { sigMin: 2.0, sigMax: 12, minDeltaUSD: 25, lo: 0.50, hi: 0.70,
+              elFromSec: 30, elToSec: 240, minTimeMs: 45000,
+              maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    if (ctx.curBTC == null || ctx.openingBTC == null) return null;
+    const winLenSec = (typeof POLY_WINDOW_SEC === 'number' ? POLY_WINDOW_SEC : 300);
+    const elapsed   = winLenSec - ctx.msToEnd / 1000;
+    if (elapsed < p.elFromSec || elapsed > p.elToSec) return null;
+
+    const deltaUSD = ctx.curBTC - ctx.openingBTC;
+    if (Math.abs(deltaUSD) < p.minDeltaUSD) return null;      // отсечка микродвижений
+    const deltaBps = deltaUSD / ctx.openingBTC * 10000;
+    const rv = getRV1s(60);
+    if (rv == null) return null;
+    // пол rv 0.5bps — иначе при штиле сигма «взрывается» на копеечных движениях
+    const sigma = Math.abs(deltaBps) / (Math.max(0.5, rv) * Math.sqrt(Math.max(1, elapsed)));
+    if (sigma < p.sigMin || sigma > p.sigMax) return null;
+
+    const dir = deltaUSD > 0 ? 'UP' : 'DOWN';
+    const np  = _normPoly(ctx); if (!np) return null;
+    const price = dir === 'UP' ? np.up : np.dn;
+    if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+
+    const ourProb = _clampProb(Math.min(0.72, price + 0.12), price);
+    return { side: dir, polyPrice: price, ourProb, edge: ourProb - price,
+             info: `lagFav ${dir} σ=${sigma.toFixed(1)} Δ$${deltaUSD.toFixed(0)} @${(price * 100).toFixed(0)}¢` };
+  },
+  shouldExit() { return null; },   // hold до SETTLE — по бектесту лучший выход
+};
+
+// ── FLOMD TACTIC (v3) ─────────────────────────────────────────────────────────
+// Дог-стратегия с полностью автоматическим управлением режимом. Все пороги
+// найдены на посекундных данных 1–11 июня: подбор на IS (1–7), проверка на OOS
+// (8–11); вся сетка соседних порогов (54 комбинации) в плюсе на ОБОИХ периодах.
+//
+// ВХОД: дешёвая сторона 25–35¢ (НЕ 15–35: дог ниже 25¢ токсичен — WR 7–22%,
+//   EV −1.4…−6.7$/сделку на обоих периодах; возврат с 20¢ почти не случается).
+//   Выход: hold до SETTLE + TP@96¢ (lock-выход перед закрытием помогает только
+//   НЕфильтрованному потоку; после гейтов он режет победителей — отвергнут).
+//
+// ГЕЙТЫ (порядок от дешёвых к дорогим):
+//   1) NIGHT 21–23 UTC (00–02 МСК): час 21 UTC = −5.0$/сделку, 22 UTC = −2.5.
+//      Часы 20 и 23 ~нейтральны — разблокированы (в v1 блок был шире, 20–24).
+//   2) CAP |Δ| ТЕКУЩЕГО окна ≥$60: EV гниёт с ростом движения (−4.3 у $75–100).
+//   3) TREND-ПАУЗА: |сумма ПОДПИСАННЫХ движений последних 3 окон| в [$40..$300) —
+//      однонаправленная перемолка, доги ложатся сериями. Возврат АВТОМАТИЧЕСКИЙ:
+//      сумма < $40 (устаканилось) или ≥ $300 (перелёт → снапбэк, доги в плюсе).
+//   4) МАШИНА по demo-логу underdogHold: 8 лузов подряд → halt; 3 вина подряд →
+//      resume. («1 win» включается слишком рано, vol-триггеры не фильтруют.)
+//
+// Проверено и ОТВЕРГНУТО (чтобы не возвращаться): абсорбция CVD-против-движения
+// (IS +0.9, OOS не подтвердилась), сторона дога UP/DOWN (симметрично), фаза окна
+// при входе (нестабильна между периодами), lock-выход (см. выше).
+//
+// Итог на 11 днях ($10/сделку, ask-филлы + 0.8с): IS +$391 (n=84), OOS +$247
+// (n=162) против −$793 у голого underdogHold 15–35.
+// Гейт чистый (пересчитывается из лога underdogHold на каждом тике) — ничего не
+// «застревает» между рестартами и при demo-delay.
+function _flomdRegimeActive(p) {
+  const ref = STRATEGIES['underdogHold'];
+  if (!ref || !ref.demo || !ref.demo.log.length) return true;   // нет истории — работаем
+  let active = true, ls = 0, ws = 0;
+  for (const t of ref.demo.log) {
+    if (t.dirty) continue;
+    if (active) {
+      ls = t.won ? 0 : ls + 1;
+      if (ls >= p.skipAfter) { active = false; ws = 0; ls = 0; }
+    } else {
+      ws = t.won ? ws + 1 : 0;
+      if (ws >= p.resumeWins) { active = true; ls = 0; ws = 0; }
+    }
+  }
+  return active;
+}
+const STRAT_FLOMD = {
+  id: 'flomd', name: 'FLOMD TACTIC',
+  desc: 'Дог 25–35¢ (ниже 25¢ — токсично) с авто-режимом: стоп после 8 лузов underdogHold, возврат после 3 винов, ночной блок 21–23 UTC, cap движения окна ≥$60, пауза при перемолке $40–300 за 3 окна.',
+  defaults: { lo: 0.25, hi: 0.35, minTimeMs: 60000, tpAbs: 0.96,
+              skipAfter: 8, resumeWins: 3, blockFromUTC: 21, blockToUTC: 23,
+              maxEntryMoveUSD: 60, trendPauseLoUSD: 40, trendPauseHiUSD: 300, trendPauseWindows: 3,
+              maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    // ночной блок (UTC, поддержан переход через полночь)
+    const h = new Date().getUTCHours();
+    const f = p.blockFromUTC % 24, t = p.blockToUTC % 24;
+    const blocked = (f === t) ? false : (f < t ? (h >= f && h < t) : (h >= f || h < t));
+    if (blocked) return null;
+    // ── Анти-тренд гейт 1: ТЕКУЩЕЕ окно уже уехало слишком далеко ─────────────
+    if (ctx.curBTC != null && ctx.openingBTC != null
+        && Math.abs(ctx.curBTC - ctx.openingBTC) >= p.maxEntryMoveUSD) return null;
+    // ── Анти-тренд гейт 2: однонаправленная перемолка соседних окон ───────────
+    // Пауза в полосе [lo..hi); авто-возврат при <lo (штиль) или ≥hi (перелёт).
+    const wh = poly.winHist || [];
+    if (wh.length >= p.trendPauseWindows) {
+      let sum = 0;
+      for (let i = wh.length - p.trendPauseWindows; i < wh.length; i++) sum += (wh[i].move || 0);
+      const grind = Math.abs(sum);
+      if (grind >= p.trendPauseLoUSD && grind < p.trendPauseHiUSD) return null;
+    }
+    // авто-режим по логу underdogHold
+    if (!_flomdRegimeActive(p)) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const dogPrice = Math.min(np.up, np.dn);
+    if (dogPrice < p.lo || dogPrice > p.hi || dogPrice < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
+    return { side: dogSide, polyPrice: dogPrice, ourProb, edge: ourProb - dogPrice,
+             info: `FLOMD ${dogSide} @${(dogPrice * 100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) {
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    return null;
+  },
+};
+
+// ── АКТИВНЫЙ НАБОР (вычищен от мусора) ────────────────────────────────────────
+// Убраны по итогам бектеста на реальных данных и анализа demo/real-логов:
+//   momentum/momScratch/momHi/momConfirm — модель predictPoly минусит даже в demo;
+//   udgA/B/C/D/E, udgBest, udgFav, udgStreak, udgScore — A/B-тест коридоров
+//   завершён: при реалистичном исполнении (ask + 0.8с) эдж знакопеременный;
+//   udgFlip/udgFlipFav — к тому же не работали с demo-delay (мутация state
+//   в shouldEnter); udgSkip3/B/C/E — дубли, оставлен лучший D.
+// Ядро: underdogHold (опорный лог для skip/брейкера/FLOMD), udgSkip3D, udgVol,
+// новые lagFav и FLOMD TACTIC, 2 ручных слота.
 const STRAT_DEFINITIONS = [
-  STRAT_UNDERDOG_HOLD, STRAT_MOMENTUM,
-  STRAT_MOM_SCRATCH, STRAT_MOM_HI, STRAT_MOM_CONFIRM,
-  STRAT_UDG_A, STRAT_UDG_B, STRAT_UDG_C, STRAT_UDG_D, STRAT_UDG_E,
-  STRAT_UDG_FAV, STRAT_UDG_FLIP, STRAT_UDG_FLIP_FAV,
-  STRAT_UDG_VOL, STRAT_UDG_STREAK, STRAT_UDG_BEST, STRAT_UDG_SCORE,
-  STRAT_UDG_SKIP3, STRAT_UDG_SKIP3_B, STRAT_UDG_SKIP3_C,
-  STRAT_UDG_SKIP3_D, STRAT_UDG_SKIP3_E,
+  STRAT_UNDERDOG_HOLD,
+  STRAT_UDG_SKIP3_D,
+  STRAT_UDG_VOL,
+  STRAT_LAG_FAV,
+  STRAT_FLOMD,
   ...MANUAL_STRATS,
 ];
 
@@ -2433,8 +2599,10 @@ const STRAT_DEFINITIONS = [
 // В Telegram уходит уведомление. Флаг underdogHoldAutoBlocked снимается только
 // вручную: пользователь выключает и снова включает real на дашборде.
 const UNDERDOG_HOLD_LOSS_LIMIT = 8;
+// FLOMD сюда НЕ входит — у него собственный авто-режим (стоп/возврат внутри
+// shouldEnter). Остальные skip-зависимые стопаются по-старому, включение вручную.
 const UNDERDOG_LOSS_DEPENDENT_IDS = [
-  'udgSkip3', 'udgSkip3B', 'udgSkip3C', 'udgSkip3D', 'udgSkip3E',
+  'udgSkip3D',
 ];
 
 // ─── REAL-TRADING RISK CONTROLS ──────────────────────────────────────────────
@@ -2449,6 +2617,11 @@ const REAL_MIN_MS_TO_END     = 45_000;   // Need ≥45s left in window — else 
 const REAL_COOLDOWN_MS       = 20_000;   // Wait ≥20s after any real close before opening again
 let REAL_DAILY_LOSS_CAP      = parseFloat(process.env.REAL_DAILY_LOSS_CAP || '3');  // USD; -$3 default
                                                                                     // After cap is hit, real autodisables until next UTC day
+// FIX: предел СУММАРНОЙ открытой real-экспозиции (доля от баланса кошелька).
+// Каждая стратегия сайзится от полного баланса — без этого лимита при N
+// включённых стратегиях совокупный риск умножался на N.
+const MAX_TOTAL_EXPOSURE_FRAC = Math.max(0.05, Math.min(1.0,
+  parseFloat(process.env.MAX_TOTAL_EXPOSURE_FRAC || '0.5') || 0.5));
 
 // ── АБСОЛЮТНЫЙ TAKE-PROFIT ─────────────────────────────────────────────────────
 // Бинарный токен не может стоить дороже 100¢, поэтому ПРОЦЕНТНЫЙ TP при высоком
@@ -2630,15 +2803,27 @@ function logCalibEntry(s, ctx, entry, acct, isReal) {
 }
 
 // Дописать фактический исход окна для записей, чьё окно уже закрылось.
+// FIX: сначала пытаемся взять победителя ПО КНИГЕ (winnerBySlug) — это резолв
+// Polymarket. Фид BTC используется только как фолбэк (помечается dirty=1).
 function resolveCalib(ctx) {
   const now = Date.now();
   for (const r of calibLog) {
     if (r.outcome !== null) continue;
     if (now < r.windowEnd) continue;
+    const bookWinner = winnerBySlug[r.slug];
+    if (bookWinner) {
+      r.outcome = bookWinner;
+      r.ourWin  = (r.outcome === r.side) ? 1 : 0;
+      continue;
+    }
     if (now > r.windowEnd + 120000) { r.outcome = 'stale'; continue; } // не поймали закрытие
     if (ctx.curBTC == null || r.openingBTC == null) continue;
-    r.outcome = ctx.curBTC > r.openingBTC ? 'UP' : 'DOWN';
-    r.ourWin  = (r.outcome === r.side) ? 1 : 0;
+    // окно закрылось, книга не дорезолвилась — ждём ещё (до 120с), потом фолбэк
+    if (now > r.windowEnd + 30000) {
+      r.outcome = ctx.curBTC > r.openingBTC ? 'UP' : 'DOWN';
+      r.ourWin  = (r.outcome === r.side) ? 1 : 0;
+      r.dirty   = 1;
+    }
   }
 }
 
@@ -2689,6 +2874,21 @@ function stratOpen(s, ctx, entry, acct, isReal) {
   // Each guard below applies ONLY to real orders — demo keeps trading
   // unhindered so we still collect statistics.
   if (isRealOrder) {
+    // [Guard F — FIX] Общий лимит экспозиции: каждая real-стратегия сайзится от
+    // ПОЛНОГО баланса кошелька, поэтому при нескольких включённых стратегиях
+    // суммарный риск умножался. Теперь сумма открытых real-позиций + новая
+    // не может превысить MAX_TOTAL_EXPOSURE_FRAC от баланса.
+    let totalOpenReal = 0;
+    for (const id2 in STRATEGIES) {
+      const op = STRATEGIES[id2].real && STRATEGIES[id2].real.open;
+      if (op && op.isReal) totalOpenReal += op.sizeUSDC || 0;
+    }
+    const expCap = (realBalance !== null ? realBalance : effectiveBalance) * MAX_TOTAL_EXPOSURE_FRAC;
+    if (totalOpenReal + sizeUSDC > expCap) {
+      console.log(`[real] SKIP — total exposure $${(totalOpenReal + sizeUSDC).toFixed(2)} would exceed cap $${expCap.toFixed(2)}`);
+      return;
+    }
+
     // Reset daily-loss bucket if we've rolled into a new UTC day.
     const utcToday = new Date().toISOString().slice(0, 10);
     if (s.realDailyLossDate !== utcToday) {
@@ -3080,12 +3280,13 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
       const b = await fetchRealBalance();
       if (b !== null) {
         realBalance = b;
-        const mom = STRATEGIES.momentum;
-        if (mom && !mom.real.open) {
-          const before = mom.real.balance;
+        // FIX: раньше тут всегда обновлялся STRATEGIES.momentum, даже если
+        // закрылась другая стратегия. Обновляем ИМЕННО эту стратегию (s).
+        if (s && s.real && !s.real.open) {
+          const before = s.real.balance;
           const drift  = b - before;
-          mom.real.balance = b;
-          mom.real.peakBalance = Math.max(mom.real.peakBalance, b);
+          s.real.balance = b;
+          s.real.peakBalance = Math.max(s.real.peakBalance, b);
           saveState();
           console.log(`[real] balance sync (${label}): $${before.toFixed(2)} → $${b.toFixed(2)} (drift=${drift >= 0 ? '+' : ''}$${drift.toFixed(2)})`);
           // If there's meaningful drift from model, tell the user.
@@ -3290,6 +3491,14 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
 
 function processAccount(s, ctx, acct, isReal) {
   if (acct.open) {
+    // FIX (settle-race): пока позиция открыта и poly.market ещё принадлежит ЕЁ
+    // окну — запоминаем последние цены этого рынка. На SETTLE используем их,
+    // а не «снапшот после expiry», который мог уже принадлежать НОВОМУ рынку.
+    if (poly.market && poly.market.eventSlug === acct.open.marketSlug
+        && ctx.polyUp != null && ctx.polyDn != null && Date.now() < acct.open.expiryTime + 4000) {
+      acct.open._lastOwnUp = ctx.polyUp;
+      acct.open._lastOwnDn = ctx.polyDn;
+    }
     // Реальный вход ещё не подтверждён (BUY висит / идёт проверка заполнения)?
     // НЕ трогаем позицию логикой выхода — иначе можем отменить собственную
     // покупку до того, как она зальётся (так была упущена сделка @13.5¢).
@@ -3314,11 +3523,20 @@ function processAccount(s, ctx, acct, isReal) {
       //    Это освобождает позицию и позволяет войти в новое окно.
       const SETTLE_FAST_WAIT_MS = 5000; // максимум 5 сек ожидания, не 60
 
-      // Снимаем snapshot цен в момент первого попадания в блок
-      if (!acct.open._settleSnapshotUp && ctx.polyUp != null) {
-        acct.open._settleSnapshotUp = ctx.polyUp;
-        acct.open._settleSnapshotDn = ctx.polyDn;
-        acct.open._settleDetectedAt = Date.now();
+      // Снимаем snapshot цен в момент первого попадания в блок.
+      // FIX: приоритет — последним ценам СВОЕГО рынка (_lastOwnUp/_lastOwnDn),
+      // сохранённым пока poly.market ещё принадлежал окну позиции. Старый
+      // снапшот мог взять цены уже НОВОГО рынка (fetchPolyMarket крутится каждые 1.5с).
+      if (!acct.open._settleSnapshotUp) {
+        if (acct.open._lastOwnUp != null) {
+          acct.open._settleSnapshotUp = acct.open._lastOwnUp;
+          acct.open._settleSnapshotDn = acct.open._lastOwnDn;
+          acct.open._settleDetectedAt = Date.now();
+        } else if (ctx.polyUp != null && poly.market && poly.market.eventSlug === acct.open.marketSlug) {
+          acct.open._settleSnapshotUp = ctx.polyUp;
+          acct.open._settleSnapshotDn = ctx.polyDn;
+          acct.open._settleDetectedAt = Date.now();
+        }
       }
 
       // Пробуем определить победителя: сначала по snapshot, потом по текущим ценам
@@ -3352,10 +3570,13 @@ function processAccount(s, ctx, acct, isReal) {
     // DEMO: реалистичный вход с задержкой и отсечкой «улетевшей» цены.
     if (acct === s.demo && DEMO_ENTRY_DELAY_MS > 0) {
       const now   = Date.now();
+      // FIX: намерение, зафиксированное в прошлом окне, не должно исполняться
+      // в новом (чужие цены / чужой рынок). Сбрасываем при смене slug.
+      if (acct.pendingEntry && acct.pendingEntry.slug !== ctx.win.slug) acct.pendingEntry = null;
       const entry = s.def.shouldEnter(ctx, s.params);
       if (!acct.pendingEntry) {
         // фиксируем намерение войти и ждём задержку (заливаемся позже, по факту-цене)
-        if (entry) acct.pendingEntry = { side: entry.side, signalPrice: entry.polyPrice, fireAt: now + DEMO_ENTRY_DELAY_MS };
+        if (entry) acct.pendingEntry = { side: entry.side, signalPrice: entry.polyPrice, fireAt: now + DEMO_ENTRY_DELAY_MS, slug: ctx.win.slug };
         return;
       }
       if (now < acct.pendingEntry.fireAt) return;       // ещё ждём
@@ -3395,7 +3616,8 @@ function processStrategies() {
 
     // Real account — places CLOB orders if wallet is configured; otherwise sim
     if (s.realEnabled && !s.pendingReal) {
-      const canReal = REAL_TRADING && !!polyWallet && !!polyApiCreds;
+      // FIX: в SIM-режиме реальные ордера ЗАПРЕЩЕНЫ — данные BTC симулированные.
+      const canReal = REAL_TRADING && !!polyWallet && !!polyApiCreds && !isSim;
       processAccount(s, ctx, s.real, canReal);
     }
   }
@@ -3476,6 +3698,11 @@ function startSim() {
   if (isSim) return;
   isSim    = true;
   wsStatus = 'sim';
+  // FIX: в SIM-режиме обнуляем Chainlink-цену, чтобы getStratContext брал цену
+  // из sim-тиков, а не из устаревшего (или, как раньше, ПОДМЕНЁННОГО фейком)
+  // chain.currentPrice. Реальная торговля в SIM полностью запрещена (см. canReal).
+  chain.currentPrice = null;
+  chain.available    = false;
   console.log('[sim] started (ws blocked/failed) — будет пробовать вернуться в live каждые 30с');
   // Авто-восстановление: пока в SIM, периодически пробуем переподключиться к Coinbase.
   // Как только WS оживёт, message-handler вызовет exitSim() и SIM остановится.
@@ -3507,7 +3734,9 @@ function startSim() {
     const buyBias = 0.48 + trend * 0.09 + (Math.random() - 0.5) * 0.22;
     const n = Math.floor(Math.random() * 5) + 1;
     for (let i = 0; i < n; i++) pushTick(price + (Math.random() - 0.5) * noise * 0.25, Math.random() * 0.35 + 0.005, Math.random() > buyBias ? 'BUY' : 'SELL');
-    if (chain.enabled) { chain.currentPrice = price + (Math.random() - 0.5) * 1; chain.lastUpdate = Date.now(); chain.available = true; }
+    // FIX: раньше тут sim ПЕРЕЗАПИСЫВАЛ chain.currentPrice фейковой ценой —
+    // при живом REAL_TRADING это позволяло ставить реальные ордера по выдуманному
+    // BTC. Теперь sim живёт только в ticks/book; chain не трогаем.
   }, 120);
 }
 
