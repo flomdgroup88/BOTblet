@@ -2531,10 +2531,11 @@ function _flomdRegimeActive(p) {
 }
 const STRAT_FLOMD = {
   id: 'flomd', name: 'FLOMD TACTIC',
-  desc: 'Дог 25–35¢ (ниже 25¢ — токсично) с авто-режимом: стоп после 8 лузов underdogHold, возврат после 3 винов, ночной блок 21–23 UTC, cap движения окна ≥$60, пауза при перемолке $40–300 за 3 окна.',
+  desc: 'Дог 25–35¢ (ниже 25¢ — токсично) с авто-режимом: стоп после 8 лузов underdogHold, возврат после 3 винов, ночной блок 21–23 UTC, cap движения окна ≥$60, пауза при перемолке $40–300 за 3 окна, дог только ПО направлению потока (v4).',
   defaults: { lo: 0.25, hi: 0.35, minTimeMs: 60000, tpAbs: 0.96,
               skipAfter: 8, resumeWins: 3, blockFromUTC: 21, blockToUTC: 23,
               maxEntryMoveUSD: 60, trendPauseLoUSD: 40, trendPauseHiUSD: 300, trendPauseWindows: 3,
+              skipAgainstGrind: 1, grindDirMinUSD: 20,
               maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
   shouldEnter(ctx, p) {
     if (ctx.msToEnd < p.minTimeMs) return null;
@@ -2549,10 +2550,11 @@ const STRAT_FLOMD = {
     // ── Анти-тренд гейт 2: однонаправленная перемолка соседних окон ───────────
     // Пауза в полосе [lo..hi); авто-возврат при <lo (штиль) или ≥hi (перелёт).
     const wh = poly.winHist || [];
+    let grindSum = null;
     if (wh.length >= p.trendPauseWindows) {
-      let sum = 0;
-      for (let i = wh.length - p.trendPauseWindows; i < wh.length; i++) sum += (wh[i].move || 0);
-      const grind = Math.abs(sum);
+      grindSum = 0;
+      for (let i = wh.length - p.trendPauseWindows; i < wh.length; i++) grindSum += (wh[i].move || 0);
+      const grind = Math.abs(grindSum);
       if (grind >= p.trendPauseLoUSD && grind < p.trendPauseHiUSD) return null;
     }
     // авто-режим по логу underdogHold
@@ -2561,6 +2563,15 @@ const STRAT_FLOMD = {
     const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
     const dogPrice = Math.min(np.up, np.dn);
     if (dogPrice < p.lo || dogPrice > p.hi || dogPrice < MIN_ENTRY_PRICE) return null;
+    // ── Гейт 3 (v4): дог ПРОТИВ направления перемолки ─────────────────────────
+    // Берём дога только ПО направлению макро-потока последних окон: рынок
+    // перемалывает вниз → берём только DOWN-дога (ставка на откат вверх внутри
+    // окна при нисходящем фоне — это ловля ножа: IS EV +1.7 vs +5.3, OOS −1.2
+    // vs +2.0). v3→v4: IS +43.9%→+51.2%, OOS +13.8%→+16.9% на сделку.
+    if (p.skipAgainstGrind && grindSum != null && Math.abs(grindSum) >= (p.grindDirMinUSD || 20)) {
+      const dogUp = dogSide === 'UP';
+      if ((dogUp && grindSum < 0) || (!dogUp && grindSum > 0)) return null;
+    }
     const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
     return { side: dogSide, polyPrice: dogPrice, ourProb, edge: ourProb - dogPrice,
              info: `FLOMD ${dogSide} @${(dogPrice * 100).toFixed(0)}¢` };
