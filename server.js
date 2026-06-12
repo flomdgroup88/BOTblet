@@ -587,7 +587,18 @@ async function fetchClobMidpoint(tokenId) {
       // the inner quotes are degenerate — treat the book as effectively empty
       // and fall through to the midpoint endpoint.
       const spread = bestAsk - bestBid;
-      if (spread < 0.50) { clobQuotes[tokenId] = { bid: bestBid, ask: bestAsk }; return (bestBid + bestAsk) / 2; }
+      if (spread < 0.50) {
+        // ML-ЛОГ: размеры лучших уровней — фича ликвидности для обучающего лога
+        let bidSz = null, askSz = null;
+        try {
+          const be = book.bids.find(x => parseFloat(x.price) === bestBid);
+          const ae = book.asks.find(x => parseFloat(x.price) === bestAsk);
+          bidSz = be ? parseFloat(be.size) : null;
+          askSz = ae ? parseFloat(ae.size) : null;
+        } catch (_) {}
+        clobQuotes[tokenId] = { bid: bestBid, ask: bestAsk, bidSz, askSz };
+        return (bestBid + bestAsk) / 2;
+      }
     } else if (bestBid !== null) {
       return bestBid;
     } else if (bestAsk !== null) {
@@ -2428,6 +2439,183 @@ const STRAT_UDG_SKIP3_E = {
   },
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ML-ЛОГ — обучающий журнал. Пишет в ml_log.jsonl три типа записей:
+//   entry   — полный слепок рынка на каждом demo-входе (все фичи);
+//   exit    — исход сделки (связан с entry по id);
+//   virtual — КОНТРФАКТЫ: входы, заблокированные гейтами FLOMD, с их
+//             виртуальным исходом по резолву окна. Это данные, которых нет в
+//             обычных логах: что было бы со сделками, которые мы НЕ открыли —
+//             по ним видно, сколько реально экономит каждый гейт.
+// Самообучение здесь сознательно «мягкое»: бот копит доказательства и строит
+// выводы (/api/ml/report + ежедневный TG-дайджест), но НЕ крутит пороги сам —
+// на малых данных авто-тюнинг переподгоняется под шум за считанные дни.
+// Файл ml_log.jsonl приноси на перекалибровку — по нему пороги пересчитываются
+// на реальном форвард-объёме.
+// ═══════════════════════════════════════════════════════════════════════════
+const ML_LOG_FILE = path.join(__dirname, 'ml_log.jsonl');
+let mlPendingVirtual = [];
+const _mlBlockedSeen = new Set();
+let _mlSeq = 0, _mlCvdSlug = null, _mlCvdAt = 0, _mlLastDigestDay = null;
+
+function mlAppend(rec) {
+  try { fs.appendFile(ML_LOG_FILE, JSON.stringify(rec) + '\n', () => {}); } catch (_) {}
+}
+function _mlFlow10s() {
+  const cutoff = Date.now() - 10000;
+  let buy = 0, tot = 0;
+  for (let i = ticks.length - 1; i >= 0; i--) {
+    const tk = ticks[i];
+    if (tk.time < cutoff) break;
+    tot += tk.qty || 0; if (tk.side === 'BUY') buy += tk.qty || 0;
+  }
+  return tot > 0 ? +(buy / tot).toFixed(3) : null;
+}
+function _mlRV60() {
+  const r = ticks.filter(tk => tk.time >= Date.now() - 60000);
+  if (r.length < 10) return null;
+  const bySec = new Map();
+  for (const tk of r) bySec.set(Math.floor(tk.time / 1000), tk.price);
+  const arr = [...bySec.values()];
+  if (arr.length < 10) return null;
+  let s1 = 0, s2 = 0, n = 0;
+  for (let i = 1; i < arr.length; i++) {
+    const ret = Math.log(arr[i] / arr[i - 1]) * 10000;
+    s1 += ret; s2 += ret * ret; n++;
+  }
+  return n ? +Math.sqrt(Math.max(0, s2 / n - (s1 / n) ** 2)).toFixed(3) : null;
+}
+function _mlCvdWin(ctx) {
+  if (_mlCvdSlug !== ctx.win.slug) { _mlCvdSlug = ctx.win.slug; _mlCvdAt = cvd; }
+  return +(cvd - _mlCvdAt).toFixed(3);
+}
+function mlSnapshot(ctx) {
+  const wh = poly.winHist || [];
+  const gsum = n => wh.length >= n ? +wh.slice(-n).reduce((a, x) => a + (x.move || 0), 0).toFixed(1) : null;
+  let stk = 0;
+  if (wh.length) for (let i = wh.length - 1; i >= 0; i--) { if (wh[i].winner === wh[wh.length - 1].winner) stk++; else break; }
+  const qu = poly.market ? (clobQuotes[poly.market.tokenIdUp]   || {}) : {};
+  const qd = poly.market ? (clobQuotes[poly.market.tokenIdDown] || {}) : {};
+  return {
+    t: Date.now(), slug: ctx.win.slug, hr: new Date().getUTCHours(),
+    msToEnd: ctx.msToEnd,
+    deltaUSD: (ctx.curBTC != null && ctx.openingBTC != null) ? +(ctx.curBTC - ctx.openingBTC).toFixed(1) : null,
+    up: ctx.polyUp, dn: ctx.polyDn,
+    upAskSz: qu.askSz ?? null, dnAskSz: qd.askSz ?? null,
+    upBidSz: qu.bidSz ?? null, dnBidSz: qd.bidSz ?? null,
+    prevMove: wh.length ? +(wh[wh.length - 1].move || 0).toFixed(1) : null,
+    grind3: gsum(3), grind6: gsum(6),
+    outcomeStreak: wh.length ? stk : null,
+    flow10s: _mlFlow10s(), rv60: _mlRV60(), cvdWin: _mlCvdWin(ctx),
+  };
+}
+function mlEntry(s, ctx, entry, o) {
+  const id = (++_mlSeq) + '-' + Date.now();
+  o._mlId = id;
+  mlAppend({ type: 'entry', id, strat: s.def.id, side: entry.side,
+             sigPrice: entry.polyPrice, fill: o.polyEntryPrice, ...mlSnapshot(ctx) });
+}
+function mlExit(s, o, pnl, won, reason, dirty) {
+  mlAppend({ type: 'exit', id: o._mlId || null, strat: s.def.id, t: Date.now(),
+             slug: o.marketSlug, side: o.side, fill: o.polyEntryPrice,
+             pnl: +pnl.toFixed(3), won: won ? 1 : 0, reason, dirty: dirty ? 1 : 0 });
+}
+function mlBlocked(stratId, gate, ctx, side, price) {
+  const key = ctx.win.slug + '|' + stratId + '|' + gate;
+  if (_mlBlockedSeen.has(key)) return;
+  _mlBlockedSeen.add(key);
+  if (_mlBlockedSeen.size > 4000) {
+    const it = _mlBlockedSeen.values();
+    for (let i = 0; i < 2000; i++) _mlBlockedSeen.delete(it.next().value);
+  }
+  mlPendingVirtual.push({ type: 'virtual', strat: stratId, gate, side, price,
+                          endTs: ctx.win.endTs, ...mlSnapshot(ctx) });
+}
+// Резолвер контрфактов: окно закрылось → проставляем виртуальный исход
+setInterval(() => {
+  if (!mlPendingVirtual.length) return;
+  const now = Date.now(); const keep = [];
+  for (const v of mlPendingVirtual) {
+    const wnr = winnerBySlug[v.slug];
+    if (wnr) {
+      const won = v.side === wnr;
+      const fill = Math.min(0.99, v.price + 0.01);            // ~ask-филл
+      v.won = won ? 1 : 0;
+      v.virtPnl = +(won ? 10 * (1 / fill - 1) : -10).toFixed(2); // на $10 ставку
+      mlAppend(v);
+    } else if (now < v.endTs + 180000) keep.push(v);
+  }
+  mlPendingVirtual = keep;
+}, 5000);
+
+function mlReadAll(sinceMs) {
+  try {
+    if (!fs.existsSync(ML_LOG_FILE)) return [];
+    const out = [];
+    for (const line of fs.readFileSync(ML_LOG_FILE, 'utf8').split('\n')) {
+      if (!line) continue;
+      try { const r = JSON.parse(line); if (!sinceMs || r.t >= sinceMs) out.push(r); } catch (_) {}
+    }
+    return out;
+  } catch (_) { return []; }
+}
+function _mlBucket(v, edges) {
+  if (v == null || !isFinite(v)) return null;
+  for (let i = 0; i < edges.length - 1; i++) if (v >= edges[i] && v < edges[i + 1]) return edges[i] + '..' + edges[i + 1];
+  return null;
+}
+function mlBuildReport(days) {
+  const since = Date.now() - days * 86400000;
+  const recs = mlReadAll(since);
+  const entries = {}; const out = { days, generatedAt: new Date().toISOString(), strategies: {}, gates: {}, buckets: {}, flags: [] };
+  for (const r of recs) if (r.type === 'entry') entries[r.id] = r;
+  const agg = (o, k, pnl, won) => {
+    const a = o[k] || (o[k] = { n: 0, pnl: 0, wins: 0 });
+    a.n++; a.pnl = +(a.pnl + pnl).toFixed(2); a.wins += won ? 1 : 0;
+  };
+  const bDelta = {}, bHour = {}, bPrice = {}, bGrindDir = {};
+  for (const r of recs) {
+    if (r.type === 'exit' && !r.dirty) {
+      agg(out.strategies, r.strat, r.pnl, r.won);
+      const e = entries[r.id];
+      if (e) {
+        agg(bHour, 'h' + e.hr, r.pnl, r.won);
+        if (e.deltaUSD != null) agg(bDelta, _mlBucket(Math.abs(e.deltaUSD), [0, 30, 60, 100, 9999]) || 'na', r.pnl, r.won);
+        agg(bPrice, _mlBucket(r.fill, [0, 0.2, 0.3, 0.4, 0.6, 1.01]) || 'na', r.pnl, r.won);
+        if (e.grind3 != null) {
+          const withGrind = (r.side === 'UP') === (e.grind3 > 0);
+          agg(bGrindDir, Math.abs(e.grind3) < 20 ? 'flat' : (withGrind ? 'with' : 'against'), r.pnl, r.won);
+        }
+      }
+    }
+    if (r.type === 'virtual' && r.virtPnl != null) agg(out.gates, r.gate, r.virtPnl, r.won);
+  }
+  for (const o of [out.strategies, out.gates, bDelta, bHour, bPrice, bGrindDir])
+    for (const k in o) { o[k].ev = +(o[k].pnl / o[k].n).toFixed(2); o[k].wr = +(o[k].wins / o[k].n * 100).toFixed(1); }
+  out.buckets = { absDelta: bDelta, hourUTC: bHour, fillPrice: bPrice, grindDirection: bGrindDir };
+  // «сэкономлено гейтом» = −(виртуальный PnL заблокированного), если он минусовой
+  for (const gname in out.gates) out.gates[gname].savedUSD = +(-out.gates[gname].pnl).toFixed(2);
+  for (const [zone, o] of Object.entries(out.buckets))
+    for (const [k, a] of Object.entries(o))
+      if (a.n >= 30 && a.ev <= -1) out.flags.push(`${zone}:${k} — EV ${a.ev}$/сделку на n=${a.n} — присмотреться`);
+  return out;
+}
+// Ежедневный TG-дайджест в 06:00 UTC (09:00 МСК)
+setInterval(() => {
+  const d = new Date();
+  if (d.getUTCHours() !== 6) return;
+  const day = d.toISOString().slice(0, 10);
+  if (_mlLastDigestDay === day) return;
+  _mlLastDigestDay = day;
+  try {
+    const r = mlBuildReport(1);
+    const sl = Object.entries(r.strategies).map(([k, a]) => `• ${_tgEsc(k)}: ${a.n} сдел., EV ${a.ev >= 0 ? '+' : ''}$${a.ev}, WR ${a.wr}%`).join('\n') || '• сделок не было';
+    const gl = Object.entries(r.gates).map(([k, a]) => `• ${_tgEsc(k)}: блокир. ${a.n}, сэкономлено ${a.savedUSD >= 0 ? '+' : ''}$${a.savedUSD}`).join('\n') || '• блокировок не было';
+    const fl = r.flags.length ? '\n⚠️ ' + r.flags.map(_tgEsc).join('\n⚠️ ') : '';
+    sendTg(`📊 <b>ML-дайджест за сутки</b>\n\n<b>Стратегии (demo):</b>\n${sl}\n\n<b>Гейты FLOMD (контрфакты):</b>\n${gl}${fl}`);
+  } catch (_) {}
+}, 60000);
+
 // ── LAG FAVORITE («отстающий фаворит») ────────────────────────────────────────
 // АУДИТ (повторная проверка всего пайплайна): первоначальная σ-версия опиралась
 // на записанную delta_sigma из логов коллектора, формулу которой бот не может
@@ -2539,14 +2727,22 @@ const STRAT_FLOMD = {
               maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
   shouldEnter(ctx, p) {
     if (ctx.msToEnd < p.minTimeMs) return null;
+    // Сначала проверяем КАНДИДАТА (дог в коридоре) — если его нет, гейты молчат;
+    // если есть, но гейт блокирует — пишем контрфакт в ML-лог (mlBlocked), чтобы
+    // потом видеть, сколько каждый гейт сэкономил/недозаработал на самом деле.
+    const np = _normPoly(ctx); if (!np) return null;
+    const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const dogPrice = Math.min(np.up, np.dn);
+    if (dogPrice < p.lo || dogPrice > p.hi || dogPrice < MIN_ENTRY_PRICE) return null;
+    const blockedBy = (gate) => { try { mlBlocked('flomd', gate, ctx, dogSide, dogPrice); } catch (_) {} return null; };
     // ночной блок (UTC, поддержан переход через полночь)
     const h = new Date().getUTCHours();
     const f = p.blockFromUTC % 24, t = p.blockToUTC % 24;
-    const blocked = (f === t) ? false : (f < t ? (h >= f && h < t) : (h >= f || h < t));
-    if (blocked) return null;
+    const night = (f === t) ? false : (f < t ? (h >= f && h < t) : (h >= f || h < t));
+    if (night) return blockedBy('night');
     // ── Анти-тренд гейт 1: ТЕКУЩЕЕ окно уже уехало слишком далеко ─────────────
     if (ctx.curBTC != null && ctx.openingBTC != null
-        && Math.abs(ctx.curBTC - ctx.openingBTC) >= p.maxEntryMoveUSD) return null;
+        && Math.abs(ctx.curBTC - ctx.openingBTC) >= p.maxEntryMoveUSD) return blockedBy('entryMoveCap');
     // ── Анти-тренд гейт 2: однонаправленная перемолка соседних окон ───────────
     // Пауза в полосе [lo..hi); авто-возврат при <lo (штиль) или ≥hi (перелёт).
     const wh = poly.winHist || [];
@@ -2555,23 +2751,17 @@ const STRAT_FLOMD = {
       grindSum = 0;
       for (let i = wh.length - p.trendPauseWindows; i < wh.length; i++) grindSum += (wh[i].move || 0);
       const grind = Math.abs(grindSum);
-      if (grind >= p.trendPauseLoUSD && grind < p.trendPauseHiUSD) return null;
+      if (grind >= p.trendPauseLoUSD && grind < p.trendPauseHiUSD) return blockedBy('trendPause');
     }
-    // авто-режим по логу underdogHold
-    if (!_flomdRegimeActive(p)) return null;
-    const np = _normPoly(ctx); if (!np) return null;
-    const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
-    const dogPrice = Math.min(np.up, np.dn);
-    if (dogPrice < p.lo || dogPrice > p.hi || dogPrice < MIN_ENTRY_PRICE) return null;
     // ── Гейт 3 (v4): дог ПРОТИВ направления перемолки ─────────────────────────
-    // Берём дога только ПО направлению макро-потока последних окон: рынок
-    // перемалывает вниз → берём только DOWN-дога (ставка на откат вверх внутри
-    // окна при нисходящем фоне — это ловля ножа: IS EV +1.7 vs +5.3, OOS −1.2
-    // vs +2.0). v3→v4: IS +43.9%→+51.2%, OOS +13.8%→+16.9% на сделку.
+    // Берём дога только ПО направлению макро-потока последних окон (ловля ножа
+    // против потока: IS EV +1.7 vs +5.3, OOS −1.2 vs +2.0).
     if (p.skipAgainstGrind && grindSum != null && Math.abs(grindSum) >= (p.grindDirMinUSD || 20)) {
       const dogUp = dogSide === 'UP';
-      if ((dogUp && grindSum < 0) || (!dogUp && grindSum > 0)) return null;
+      if ((dogUp && grindSum < 0) || (!dogUp && grindSum > 0)) return blockedBy('againstGrind');
     }
+    // авто-режим по логу underdogHold
+    if (!_flomdRegimeActive(p)) return blockedBy('machine');
     const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
     return { side: dogSide, polyPrice: dogPrice, ourProb, edge: ourProb - dogPrice,
              info: `FLOMD ${dogSide} @${(dogPrice * 100).toFixed(0)}¢` };
@@ -3017,6 +3207,7 @@ function stratOpen(s, ctx, entry, acct, isReal) {
     actualShares:       null,           // ← filled after BUY response confirms
   };
   acct.balance    -= sizeUSDC;
+  if (acct === s.demo) { try { mlEntry(s, ctx, entry, acct.open); } catch (_) {} }  // ML-ЛОГ
   if (s.params.maxPerWindow) acct._cdCount = (acct._cdCount || 0) + 1;
   if (isRealOrder) {
     s.pendingReal = true;
@@ -3199,6 +3390,7 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
   acct.balance    += proceeds;
   acct.peakBalance = Math.max(acct.peakBalance, acct.balance);
   acct.log.push(entry);
+  if (acct === s.demo) { try { mlExit(s, o, pnl, won, reason, entry.dirty === 1); } catch (_) {} }  // ML-ЛОГ
   if (acct.log.length > 500) acct.log.shift();
   acct.open = null;
   saveState();
@@ -4146,6 +4338,15 @@ app.get('/api/export/calib.csv', (_, res) => {
 // ─── REAL TRADING API ENDPOINTS ───────────────────────────────────────────────
 
 // GET /api/real/status — wallet address, readiness, live USDC balance
+app.get('/api/ml/report', (req, res) => {
+  try { res.json(mlBuildReport(Math.max(0.1, parseFloat(req.query.days || '3')))); }
+  catch (e) { res.status(500).json({ error: String(e) }); }
+});
+app.get('/api/ml/export', (_, res) => {
+  if (!fs.existsSync(ML_LOG_FILE)) return res.status(404).json({ error: 'нет лога' });
+  res.download(ML_LOG_FILE);
+});
+
 app.get('/api/real/status', async (_, res) => {
   const balance = polyWallet && polyApiCreds ? await fetchRealBalance() : null;
   if (balance !== null) realBalance = balance;
