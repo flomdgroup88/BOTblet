@@ -2638,7 +2638,7 @@ setInterval(() => {
 const STRAT_LAG_FAV = {
   id: 'lagFav', name: 'Lag Favorite (отстающий фаворит)',
   desc: 'BTC ушёл ≥$90 от открытия, а лидер ещё 50–70¢ — книга отстаёт. Берём лидера, держим до SETTLE. IS +32%/сделку PF 2.5 | OOS +20% PF 1.9.',
-  defaults: { minDeltaUSD: 90, lo: 0.50, hi: 0.70,
+  defaults: { minDeltaUSD: 90, lo: 0.55, hi: 0.72,
               elFromSec: 30, elToSec: 240, minTimeMs: 45000,
               maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
   shouldEnter(ctx, p) {
@@ -2724,6 +2724,7 @@ const STRAT_FLOMD = {
               skipAfter: 8, resumeWins: 3, blockFromUTC: 21, blockToUTC: 23,
               maxEntryMoveUSD: 60, trendPauseLoUSD: 40, trendPauseHiUSD: 300, trendPauseWindows: 3,
               skipAgainstGrind: 1, grindDirMinUSD: 20,
+              stopLossPrice: 0.05,
               maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
   shouldEnter(ctx, p) {
     if (ctx.msToEnd < p.minTimeMs) return null;
@@ -2769,8 +2770,55 @@ const STRAT_FLOMD = {
   shouldExit(ctx, pos, p) {
     const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
     if (mid != null && p.tpAbs && mid >= p.tpAbs) return { reason: 'TP', exitPrice: mid };
+    // СТОП-ЛОСС (добавлен по реальным данным 12 июня): если дог упал ниже
+    // stopLossPrice — позиция мертва, режем не дожидаясь SETTLE. Бектест с
+    // комиссией: +$498 vs +$370 у hold, OOS удвоился ($63→$139). Это
+    // автоматизация ручного «режь покойника».
+    if (mid != null && p.stopLossPrice && mid <= p.stopLossPrice) return { reason: 'SL', exitPrice: mid };
     return null;
   },
+};
+
+// ── FAVMOM (фаворит-моментум) ─────────────────────────────────────────────────
+// НОВАЯ стратегия (бектест на данных 1–12 июня с комиссией). Идея ПРОТИВОПОЛОЖНА
+// lagFav: не ждём отставания книги, а едем НА продолжении тренда. BTC рванул от
+// открытия (Δ≥порог), книга УЖЕ оценила лидера дорого (72–88¢) — но движение
+// сильное и до конца окна обычно не разворачивается. Берём дорогого лидера,
+// держим до SETTLE. WR ~85%, торгует часто (не редкий сетап как lagFav).
+// favMomA Δ90 72-88: n=447, +$122, 8/11 дней+, WR 85%.
+// favMomB Δ120 75-90: n=214, +$69, 9/11 дней+, WR 88% (реже, но надёжнее).
+function _favMomEntry(ctx, p, tag) {
+  if (ctx.msToEnd < (p.minTimeMs || 45000)) return null;
+  if (ctx.curBTC == null || ctx.openingBTC == null) return null;
+  const winLenSec = (typeof POLY_WINDOW_SEC === 'number' ? POLY_WINDOW_SEC : 300);
+  const elapsed   = winLenSec - ctx.msToEnd / 1000;
+  if (elapsed < p.elFromSec || elapsed > p.elToSec) return null;
+  const deltaUSD = ctx.curBTC - ctx.openingBTC;
+  if (Math.abs(deltaUSD) < p.minDeltaUSD) return null;
+  const dir = deltaUSD > 0 ? 'UP' : 'DOWN';
+  const np = _normPoly(ctx); if (!np) return null;
+  const price = dir === 'UP' ? np.up : np.dn;
+  if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+  if (price > 0.90) return null;   // не платим > 90¢ за лидера (плохой R/R)
+  const ourProb = _clampProb(Math.min(0.95, price + 0.06), price);
+  return { side: dir, polyPrice: price, ourProb, edge: ourProb - price,
+           info: `${tag} ${dir} Δ$${deltaUSD.toFixed(0)} @${(price * 100).toFixed(0)}¢` };
+}
+const STRAT_FAVMOM_A = {
+  id: 'favMomA', name: 'Fav Momentum A (продолжение тренда)',
+  desc: 'BTC рванул Δ≥$90, лидер уже 72–88¢ — едем на продолжении до SETTLE. WR 85%, 8/11 дней+, +$122.',
+  defaults: { minDeltaUSD: 90, lo: 0.72, hi: 0.88, elFromSec: 20, elToSec: 200,
+              minTimeMs: 45000, maxPerWindow: 1, kellyFrac: 0.08, maxFrac: 0.04 },
+  shouldEnter(ctx, p) { return _favMomEntry(ctx, p, 'favMomA'); },
+  shouldExit() { return null; },
+};
+const STRAT_FAVMOM_B = {
+  id: 'favMomB', name: 'Fav Momentum B (сильный тренд, надёжнее)',
+  desc: 'Δ≥$120, лидер 75–90¢. Реже, но WR 88%, 9/11 дней+, +$69.',
+  defaults: { minDeltaUSD: 120, lo: 0.75, hi: 0.90, elFromSec: 20, elToSec: 200,
+              minTimeMs: 45000, maxPerWindow: 1, kellyFrac: 0.08, maxFrac: 0.04 },
+  shouldEnter(ctx, p) { return _favMomEntry(ctx, p, 'favMomB'); },
+  shouldExit() { return null; },
 };
 
 // ── АКТИВНЫЙ НАБОР (вычищен от мусора) ────────────────────────────────────────
@@ -2789,11 +2837,12 @@ const STRAT_FLOMD = {
 //   FLOMD TACTIC v3 — топ набора (+$558/11дн);
 //   удалены как слабые: udgSkip3D 22-30 (+$53, OOS −1.5%), udgVol (~$0).
 const STRAT_DEFINITIONS = [
-  STRAT_UNDERDOG_HOLD,
-  STRAT_UDG_SKIP3,
-  STRAT_LAG_FAV,
-  STRAT_LAG_FAV_75,
-  STRAT_FLOMD,
+  STRAT_UNDERDOG_HOLD,   // опора-датчик, на REAL не включать
+  STRAT_LAG_FAV,         // отстающий фаворит (книга < спота)
+  STRAT_FAVMOM_A,        // НОВАЯ: продолжение тренда (книга > спота)
+  STRAT_FAVMOM_B,        // НОВАЯ: сильный тренд, WR 88%
+  STRAT_FLOMD,           // дог 25-35 + машина + стоп-лосс 5¢
+  STRAT_UDG_SKIP3,       // дог после 3 лузов опоры
   ...MANUAL_STRATS,
 ];
 
