@@ -2147,9 +2147,9 @@ const STRAT_UDG_SCORE = {
 const STRAT_UDG_SKIP3 = {
   id: 'udgSkip3',
   name: 'UDG-Skip-3 (Hold + Skip-фильтр)',
-  desc: 'Underdog Hold 15–35¢ + фильтр серий: пропускаем вход если underdogHold demo проиграл skipAfter раз подряд',
+  desc: 'Дог 10–35¢ ТОЛЬКО после 3 лузов underdogHold подряд. Лучший skip по бектесту с комиссией: IS +10.1%, OOS +9.0%, +$214/11дн. Верхнюю границу НЕ поднимать (40¢ → минус).',
   defaults: {
-    lo: 0.15, hi: 0.35,
+    lo: 0.10, hi: 0.35,
     minTimeMs: 60000,
     tpAbs: 0.96,
     skipAfter: 3,
@@ -2429,34 +2429,28 @@ const STRAT_UDG_SKIP3_E = {
 };
 
 // ── LAG FAVORITE («отстающий фаворит») ────────────────────────────────────────
-// Бектест на посекундных данных 1–11 июня (вход по ASK через 0.8с после сигнала,
-// chase-отсечка 15%, SETTLE по книге): BTC уже заметно ушёл от открытия окна
-// (≥sigMin σ нормированного движения И ≥minDeltaUSD$), а ЛИДИРУЮЩАЯ сторона всё
-// ещё стоит 50–70¢ — книга отстаёт от спота. Берём лидера, держим до SETTLE.
-// 5m: IS (1–7 июня) n=71 ROI +44%/сделку PF 3.6 | OOS (8–11) n=87 ROI +14.3% PF 1.57.
-// Эдж устойчив к задержке до 5с и доп. слиппеджу +5%.
-
-// Реализованная волатильность 1-секундных ретёрнов BTC, bps (по тикам Coinbase).
-function getRV1s(sec = 60) {
-  const r = ticks.filter(t => t.time >= Date.now() - sec * 1000);
-  if (r.length < 10) return null;
-  const bySec = new Map();
-  for (const t of r) bySec.set(Math.floor(t.time / 1000), t.price);
-  const arr = [...bySec.values()];
-  if (arr.length < 10) return null;
-  let s = 0, s2 = 0, n = 0;
-  for (let i = 1; i < arr.length; i++) {
-    const ret = Math.log(arr[i] / arr[i - 1]) * 10000; // bps
-    s += ret; s2 += ret * ret; n++;
-  }
-  if (!n) return null;
-  return Math.sqrt(Math.max(0, s2 / n - (s / n) ** 2));
-}
-
+// АУДИТ (повторная проверка всего пайплайна): первоначальная σ-версия опиралась
+// на записанную delta_sigma из логов коллектора, формулу которой бот не может
+// воспроизвести вживую точно (реконструкция совпадает лишь на ~70%) — при живой
+// формуле эдж разваливался. Поэтому зашита ЧИСТАЯ Δ-версия без сигмы — все её
+// входы бот вычисляет из того, что у него есть: цена BTC и книга Polymarket.
+//
+// Логика: BTC ушёл от открытия окна на ≥$90, а ЛИДИРУЮЩАЯ сторона всё ещё
+// стоит 50–70¢ — книга отстаёт от спота. Берём лидера, держим до SETTLE.
+// Бектест (вход по ASK +0.8с, chase 15%, SETTLE по книге), подбор IS 1–7 июня,
+// проверка OOS 8–11: IS n=55 ROI +32.3%/сделку PF 2.48 maxDD $33 |
+// OOS n=30 ROI +20.0% PF 1.86 maxDD $20. Соседние пороги тоже в плюсе на обоих
+// периодах: Δ≥$75 (+18.4/+6.0), Δ≥$120 (+50/+26), коридор 55–75 (+17.4/+12.3).
+// ~8 сделок/день; в совсем тихие дни может не торговать вообще — это нормально.
+//
+// Вторая ступень lagFav75 (Δ≥$75): IS +18.4% PF 1.66 | OOS +6.0% PF 1.21, ~15
+// сделок/день — слабее на сделку, но быстрее набирает статистику. ВНИМАНИЕ: её
+// входы — НАДмножество входов lagFav (каждый сигнал Δ≥90 сначала проходит 75),
+// в demo это два независимых счёта для сравнения, на REAL включать только ОДНУ.
 const STRAT_LAG_FAV = {
   id: 'lagFav', name: 'Lag Favorite (отстающий фаворит)',
-  desc: 'BTC ушёл ≥2σ и ≥$25 от открытия, а лидер ещё 50–70¢ — книга отстаёт. Берём лидера, держим до SETTLE.',
-  defaults: { sigMin: 2.0, sigMax: 12, minDeltaUSD: 25, lo: 0.50, hi: 0.70,
+  desc: 'BTC ушёл ≥$90 от открытия, а лидер ещё 50–70¢ — книга отстаёт. Берём лидера, держим до SETTLE. IS +32%/сделку PF 2.5 | OOS +20% PF 1.9.',
+  defaults: { minDeltaUSD: 90, lo: 0.50, hi: 0.70,
               elFromSec: 30, elToSec: 240, minTimeMs: 45000,
               maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
   shouldEnter(ctx, p) {
@@ -2467,13 +2461,7 @@ const STRAT_LAG_FAV = {
     if (elapsed < p.elFromSec || elapsed > p.elToSec) return null;
 
     const deltaUSD = ctx.curBTC - ctx.openingBTC;
-    if (Math.abs(deltaUSD) < p.minDeltaUSD) return null;      // отсечка микродвижений
-    const deltaBps = deltaUSD / ctx.openingBTC * 10000;
-    const rv = getRV1s(60);
-    if (rv == null) return null;
-    // пол rv 0.5bps — иначе при штиле сигма «взрывается» на копеечных движениях
-    const sigma = Math.abs(deltaBps) / (Math.max(0.5, rv) * Math.sqrt(Math.max(1, elapsed)));
-    if (sigma < p.sigMin || sigma > p.sigMax) return null;
+    if (Math.abs(deltaUSD) < p.minDeltaUSD) return null;
 
     const dir = deltaUSD > 0 ? 'UP' : 'DOWN';
     const np  = _normPoly(ctx); if (!np) return null;
@@ -2482,9 +2470,19 @@ const STRAT_LAG_FAV = {
 
     const ourProb = _clampProb(Math.min(0.72, price + 0.12), price);
     return { side: dir, polyPrice: price, ourProb, edge: ourProb - price,
-             info: `lagFav ${dir} σ=${sigma.toFixed(1)} Δ$${deltaUSD.toFixed(0)} @${(price * 100).toFixed(0)}¢` };
+             info: `lagFav ${dir} Δ$${deltaUSD.toFixed(0)} @${(price * 100).toFixed(0)}¢` };
   },
   shouldExit() { return null; },   // hold до SETTLE — по бектесту лучший выход
+};
+
+const STRAT_LAG_FAV_75 = {
+  id: 'lagFav75', name: 'Lag Favorite 75 (активная ступень)',
+  desc: 'То же, но порог Δ≥$75: больше сделок, ниже EV. IS +18.4% PF 1.66 | OOS +6.0% PF 1.21. На REAL — только одну из двух ступеней.',
+  defaults: { minDeltaUSD: 75, lo: 0.50, hi: 0.70,
+              elFromSec: 30, elToSec: 240, minTimeMs: 45000,
+              maxPerWindow: 1, kellyFrac: 0.08, maxFrac: 0.04 },
+  shouldEnter(ctx, p) { return STRAT_LAG_FAV.shouldEnter(ctx, p); },
+  shouldExit() { return null; },
 };
 
 // ── FLOMD TACTIC (v3) ─────────────────────────────────────────────────────────
@@ -2583,11 +2581,17 @@ const STRAT_FLOMD = {
 //   в shouldEnter); udgSkip3/B/C/E — дубли, оставлен лучший D.
 // Ядро: underdogHold (опорный лог для skip/брейкера/FLOMD), udgSkip3D, udgVol,
 // новые lagFav и FLOMD TACTIC, 2 ручных слота.
+// ФИНАЛЬНЫЙ НАБОР ДЛЯ ДЕМО-ТЕСТА (по верифицированному бектесту с комиссией):
+//   underdogHold — ОПОРА: кормит логом машину skip и FLOMD, на REAL не включать;
+//   udgSkip3 10-35 — лучший skip (+$214/11дн);
+//   lagFav Δ90 (+$220, maxDD $35) и lagFav75 Δ75 — две ступени, на REAL одна;
+//   FLOMD TACTIC v3 — топ набора (+$558/11дн);
+//   удалены как слабые: udgSkip3D 22-30 (+$53, OOS −1.5%), udgVol (~$0).
 const STRAT_DEFINITIONS = [
   STRAT_UNDERDOG_HOLD,
-  STRAT_UDG_SKIP3_D,
-  STRAT_UDG_VOL,
+  STRAT_UDG_SKIP3,
   STRAT_LAG_FAV,
+  STRAT_LAG_FAV_75,
   STRAT_FLOMD,
   ...MANUAL_STRATS,
 ];
@@ -2602,7 +2606,7 @@ const UNDERDOG_HOLD_LOSS_LIMIT = 8;
 // FLOMD сюда НЕ входит — у него собственный авто-режим (стоп/возврат внутри
 // shouldEnter). Остальные skip-зависимые стопаются по-старому, включение вручную.
 const UNDERDOG_LOSS_DEPENDENT_IDS = [
-  'udgSkip3D',
+  'udgSkip3',
 ];
 
 // ─── REAL-TRADING RISK CONTROLS ──────────────────────────────────────────────
