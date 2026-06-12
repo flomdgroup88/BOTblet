@@ -2719,8 +2719,12 @@ function _flomdRegimeActive(p) {
 }
 const STRAT_FLOMD = {
   id: 'flomd', name: 'FLOMD TACTIC',
-  desc: 'Дог 25–35¢ (ниже 25¢ — токсично) с авто-режимом: стоп после 8 лузов underdogHold, возврат после 3 винов, ночной блок 21–23 UTC, cap движения окна ≥$60, пауза при перемолке $40–300 за 3 окна, дог только ПО направлению потока (v4).',
-  defaults: { lo: 0.25, hi: 0.35, minTimeMs: 60000, tpAbs: 0.96,
+  desc: 'Дог 25–35¢ (ниже 25¢ — токсично) с авто-режимом: стоп после 8 лузов underdogHold, возврат после 3 винов, ночной блок 21–23 UTC, cap движения окна ≥$60, пауза при перемолке $40–300 за 3 окна, дог ПО направлению потока, SL 5¢, TP выкл (держим до резолва).',
+  // Свип 1¢ (train/test): SL-плато 3-6¢, центр 5¢. TP ВЫКЛЮЧЕН: с SL=5¢
+  // «без TP» лучше TP96 на КАЖДОМ SL плато (+$40-60, оба периода) — продажа
+  // победителя на 96¢ по bid−fee жертвует ~4-5¢/шэр против $1.00 резолва,
+  // а защиту от разворота уже даёт SL. tpAbs можно вернуть из UI (напр. 0.96).
+  defaults: { lo: 0.25, hi: 0.35, minTimeMs: 60000, tpAbs: 0,
               skipAfter: 8, resumeWins: 3, blockFromUTC: 21, blockToUTC: 23,
               maxEntryMoveUSD: 60, trendPauseLoUSD: 40, trendPauseHiUSD: 300, trendPauseWindows: 3,
               skipAgainstGrind: 1, grindDirMinUSD: 20,
@@ -2836,12 +2840,18 @@ const STRAT_FAVMOM_B = {
 //   lagFav Δ90 (+$220, maxDD $35) и lagFav75 Δ75 — две ступени, на REAL одна;
 //   FLOMD TACTIC v3 — топ набора (+$558/11дн);
 //   удалены как слабые: udgSkip3D 22-30 (+$53, OOS −1.5%), udgVol (~$0).
+// ── ИТОГОВЫЙ НАБОР ────────────────────────────────────────────────────────────
+// Параллельность: каждая стратегия смотрит на свой acct.open — входят независимо.
+// Защиты от суммарного риска: MAX_TOTAL_EXPOSURE_FRAC (50% баланса, Guard F).
+// favMomB убрана: 47% окон пересекается с favMomA → дублёр, не независимый сигнал.
+// lagFav и favMomA пересекаются в 18% окон, но с РАЗНЫХ СТОРОН (lagFav 55-72¢,
+// favMomA 72-88¢) — это разные ставки на разные исходы, ок.
+// underdogHold — ТОЛЬКО demo (датчик для FLOMD и skip3), на REAL не включать.
 const STRAT_DEFINITIONS = [
-  STRAT_UNDERDOG_HOLD,   // опора-датчик, на REAL не включать
-  STRAT_LAG_FAV,         // отстающий фаворит (книга < спота)
-  STRAT_FAVMOM_A,        // НОВАЯ: продолжение тренда (книга > спота)
-  STRAT_FAVMOM_B,        // НОВАЯ: сильный тренд, WR 88%
-  STRAT_FLOMD,           // дог 25-35 + машина + стоп-лосс 5¢
+  STRAT_UNDERDOG_HOLD,   // датчик — DEMO only
+  STRAT_LAG_FAV,         // отстающий фаворит: книга < спота, OOS +17%
+  STRAT_FAVMOM_A,        // моментум: книга > спота, WR 85%, 8/11 дней+
+  STRAT_FLOMD,           // дог + машина + SL 5¢
   STRAT_UDG_SKIP3,       // дог после 3 лузов опоры
   ...MANUAL_STRATS,
 ];
