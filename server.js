@@ -3218,6 +3218,141 @@ const STRAT_FAVMOM_B = {
 // РАБОЧИЕ (можно REAL): lagFav, favMomA, FLOMD, udgSkip3 + 5 режим-следящих.
 // Каждая стратегия смотрит свой acct.open (входят независимо); суммарный риск
 // ограничен MAX_TOTAL_EXPOSURE_FRAC (Guard F, 50% баланса).
+// ═══════════════════════════════════════════════════════════════════════════
+// REGIME SWITCH — единая авто-переключающая стратегия (ДОГ ↔ MOMENTUM).
+// ─────────────────────────────────────────────────────────────────────────────
+// Идея (из анализа 47k demo-сделок): underdog и momentum АНТИкоррелированы
+// (−0.58 по дням). underdog зарабатывает в ЧОПЕ (рынок пилит у нуля, реальны
+// развороты к 50/50), momentum — в ТРЕНДЕ (BTC идёт в одну сторону, дог дохнет).
+// Эта стратегия меряет режим рынка по истории окон и сама выбирает сторону:
+//   • ЧОП  (efficiency ratio низкий) → берём дешёвую сторону (DOG-плечо)
+//   • ТРЕНД (efficiency ratio высокий) → берём momentum (MOM-плечо)
+//   • середина → разрешаем спор недавним реализованным эджем плеча, иначе пропуск
+// Переключение по САМОМУ BTC (не по своему PnL) — мгновенное, не опаздывает на
+// сломе режима, в отличие от трейлинг-PnL переключателя (тот залипает).
+// Доп-защита: пер-плечевой предохранитель по своему demo-логу (стоп плеча после
+// серии лузов, возврат после серии винов) — автоматически банит «протухшее» плечо.
+
+// Efficiency ratio за последние N окон: |Σ движение| / Σ|движение|. 0 = чоп, 1 = тренд.
+function _regimeState(p) {
+  const wh = poly.winHist || [];
+  if (wh.length < Math.max(p.regimeMinWindows, 1)) return { ready: false, er: null, vol: 0, net: 0 };
+  const slice = wh.slice(-p.regimeWindows);
+  let net = 0, gross = 0;
+  for (const w of slice) { const m = w.move || 0; net += m; gross += Math.abs(m); }
+  return { ready: true, er: gross > 0 ? Math.abs(net) / gross : 0, vol: gross, net };
+}
+// Разрешено ли плечо: машина по СВОЕМУ demo-логу, считаем только сделки этого плеча
+// (по тегу [DOG]/[MOM] в entryInfo). Стоп после breakerLosses лузов подряд,
+// возврат после breakerWins винов подряд. Чистый пересчёт на каждом тике.
+function _legAllowed(self, legTag, p) {
+  if (!self || !self.demo || !self.demo.log.length) return true;
+  let active = true, ls = 0, ws = 0;
+  for (const t of self.demo.log) {
+    if (t.dirty) continue;
+    if ((t.entryInfo || '').indexOf(legTag) === -1) continue;
+    if (active) { ls = t.won ? 0 : ls + 1; if (ls >= p.breakerLosses) { active = false; ws = 0; ls = 0; } }
+    else        { ws = t.won ? ws + 1 : 0; if (ws >= p.breakerWins)   { active = true;  ls = 0; ws = 0; } }
+  }
+  return active;
+}
+// Недавний реализованный счёт плеча (для разрешения «середины»): среднее по
+// последним tieK сделкам плеча (pnl если есть, иначе ±1 по исходу).
+function _legScore(self, legTag, K) {
+  if (!self || !self.demo) return 0;
+  const log = self.demo.log.filter(t => !t.dirty && (t.entryInfo || '').indexOf(legTag) !== -1).slice(-K);
+  if (!log.length) return 0;
+  let s = 0;
+  for (const t of log) s += (typeof t.pnl === 'number' ? t.pnl : (t.won ? 1 : -1));
+  return s / log.length;
+}
+
+const STRAT_REGIME_SWITCH = {
+  id: 'regimeSwitch', name: 'Regime Switch (Dog ↔ Momentum)',
+  desc: 'Сам меряет режим рынка по истории окон (efficiency ratio тренд/чоп) и переключает сторону: дог в чопе, momentum в тренде, пропуск в неясной середине. Пер-плечевой предохранитель по demo-логу банит протухшее плечо. Переключение по поведению BTC, а не по своему PnL — не опаздывает на сломе режима.',
+  defaults: {
+    minTimeMs: 60000,
+    // — детектор режима —
+    regimeWindows: 6,      // окон в efficiency ratio
+    regimeMinWindows: 5,   // минимум истории, иначе bootstrap = дог
+    chopMaxER: 0.40,       // ER ≤ это → ЧОП → дог
+    trendMinER: 0.60,      // ER ≥ это → ТРЕНД → momentum
+    minVolUSD: 8,          // Σ|движение| ниже → мёртвый рынок, пропуск
+    // — DOG-плечо (коридор из анализа: 0.40–0.50 = лучший EV; <0.35 токсично) —
+    lo: 0.40, hi: 0.50,
+    dogEntryMoveCapUSD: 20, // текущее окно уехало ≥ → тренд внутри окна, дог не берём
+    dogTpAbs: 0.96, dogStopPrice: 0.05,
+    // — MOM-плечо (как momentum) —
+    minConf: 35, minEdge: 0.03, tpPct: 0.50, slPct: 0.30, flipConf: 50, advMovePct: 0.25,
+    // — предохранитель / разрешение середины / фоллбэк —
+    breakerLosses: 8, breakerWins: 3, tieK: 20, allowFallback: 1,
+    // — сайзинг —
+    kellyFrac: 0.15, maxFrac: 0.07, maxPerWindow: 1,
+  },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const self = STRATEGIES['regimeSwitch'];
+    const rs = _regimeState(p);
+    if (rs.ready && rs.vol < p.minVolUSD) return null;   // мёртвый рынок
+
+    // кандидаты обоих плеч
+    const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const dogPrice = Math.min(np.up, np.dn);
+    const dogOk    = dogPrice >= p.lo && dogPrice <= p.hi && dogPrice >= MIN_ENTRY_PRICE;
+    const momE     = _momentumEntry(ctx, p, INVERT_SIGNAL);
+
+    // выбор режима
+    let want;
+    if (!rs.ready)                 want = 'DOG';                       // bootstrap до набора истории
+    else if (rs.er >= p.trendMinER) want = 'MOM';
+    else if (rs.er <= p.chopMaxER)  want = 'DOG';
+    else want = _legScore(self, '[MOM]', p.tieK) > _legScore(self, '[DOG]', p.tieK) ? 'MOM' : 'DOG';
+
+    const erTag = rs.ready ? rs.er.toFixed(2) : 'na';
+    const tryDog = () => {
+      if (!dogOk) return null;
+      if (!_legAllowed(self, '[DOG]', p)) return null;
+      // анти-тренд гейт: дог берём только если текущее окно НЕ уехало (дог живёт в пиле)
+      if (ctx.curBTC != null && ctx.openingBTC != null &&
+          Math.abs(ctx.curBTC - ctx.openingBTC) >= p.dogEntryMoveCapUSD) return null;
+      const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
+      return { side: dogSide, polyPrice: dogPrice, ourProb, edge: ourProb - dogPrice,
+               info: `RS DOG @${(dogPrice * 100).toFixed(0)}¢ ER=${erTag} [DOG]` };
+    };
+    const tryMom = () => {
+      if (!momE) return null;
+      if (!_legAllowed(self, '[MOM]', p)) return null;
+      return { side: momE.side, polyPrice: momE.polyPrice, ourProb: momE.ourProb, edge: momE.edge,
+               info: `RS MOM ${momE.info} ER=${erTag} [MOM]` };
+    };
+
+    let entry = want === 'MOM' ? tryMom() : tryDog();
+    if (!entry && p.allowFallback) entry = want === 'MOM' ? tryDog() : tryMom();
+    return entry;
+  },
+  shouldExit(ctx, pos, p) {
+    const isMom = (pos.entryInfo || '').indexOf('[MOM]') !== -1;
+    if (isMom) {
+      const ex = _tpSlExit(ctx, pos, { ...p, tpPct: p.tpPct, slPct: p.slPct }) || _advExit(ctx, pos, p);
+      if (ex) return ex;
+      let effDir = ctx.sigP.dir;
+      if (INVERT_SIGNAL && effDir !== 'WAIT') effDir = effDir === 'UP' ? 'DOWN' : 'UP';
+      if (effDir !== 'WAIT' && effDir !== pos.side && ctx.sigP.conf > p.flipConf) {
+        const curMid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+        return { reason: 'FLIP', exitPrice: curMid };
+      }
+      return null;
+    }
+    // DOG-плечо: абсолютный TP + жёсткий стоп (по данным FLOMD стоп помогает)
+    const mid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (mid != null && p.dogTpAbs    && mid >= p.dogTpAbs)    return { reason: 'TP', exitPrice: mid };
+    if (mid != null && p.dogStopPrice && mid <= p.dogStopPrice) return { reason: 'SL', exitPrice: mid };
+    return null;
+  },
+};
+
+
 const STRAT_DEFINITIONS = [
   // — сенсоры (DEMO only) —
   STRAT_UNDERDOG_HOLD,
@@ -3228,6 +3363,7 @@ const STRAT_DEFINITIONS = [
   STRAT_TIME_SESSION,
   STRAT_MOMENTUM,
   STRAT_MOM_SCRATCH_HI,
+  STRAT_REGIME_SWITCH,   // ← авто-переключатель дог↔momentum
   // — рабочие: книга < спота / книга > спота / дог —
   STRAT_LAG_FAV,
   STRAT_FAVMOM_A,
