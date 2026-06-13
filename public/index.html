@@ -613,13 +613,13 @@ table.log tr:hover td { background: var(--bg3); }
       <input id="p-minEntry" class="cfg-input" type="number" step="1" min="0" max="50" style="width:90px;flex:0 0 auto;">
     </div>
 
-    <!-- ДНЕВНОЙ ЛИМИТ ПОТЕРЬ (реал, в $) -->
+    <!-- МИН. БАЛАНС (реал, в $) -->
     <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px;padding:12px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px;">
       <div style="flex:1;min-width:220px;">
-        <div style="font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px;">Дневной лимит потерь ($)</div>
-        <div style="font-size:11px;color:var(--tx3);">реальная торговля авто-выключается на сутки при таком минусе за день (UTC). Только REAL.</div>
+        <div style="font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px;">Мин. баланс (реал, $)</div>
+        <div style="font-size:11px;color:var(--tx3);">пол по балансу кошелька: новые реальные сделки не открываются, если свободный USDC после входа опустится ниже этой суммы. Demo не трогает. По умолчанию $20.</div>
       </div>
-      <input id="p-dailyLoss" class="cfg-input" type="number" step="0.5" min="0.1" style="width:90px;flex:0 0 auto;">
+      <input id="p-minBalance" class="cfg-input" type="number" step="1" min="0" style="width:90px;flex:0 0 auto;">
     </div>
 
     <!-- РЕАЛИСТИЧНОСТЬ DEMO -->
@@ -1461,7 +1461,7 @@ function updateConfigPanel(d) {
   }
   if (d.config && isFinite(d.config.tpAbsPrice)) _setIfBlur('p-tpAbs', Math.round(d.config.tpAbsPrice * 100));
   if (d.config && isFinite(d.config.minEntryPrice)) _setIfBlur('p-minEntry', Math.round(d.config.minEntryPrice * 100));
-  if (d.config && isFinite(d.config.dailyLossCap)) _setIfBlur('p-dailyLoss', d.config.dailyLossCap);
+  if (d.config && isFinite(d.config.minBalance)) _setIfBlur('p-minBalance', d.config.minBalance);
   if (d.config && isFinite(d.config.demoDelaySec)) _setIfBlur('p-demoDelay', d.config.demoDelaySec);
   if (d.config && isFinite(d.config.demoMaxChasePct)) _setIfBlur('p-demoChase', Math.round(d.config.demoMaxChasePct));
   if (d.config) {
@@ -1668,7 +1668,7 @@ async function saveParams() {
     minTimeMs:  num('p-minTimeSec') * 1000,
     tpAbsPrice: num('p-tpAbs') / 100,
     minEntryPrice: num('p-minEntry') / 100,
-    dailyLossCap: num('p-dailyLoss'),
+    minBalance: num('p-minBalance'),
     demoDelaySec: num('p-demoDelay'),
     demoMaxChasePct: num('p-demoChase'),
   };
@@ -1678,7 +1678,7 @@ async function saveParams() {
   if (r.ok) {
     _dirty.clear(); // сохранено — снимаем защиту, поля синхронизируются с сервером
     const be = (r.params.slPct/(r.params.tpPct+r.params.slPct)*100).toFixed(1);
-    $('cfgMsg').textContent = `✅ Сохранено · TP ${Math.round(r.params.tpPct*100)}% / SL ${Math.round(r.params.slPct*100)}% · абс.TP ${Math.round((r.tpAbsPrice||0)*100)}¢ · мин.вход ${Math.round((r.minEntryPrice||0)*100)}¢ · лимит -$${(r.dailyLossCap||0)} · безубыток ${be}%` + (r.customEnabled ? '' : ' (включи КАСТОМ для TP/SL!)');
+    $('cfgMsg').textContent = `✅ Сохранено · TP ${Math.round(r.params.tpPct*100)}% / SL ${Math.round(r.params.slPct*100)}% · абс.TP ${Math.round((r.tpAbsPrice||0)*100)}¢ · мин.вход ${Math.round((r.minEntryPrice||0)*100)}¢ · мин.баланс $${(r.minBalance??0)} · безубыток ${be}%` + (r.customEnabled ? '' : ' (включи КАСТОМ для TP/SL!)');
   } else $('cfgMsg').textContent = 'Ошибка сохранения';
 }
 

@@ -186,7 +186,7 @@ function saveState() {
     }
     out.__global = {
       invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE,
-      dailyLossCap: REAL_DAILY_LOSS_CAP,
+      dailyLossCap: REAL_DAILY_LOSS_CAP, minBalance: REAL_MIN_BALANCE,
       demoDelaySec: DEMO_ENTRY_DELAY_MS / 1000, demoMaxChasePct: DEMO_MAX_CHASE * 100,
       demoRealSpread: DEMO_REAL_SPREAD,
       schedEnabled: SCHEDULE_ENABLED, schedFrom: SCHEDULE_FROM, schedTo: SCHEDULE_TO,
@@ -245,6 +245,9 @@ function loadState() {
     }
     if (stored.__global && isFinite(Number(stored.__global.dailyLossCap))) {
       REAL_DAILY_LOSS_CAP = Math.max(0.1, Math.min(10000, Number(stored.__global.dailyLossCap)));
+    }
+    if (stored.__global && isFinite(Number(stored.__global.minBalance))) {
+      REAL_MIN_BALANCE = Math.max(0, Math.min(1000000, Number(stored.__global.minBalance)));
     }
     if (stored.__global) {
       const g = stored.__global;
@@ -3067,6 +3070,145 @@ const STRAT_UNDERDOG_DELTA = {
   },
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+// UNDERDOG DELTA — АНАЛОГИ С АВТО-СТОПОМ ПО DEMO-ЛОГУ underdogHold ────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Вход/выход = базовый UNDERDOG DELTA (дешёвый дог 15–35¢ при штиле BTC |Δ|<$17,
+// держим до резолва, фикс на 96¢), НО с авто-гейтом, который читает demo-лог
+// опоры underdogHold и стопает/возобновляет стратегию.
+//
+// ВАЖНО (требование «изначально дождаться результатов»): гейт стартует ЗАКРЫТЫМ —
+// стратегия НЕ входит, пока underdogHold не выдаст нужный результат:
+//   • стрик-версии  — нужно resumeWins винов подряд (по умолчанию 2),
+//   • pnl-версии    — нужна неотрицательная Σ PnL в окне (и хотя бы 1 сделка).
+// Опору underdogHold держим в DEMO постоянно (это датчик, на REAL не нужен).
+
+// Стрик-гейт с гистерезисом: стоп после skipAfter лузов подряд, возврат после
+// resumeWins винов подряд. Старт ЗАКРЫТ (active=false) — ждём resumeWins подряд.
+// Лог проигрывается целиком, поэтому состояние всегда сходится к текущему.
+function _udgDeltaStreakActive(skipAfter, resumeWins) {
+  const ref = STRATEGIES['underdogHold'];
+  if (!ref || !ref.demo || !ref.demo.log.length) return false;   // нет истории — ЖДЁМ
+  let active = false, ls = 0, ws = 0;
+  for (const t of ref.demo.log) {
+    if (t.dirty) continue;                                        // sim/feed-записи не считаем
+    if (active) {
+      ls = t.won ? 0 : ls + 1;
+      if (ls >= skipAfter) { active = false; ws = 0; ls = 0; }
+    } else {
+      ws = t.won ? ws + 1 : 0;
+      if (ws >= resumeWins) { active = true; ls = 0; ws = 0; }
+    }
+  }
+  return active;
+}
+
+// PnL-оконный гейт: торгуем, только если Σ PnL demo-сделок underdogHold за
+// последние windowMin минут НЕ отрицательна. Стоп при Σ<0, возврат при Σ≥0.
+// Нет закрытых сделок в окне → ЖДЁМ (старт закрыт — «изначально дождаться»).
+function _udgDeltaPnlWindowOk(windowMin) {
+  const ref = STRATEGIES['underdogHold'];
+  if (!ref || !ref.demo || !ref.demo.log) return false;
+  const cutoff = Date.now() - windowMin * 60000;
+  let sum = 0, seen = 0;
+  for (const t of ref.demo.log) {
+    if (t.dirty || !t.closeTime || t.closeTime < cutoff) continue;
+    sum += (t.pnl || 0); seen++;
+  }
+  if (seen === 0) return false;       // ещё нет результатов в окне — ждём
+  return sum >= 0;                    // Σ PnL не отрицательна → можно торговать
+}
+
+// Фабрика: UNDERDOG DELTA + авто-гейт по underdogHold (стрик ИЛИ pnl-окно).
+function makeUdgDeltaGated(opts) {
+  return {
+    id: opts.id, name: opts.name, desc: opts.desc,
+    defaults: { ...STRAT_UNDERDOG_DELTA.defaults,
+                udgStreakSkip:   opts.streakSkip   || 0,
+                udgStreakResume: opts.streakResume || 0,
+                udgPnlWindowMin: opts.pnlWindowMin || 0 },
+    shouldEnter(ctx, p) {
+      if (p.udgStreakSkip && !_udgDeltaStreakActive(p.udgStreakSkip, p.udgStreakResume || 2)) return null;
+      if (p.udgPnlWindowMin && !_udgDeltaPnlWindowOk(p.udgPnlWindowMin)) return null;
+      return STRAT_UNDERDOG_DELTA.shouldEnter(ctx, p);
+    },
+    shouldExit(ctx, pos, p) { return STRAT_UNDERDOG_DELTA.shouldExit(ctx, pos, p); },
+  };
+}
+
+// 9 аналогов: 4 стрик-стопа (3/5/4/6 лузов → возврат после 2 винов) + 5 pnl-окон.
+const UDG_DELTA_GATED = [
+  makeUdgDeltaGated({ id: 'udgDeltaS3', name: 'UDG DELTA STOP-3 (3луз/2вин)',
+    desc: 'UNDERDOG DELTA + авто-стоп: пауза после 3 лузов underdogHold подряд, возврат после 2 винов подряд. Старт закрыт — ждём 2 вина.',
+    streakSkip: 3, streakResume: 2 }),
+  makeUdgDeltaGated({ id: 'udgDeltaS5', name: 'UDG DELTA STOP-5 (5луз/2вин)',
+    desc: 'UNDERDOG DELTA + авто-стоп: пауза после 5 лузов underdogHold подряд, возврат после 2 винов подряд. Старт закрыт.',
+    streakSkip: 5, streakResume: 2 }),
+  makeUdgDeltaGated({ id: 'udgDeltaS4', name: 'UDG DELTA STOP-4 (4луз/2вин)',
+    desc: 'UNDERDOG DELTA + авто-стоп: пауза после 4 лузов underdogHold подряд, возврат после 2 винов подряд. Старт закрыт.',
+    streakSkip: 4, streakResume: 2 }),
+  makeUdgDeltaGated({ id: 'udgDeltaS6', name: 'UDG DELTA STOP-6 (6луз/2вин)',
+    desc: 'UNDERDOG DELTA + авто-стоп: пауза после 6 лузов underdogHold подряд, возврат после 2 винов подряд. Старт закрыт.',
+    streakSkip: 6, streakResume: 2 }),
+  makeUdgDeltaGated({ id: 'udgDeltaPnl60', name: 'UDG DELTA PNL-1ч',
+    desc: 'UNDERDOG DELTA + авто-стоп: если Σ PnL underdogHold за последний час отрицательна — пауза, пока не станет ≥0. Старт закрыт — ждём результатов.',
+    pnlWindowMin: 60 }),
+  makeUdgDeltaGated({ id: 'udgDeltaPnl45', name: 'UDG DELTA PNL-45м',
+    desc: 'UNDERDOG DELTA + авто-стоп: если Σ PnL underdogHold за последние 45 минут отрицательна — пауза, пока не станет ≥0.',
+    pnlWindowMin: 45 }),
+  makeUdgDeltaGated({ id: 'udgDeltaPnl35', name: 'UDG DELTA PNL-35м',
+    desc: 'UNDERDOG DELTA + авто-стоп: если Σ PnL underdogHold за последние 35 минут отрицательна — пауза, пока не станет ≥0, потом продолжаем.',
+    pnlWindowMin: 35 }),
+  makeUdgDeltaGated({ id: 'udgDeltaPnl120', name: 'UDG DELTA PNL-2ч',
+    desc: 'UNDERDOG DELTA + авто-стоп: если Σ PnL underdogHold за последние 2 часа отрицательна — пауза, пока не станет ≥0.',
+    pnlWindowMin: 120 }),
+  makeUdgDeltaGated({ id: 'udgDeltaPnl150', name: 'UDG DELTA PNL-2ч30м',
+    desc: 'UNDERDOG DELTA + авто-стоп: если Σ PnL underdogHold за последние 2ч30м отрицательна — пауза, пока не станет ≥0.',
+    pnlWindowMin: 150 }),
+];
+
+// ── UNDERDOG DELTA — МАТРИЦА КОРИДОР × TP, абсолютный SL 8¢ ────────────────────
+// Тот же штиль-вход (|Δ|<$17, фильтр свежести), но: коридоры 22–35 / 22–40 /
+// 22–32 / 22–30¢ и НЕ держим до резолва. Выход:
+//   • TP — ПРОЦЕНТНЫЙ рост цены дога от входа (38…88%),
+//   • SL — АБСОЛЮТНОЕ падение цены дога на 8¢ от входа (slAbsCents=0.08),
+//   • плюс страховочный потолок 96¢.
+// 4 коридора × 7 TP = 28 вариантов для A/B-сбора данных по соотношению риск/доход.
+function _udgDeltaAbsSlPctTpExit(ctx, pos, p) {
+  const cur = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+  if (cur == null) return null;
+  // Абсолютный стоп-лосс: цена дога упала на slAbsCents от цены входа.
+  if (p.slAbsCents && cur <= pos.polyEntryPrice - p.slAbsCents) return { reason: 'SL', exitPrice: cur };
+  // Процентный тейк-профит от цены входа.
+  if (p.tpPct) {
+    const mv = (cur - pos.polyEntryPrice) / pos.polyEntryPrice;
+    if (mv >= p.tpPct) return { reason: 'TP', exitPrice: cur };
+  }
+  // Страховочный абсолютный потолок (бинарный токен не дороже 100¢).
+  if (p.tpAbs && cur >= p.tpAbs) return { reason: 'TP', exitPrice: cur };
+  return null;
+}
+
+function makeUdgDeltaTpSl(loC, hiC, tpPct) {
+  const loN = Math.round(loC * 100), hiN = Math.round(hiC * 100), tpN = Math.round(tpPct * 100);
+  return {
+    id: `udgDelta${loN}${hiN}t${tpN}`,
+    name: `UDG Δ ${loN}-${hiN} TP${tpN} SL8¢`,
+    desc: `UNDERDOG DELTA (штиль |Δ|<$17) в коридоре ${loN}–${hiN}¢, TP ${tpN}% роста от входа, абсолютный SL 8¢. A/B-сбор данных по риск/доходу.`,
+    defaults: { ...STRAT_UNDERDOG_DELTA.defaults, lo: loC, hi: hiC,
+                tpPct, slAbsCents: 0.08, tpAbs: 0.96 },
+    shouldEnter(ctx, p) { return STRAT_UNDERDOG_DELTA.shouldEnter(ctx, p); },
+    shouldExit(ctx, pos, p) { return _udgDeltaAbsSlPctTpExit(ctx, pos, p); },
+  };
+}
+
+const UDG_DELTA_CORRIDORS = [[0.22, 0.35], [0.22, 0.40], [0.22, 0.32], [0.22, 0.30]];
+const UDG_DELTA_TPS       = [0.38, 0.44, 0.50, 0.58, 0.68, 0.77, 0.88];
+const UDG_DELTA_TPSL      = [];
+for (const [lo, hi] of UDG_DELTA_CORRIDORS)
+  for (const tp of UDG_DELTA_TPS)
+    UDG_DELTA_TPSL.push(makeUdgDeltaTpSl(lo, hi, tp));
+
 // ── FLOMD FAVE (недооценённый глубокий фаворит) ───────────────────────────────
 // САМОЕ ФУНДАМЕНТАЛЬНОЕ открытие сессии (реальные посекундные данные Polymarket
 // 8–13 июня): сторона, КУДА движется BTC в момент входа, выигрывает окно в ~98%
@@ -3371,6 +3513,8 @@ const STRAT_DEFINITIONS = [
   STRAT_FLOMD_INVERSE,
   STRAT_FLOMD_FAVE,
   STRAT_UNDERDOG_DELTA,
+  ...UDG_DELTA_GATED,    // ← 9 аналогов с авто-стопом по underdogHold (стрики + pnl-окна)
+  ...UDG_DELTA_TPSL,     // ← 28 вариантов: коридор × TP, абсолютный SL 8¢
   STRAT_UNDERDOG_DIP,
   STRAT_UDG_SKIP3,
   // — режим-следящие (FLOMD-семейство для моментума) —
@@ -3408,7 +3552,13 @@ const REAL_MAX_PRICE         = 0.90;     // Skip if our entry side > 90¢ — ba
 const REAL_MIN_MS_TO_END     = 45_000;   // Need ≥45s left in window — else no time to play out
 const REAL_COOLDOWN_MS       = 20_000;   // Wait ≥20s after any real close before opening again
 let REAL_DAILY_LOSS_CAP      = parseFloat(process.env.REAL_DAILY_LOSS_CAP || '3');  // USD; -$3 default
-                                                                                    // After cap is hit, real autodisables until next UTC day
+                                                                                    // (УСТАРЕЛО — заменено мин. балансом ниже, см. REAL_MIN_BALANCE)
+// ── МИН. БАЛАНС (реал) ────────────────────────────────────────────────────────
+// Вместо «лимита потерь за день» — простой пол по балансу: ниже этой суммы (USDC
+// в кошельке) НЕ открываем реальных сделок. Проверяется так, что новая сделка не
+// уводит свободный баланс ниже пола. По умолчанию $20, крутится с дашборда.
+let REAL_MIN_BALANCE         = Math.max(0, parseFloat(process.env.REAL_MIN_BALANCE || '20') || 20);
+let _realFloorNotified       = false;    // чтобы не спамить в TG при каждом тике у пола
 // FIX: предел СУММАРНОЙ открытой real-экспозиции (доля от баланса кошелька).
 // Каждая стратегия сайзится от полного баланса — без этого лимита при N
 // включённых стратегиях совокупный риск умножался на N.
@@ -3682,7 +3832,8 @@ function stratOpen(s, ctx, entry, acct, isReal) {
       return;
     }
 
-    // Reset daily-loss bucket if we've rolled into a new UTC day.
+    // Reset daily-loss bucket if we've rolled into a new UTC day (kept for
+    // backward-compat bookkeeping; the active risk control is the balance floor).
     const utcToday = new Date().toISOString().slice(0, 10);
     if (s.realDailyLossDate !== utcToday) {
       s.realDailyLossDate     = utcToday;
@@ -3690,13 +3841,24 @@ function stratOpen(s, ctx, entry, acct, isReal) {
       s.realDailyAutoDisabled = false;
     }
 
-    // [Guard E] Daily-loss circuit-breaker: once total real losses today
-    // exceed REAL_DAILY_LOSS_CAP, autodisable real until the user flips it
-    // back on (or until UTC midnight rolls over).
-    if (s.realDailyAutoDisabled) {
-      // Silent skip — TG warning was sent when the breaker fired.
+    // [Guard E] МИН. БАЛАНС: не открываем реальную сделку, если свободный USDC
+    // после неё опустится ниже пола REAL_MIN_BALANCE (или уже ниже него). Это
+    // заменило прежний «дневной лимит потерь» — теперь просто не уходим под пол.
+    if (realBalance !== null && (realBalance - sizeUSDC) < REAL_MIN_BALANCE) {
+      console.log(`[real] SKIP — баланс $${realBalance.toFixed(2)} − $${sizeUSDC.toFixed(2)} < пол $${REAL_MIN_BALANCE.toFixed(2)}`);
+      if (!_realFloorNotified) {
+        _realFloorNotified = true;
+        sendTg(
+          `🛑 <b>Мин. баланс достигнут</b>\n` +
+          `Баланс: <b>$${realBalance.toFixed(2)}</b>, пол: <b>$${REAL_MIN_BALANCE.toFixed(2)}</b>\n` +
+          `Новые реальные сделки приостановлены, чтобы не уйти ниже пола.\n` +
+          `Demo продолжает работать. Подними баланс или опусти пол на дашборде.`
+        );
+      }
       return;
     }
+    // Баланс выше пола — снимаем флажок, чтобы при следующем заходе под пол снова уведомить.
+    if (realBalance !== null && realBalance >= REAL_MIN_BALANCE) _realFloorNotified = false;
 
     // [Guard A] Skip extreme prices. When one side trades ≤ 10¢, the market
     // has effectively decided the outcome. Our model still says "50/50" so
@@ -4024,28 +4186,15 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
   if (o.isReal) {
     s.lastRealCloseTime    = Date.now();
     s.lastRealClosedWindow = o.marketSlug || ctx.win.slug;
-
-    // Daily-loss bucket. Reset if UTC day changed, then accumulate.
+    // Прежний «дневной лимит потерь» отключён — риск-контроль теперь это пол по
+    // балансу (REAL_MIN_BALANCE), проверяемый перед каждым открытием. Дневной
+    // счётчик ниже остаётся только для совместимости/статистики, ничего не стопает.
     const utcToday = new Date().toISOString().slice(0, 10);
     if (s.realDailyLossDate !== utcToday) {
-      s.realDailyLossDate     = utcToday;
-      s.realDailyLossAmount   = 0;
-      s.realDailyAutoDisabled = false;
+      s.realDailyLossDate   = utcToday;
+      s.realDailyLossAmount = 0;
     }
     if (pnl < 0) s.realDailyLossAmount += Math.abs(pnl);
-
-    // Trip the breaker if we've passed the daily cap.
-    if (s.realDailyLossAmount >= REAL_DAILY_LOSS_CAP && !s.realDailyAutoDisabled) {
-      s.realDailyAutoDisabled = true;
-      saveState();
-      console.warn(`[real] DAILY LOSS CAP HIT: $${s.realDailyLossAmount.toFixed(2)} ≥ $${REAL_DAILY_LOSS_CAP} — real auto-disabled for today`);
-      sendTg(
-        `🛑 <b>Дневной лимит потерь</b>\n` +
-        `Сегодня минус: <b>-$${s.realDailyLossAmount.toFixed(2)}</b> (лимит $${REAL_DAILY_LOSS_CAP})\n` +
-        `Реальная торговля автоматически отключена до завтра.\n` +
-        `Включи вручную если хочешь раньше.`
-      );
-    }
   }
 
   // ── Telegram alert on real position close (PRELIMINARY — real PnL confirmed after SELL settles) ──
@@ -4615,7 +4764,7 @@ function buildSnapshot() {
     },
     config: {
       invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE,
-      dailyLossCap: REAL_DAILY_LOSS_CAP,
+      dailyLossCap: REAL_DAILY_LOSS_CAP, minBalance: REAL_MIN_BALANCE,
       demoDelaySec: DEMO_ENTRY_DELAY_MS / 1000, demoMaxChasePct: DEMO_MAX_CHASE * 100,
       schedEnabled: SCHEDULE_ENABLED, schedFrom: SCHEDULE_FROM, schedTo: SCHEDULE_TO,
       entriesAllowedNow: entriesAllowedNow(),
@@ -4674,6 +4823,10 @@ app.post('/api/strategy/:id/params', (req, res) => {
     const t = Number(b.dailyLossCap);
     if (Number.isFinite(t)) { REAL_DAILY_LOSS_CAP = Math.max(0.1, Math.min(10000, t)); applied.dailyLossCap = REAL_DAILY_LOSS_CAP; }
   }
+  if (b.minBalance !== undefined && b.minBalance !== null && b.minBalance !== '') {
+    const t = Number(b.minBalance);
+    if (Number.isFinite(t)) { REAL_MIN_BALANCE = Math.max(0, Math.min(1000000, t)); applied.minBalance = REAL_MIN_BALANCE; _realFloorNotified = false; }
+  }
   if (b.demoDelaySec !== undefined && b.demoDelaySec !== null && b.demoDelaySec !== '') {
     const t = Number(b.demoDelaySec);
     if (Number.isFinite(t)) { DEMO_ENTRY_DELAY_MS = Math.max(0, Math.min(30000, Math.round(t * 1000))); applied.demoDelaySec = DEMO_ENTRY_DELAY_MS / 1000; }
@@ -4684,7 +4837,7 @@ app.post('/api/strategy/:id/params', (req, res) => {
   }
   saveState();
   console.log(`[params] ${req.params.id} updated`, applied);
-  res.json({ ok: true, customEnabled: s.customEnabled, customParams: s.customParams, params: s.params, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE, dailyLossCap: REAL_DAILY_LOSS_CAP, demoDelaySec: DEMO_ENTRY_DELAY_MS/1000, demoMaxChasePct: DEMO_MAX_CHASE*100 });
+  res.json({ ok: true, customEnabled: s.customEnabled, customParams: s.customParams, params: s.params, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE, dailyLossCap: REAL_DAILY_LOSS_CAP, minBalance: REAL_MIN_BALANCE, demoDelaySec: DEMO_ENTRY_DELAY_MS/1000, demoMaxChasePct: DEMO_MAX_CHASE*100 });
 });
 
 // Включить/выключить кастом-режим (база ↔ кастом).
