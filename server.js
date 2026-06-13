@@ -2728,7 +2728,7 @@ const STRAT_FLOMD = {
   // +$291 EV+0.49 10/13 дней. Направленность (откуп Δ<0 vs рост Δ>0) ПРОВЕРЕНА и
   // НЕ зашита: эффект «откуп лучше» держался только 1-7 июня (EV +5.25 на 42 сделках),
   // на 8-13 перевернулся (откуп +0.14 < рост +0.27) — артефакт периода, не сигнал.
-  defaults: { lo: 0.25, hi: 0.35, minTimeMs: 60000, tpAbs: 0,
+  defaults: { lo: 0.25, hi: 0.35, minTimeMs: 60000, tpAbs: 0, maxBtcAgeMs: 3000,
               skipAfter: 8, resumeWins: 3, blockFromUTC: 21, blockToUTC: 23,
               maxEntryMoveUSD: 17, trendPauseLoUSD: 40, trendPauseHiUSD: 300, trendPauseWindows: 3,
               skipAgainstGrind: 1, grindDirMinUSD: 20,
@@ -2749,6 +2749,9 @@ const STRAT_FLOMD = {
     const f = p.blockFromUTC % 24, t = p.blockToUTC % 24;
     const night = (f === t) ? false : (f < t ? (h >= f && h < t) : (h >= f || h < t));
     if (night) return blockedBy('night');
+    // ── Фильтр свежести цены: не входить на устаревшей цене Chainlink ─────────
+    // Страховка от сбоев сбора (10-11 июня цена висела минутами → дельта тухла).
+    if (p.maxBtcAgeMs && ctx.btcAgeMs != null && ctx.btcAgeMs > p.maxBtcAgeMs) return blockedBy('staleBtc');
     // ── Анти-тренд гейт 1: ТЕКУЩЕЕ окно уже уехало слишком далеко (|Δ|, симметрично)
     if (ctx.curBTC != null && ctx.openingBTC != null
         && Math.abs(ctx.curBTC - ctx.openingBTC) >= p.maxEntryMoveUSD) return blockedBy('entryMoveCap');
@@ -3037,7 +3040,7 @@ const STRAT_UNDERDOG_DIP = {
 const STRAT_UNDERDOG_DELTA = {
   id: 'underdogDelta', name: 'UNDERDOG DELTA (дог при штиле)',
   desc: 'Дешёвый дог 15–35¢ ТОЛЬКО когда BTC мало двигался (|Δ|<$17, обе стороны). Реальные данные 1–13 июня: +$287, 9/13 дней+, EV +0.48 — против −$927 у underdogHold без фильтра. Направленность (откуп vs рост) проверена и отброшена как шум (перевернулась во 2-м периоде). Держим до резолва.',
-  defaults: { lo: 0.15, hi: 0.35, minTimeMs: 60000, tpAbs: 0.96, btcMoveMax: 17,
+  defaults: { lo: 0.15, hi: 0.35, minTimeMs: 60000, tpAbs: 0.96, btcMoveMax: 17, maxBtcAgeMs: 3000,
               maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
   shouldEnter(ctx, p) {
     if (ctx.msToEnd < p.minTimeMs) return null;
@@ -3045,6 +3048,10 @@ const STRAT_UNDERDOG_DELTA = {
     const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
     const dogPrice = Math.min(np.up, np.dn);
     if (dogPrice < p.lo || dogPrice > p.hi || dogPrice < MIN_ENTRY_PRICE) return null;
+    // ФИЛЬТР СВЕЖЕСТИ: дельта-стратегии не входят на устаревшей цене Chainlink.
+    // Защита не от оракула (он обычно свежий ~0.5с), а от сбоев сбора данных:
+    // 10-11 июня цена "висела" минутами → дельта замораживалась. ≤3с страхует.
+    if (p.maxBtcAgeMs && ctx.btcAgeMs != null && ctx.btcAgeMs > p.maxBtcAgeMs) return null;
     // ДЕЛЬТА-ФИЛЬТР (симметричный): дог только при малом движении BTC (рынок пилит → возврат)
     if (p.btcMoveMax && ctx.curBTC != null && ctx.openingBTC != null) {
       if (Math.abs(ctx.curBTC - ctx.openingBTC) >= p.btcMoveMax) return null;
@@ -3408,6 +3415,7 @@ function getStratContext() {
     polyDn:      poly.prices.down,
     sigP,
     curBTC,
+    btcAgeMs:    (chain.lastUpdate != null) ? (Date.now() - chain.lastUpdate) : null,  // свежесть цены Chainlink
     openingBTC:  poly.windowOpeningBTC,
     openingSource: poly.windowOpeningSource,
     outcomeStreak,        // сколько окон ПОДРЯД закрылись в одну сторону (до текущего)
