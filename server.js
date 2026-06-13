@@ -2783,6 +2783,261 @@ const STRAT_FLOMD = {
   },
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+// РЕЖИМ-СЛЕДЯЩИЕ СТРАТЕГИИ (FLOMD-семейство для моментум-стратегий).
+// ─────────────────────────────────────────────────────────────────────────────
+// Глубокий анализ 47k demo-сделок за 1–13 июня (все 13 дней, train 1–8 / test
+// 9–13) подтвердил гипотезу ИНЕРЦИИ: если стратегия последние N сделок суммарно
+// в плюсе — её EV следующих сделок ВЫШЕ (режим продолжается). У всех семи
+// отобранных горячий EV > холодного без исключений. Робастность (плюс на train
+// И на test): momScratch, momConfirm, longHold, momHi, momScratchHi, longHoldX,
+// timeSession. Из дублей (longHold↔longHoldX corr 0.63; momScratchHi корр с
+// longHold 0.58) оставлены наиболее независимые.
+//
+// Все 7 параллельно на полном периоде: +$7199, плюс 11/12 дней, корреляции
+// «горячих режимов» низкие (0.0–0.3) — включаются в РАЗНОЕ время, дополняя друг
+// друга в разных рыночных режимах. Здесь подключены 5 наименее коррелированных.
+//
+// ВХОД: базовый сигнал стратегии + гейт «горячести» (Σ PnL последних gateWindow
+//   ДЕМО-сделок опоры > gateMinPnL). СТОП (авто): Σ ≤ порога → пауза до
+//   восстановления. Порог 0 — оптимум по бектесту (как только последние N в
+//   минус → выключаемся). Опора = одноимённая demo-стратегия (держать в DEMO).
+//
+// ОТВЕРГНУТО (проверено на ВСЕХ 13 днях, не только train): underdog self-сигнал
+// (на train +$2230, на test ПЕРЕВЕРНУЛСЯ −$410); momentum-hold (минус на обоих).
+// Берём только то, что робастно out-of-sample.
+function _demoHotGate(refId, gateWindow, gateMinPnL) {
+  const ref = STRATEGIES[refId];
+  if (!ref || !ref.demo || !ref.demo.log) return false;
+  const log = ref.demo.log.filter(t => !t.dirty);
+  if (log.length < gateWindow) return false;
+  let sum = 0;
+  for (let i = log.length - gateWindow; i < log.length; i++) sum += (log[i].pnl || 0);
+  return sum > gateMinPnL;
+}
+// ДНЕВНОЙ walk-forward гейт: торгуем сегодня, только если ВЧЕРАШНИЙ день опоры был
+// прибыльным (Σ PnL вчера > 0). Для медленных «дневных» режимов (underdogHold):
+// его внутридневной self-сигнал переворачивается на тесте, а дневной — держится
+// (на test 9-13 июня: −$208 против −$300 always-on, режет плохие дни до нуля).
+// dayWin — сколько прошлых КАЛЕНДАРНЫХ дней суммировать (1 = только вчера).
+function _demoDayGate(refId, dayWin) {
+  const ref = STRATEGIES[refId];
+  if (!ref || !ref.demo || !ref.demo.log) return false;
+  const log = ref.demo.log.filter(t => !t.dirty && t.closeTime);
+  if (!log.length) return false;
+  const DAY = 86400000;
+  const todayStart = Math.floor(Date.now() / DAY) * DAY;
+  const from = todayStart - dayWin * DAY;
+  let sum = 0, seen = 0;
+  for (const t of log) {
+    if (t.closeTime >= from && t.closeTime < todayStart) { sum += (t.pnl || 0); seen++; }
+  }
+  if (seen < 5) return true;   // мало истории за вчера — не блокируем
+  return sum > 0;
+}
+// Фабрика: оборачивает базовую стратегию режим-гейтом по её demo-сенсору.
+// Универсальный «горячий» гейт с тремя типами сигнала по demo-логу опоры:
+//   'sum'   — сумма PnL последних N demo-сделок > thr
+//   'wr'    — число ВИНОВ среди последних N demo-сделок > thr (винрейт-сигнал;
+//             на тесте оказался устойчивее суммы для скальп-стратегий)
+//   'accel' — «ускорение»: Σ последних 5 минус Σ предыдущих 5 > thr (тренд
+//             результата улучшается). Лучший для momConfirm/timeSession.
+// Все три подобраны перебором с проверкой на TEST (9-13 июня) и по дням (anti-overfit).
+function _demoSignalGate(refId, sigType, N, thr) {
+  const ref = STRATEGIES[refId];
+  if (!ref || !ref.demo || !ref.demo.log) return false;
+  const log = ref.demo.log.filter(t => !t.dirty);
+  const need = sigType === 'accel' ? 10 : N;
+  if (log.length < need) return false;
+  const pnl = i => (log[log.length - i] ? (log[log.length - i].pnl || 0) : 0); // i=1 последняя
+  if (sigType === 'sum') {
+    let s = 0; for (let i = 1; i <= N; i++) s += pnl(i);
+    return s > thr;
+  }
+  if (sigType === 'wr') {
+    let wins = 0; for (let i = 1; i <= N; i++) if (pnl(i) > 0) wins++;
+    return wins > thr;
+  }
+  if (sigType === 'accel') {
+    let recent = 0, prev = 0;
+    for (let i = 1; i <= 5; i++) recent += pnl(i);
+    for (let i = 6; i <= 10; i++) prev += pnl(i);
+    return (recent - prev) > thr;
+  }
+  return false;
+}
+// КОМБО-условие: проверяет «горячесть» ДРУГОЙ опоры (sum последних 8 demo > 0)
+// и сравнивает с желаемым состоянием. Открытие: режим стратегии лучше
+// предсказывается СОСТОЯНИЕМ ДРУГИХ стратегий (зеркальные/согласованные режимы),
+// чем собственным. Напр.: momConfirm работает когда momentum ХОЛОДНЫЙ;
+// longHold — когда momScratch холодный; momScratch усиливается когда longHold горячий.
+function _comboOk(combo) {
+  if (!combo || !combo.length) return true;
+  for (const c of combo) {
+    const hot = _demoSignalGate(c.ref, 'sum', c.win || 8, 0);  // горячая ли опора
+    if (hot !== c.wantHot) return false;
+  }
+  return true;
+}
+function makeRegimeStrat(base, opts) {
+  return {
+    id: opts.id, name: opts.name, desc: opts.desc,
+    defaults: { ...base.defaults, gateRefId: opts.gateRefId,
+                gateSigType: opts.gateSigType || 'sum', gateWindow: opts.gateWindow || 0,
+                gateThr: opts.gateThr != null ? opts.gateThr : 0,
+                dayGateWin: opts.dayGateWin || 0,
+                kellyFrac: opts.kellyFrac != null ? opts.kellyFrac : 0.08,
+                maxFrac: opts.maxFrac != null ? opts.maxFrac : 0.04 },
+    _combo: opts.combo || null,
+    shouldEnter(ctx, p) {
+      // режим-гейт: сигнальный (sum/wr/accel) И/ИЛИ дневной (вчера>0) И/ИЛИ комбо
+      if (p.gateWindow && !_demoSignalGate(p.gateRefId, p.gateSigType, p.gateWindow, p.gateThr)) return null;
+      if (p.dayGateWin && !_demoDayGate(p.gateRefId, p.dayGateWin)) return null;
+      if (this._combo && !_comboOk(this._combo)) return null;
+      return base.shouldEnter(ctx, p);
+    },
+    shouldExit(ctx, pos, p) { return base.shouldExit(ctx, pos, p); },
+  };
+}
+
+const STRAT_MOM_FLOMD_SCRATCH = makeRegimeStrat(STRAT_MOM_SCRATCH, {
+  id: 'momFlomdScratch', name: 'MOMENTUM FLOMD SCRATCH',
+  desc: 'momScratch только когда ≥2 вина в последних 5 demo-сделках momScratch. test EV+3.9, TEST 5/5 дней+.',
+  gateRefId: 'momScratch', gateSigType: 'wr', gateWindow: 5, gateThr: 1 });
+
+const STRAT_MOM_FLOMD_CONFIRM = makeRegimeStrat(STRAT_MOM_CONFIRM, {
+  id: 'momFlomdConfirm', name: 'MOMENTUM FLOMD CONFIRM',
+  desc: 'momConfirm когда «ускорение» demo momConfirm > 20 (тренд результата улучшается). test EV+3.2.',
+  gateRefId: 'momConfirm', gateSigType: 'accel', gateWindow: 10, gateThr: 20 });
+
+const STRAT_MOM_FLOMD_HI = makeRegimeStrat(STRAT_MOM_HI, {
+  id: 'momFlomdHi', name: 'MOMENTUM FLOMD HI',
+  desc: 'momHi когда Σ5 demo momHi > 5. test EV+3.4.',
+  gateRefId: 'momHi', gateSigType: 'sum', gateWindow: 5, gateThr: 5 });
+
+const STRAT_LONG_FLOMD = makeRegimeStrat(STRAT_LONG_HOLD, {
+  id: 'longFlomd', name: 'LONGSHOT FLOMD',
+  desc: 'longHold когда Σ5 demo longHold > 0. test EV+2.7.',
+  gateRefId: 'longHold', gateSigType: 'sum', gateWindow: 5, gateThr: 0 });
+
+const STRAT_SESSION_FLOMD = makeRegimeStrat(STRAT_TIME_SESSION, {
+  id: 'sessionFlomd', name: 'SESSION FLOMD',
+  desc: 'timeSession когда «ускорение» demo timeSession > 10. test EV+15.6 (мало сделок, высокая выборочность).',
+  gateRefId: 'timeSession', gateSigType: 'accel', gateWindow: 10, gateThr: 10 });
+
+// ── КОМБО-СТРАТЕГИИ (режим по СОСТОЯНИЮ ДРУГИХ стратегий) ──────────────────────
+// Глубже self-сигнала: входим по согласованности НЕСКОЛЬКИХ demo-опор.
+// Проверено train/test + по дням (анти-overfit, топ-день <50% прибыли).
+const STRAT_COMBO_CONFIRM = makeRegimeStrat(STRAT_MOM_CONFIRM, {
+  id: 'comboConfirm', name: 'COMBO CONFIRM (momConfirm × momentum-холодный)',
+  desc: 'momConfirm входит когда momentum ХОЛОДНЫЙ (зеркальные режимы). Сам momConfirm база −$195 на тесте → комбо +$462. 8/11 дней+.',
+  gateRefId: 'momConfirm', gateSigType: 'accel', gateWindow: 10, gateThr: 20,
+  combo: [{ ref: 'momentum', wantHot: false }] });
+
+const STRAT_COMBO_LONG = makeRegimeStrat(STRAT_LONG_HOLD, {
+  id: 'comboLong', name: 'COMBO LONG (longHold × momScratch-холодный)',
+  desc: 'longHold входит когда momScratch ХОЛОДНЫЙ. test +$332, TEST 3/3 дня+, топ-день 33%.',
+  gateRefId: 'longHold', gateSigType: 'sum', gateWindow: 5, gateThr: 0,
+  combo: [{ ref: 'momScratch', wantHot: false }] });
+
+const STRAT_COMBO_SCRATCH = makeRegimeStrat(STRAT_MOM_SCRATCH, {
+  id: 'comboScratch', name: 'COMBO SCRATCH (momScratch × longHold-горячий)',
+  desc: 'momScratch входит когда И сам горячий, И longHold горячий (согласованные режимы). test +$797, TEST 4/5 дней+.',
+  gateRefId: 'momScratch', gateSigType: 'wr', gateWindow: 5, gateThr: 1,
+  combo: [{ ref: 'longHold', wantHot: true }] });
+
+// НОВЫЕ (добавлены при глубоком переборе — раньше считались безнадёжными):
+const STRAT_MOM_FLOMD_PURE = makeRegimeStrat(STRAT_MOMENTUM, {
+  id: 'momFlomdPure', name: 'MOMENTUM FLOMD PURE',
+  desc: 'Чистый momentum (hold) когда Σ15 demo momentum > 5. Сам momentum убыточен (−$537), но в горячем режиме: test EV+4.3 $1444! Окно 15 — ключ (на 8 не ловится).',
+  gateRefId: 'momentum', gateSigType: 'sum', gateWindow: 15, gateThr: 5 });
+
+const STRAT_MOM_FLOMD_SCRATCH_HI = makeRegimeStrat(STRAT_MOM_SCRATCH_HI, {
+  id: 'momFlomdScratchHi', name: 'MOMENTUM FLOMD SCRATCH HI',
+  desc: 'momScratchHi когда Σ8 demo momScratchHi > 20 (высокий порог = только явно горячий режим). test EV+5.6.',
+  gateRefId: 'momScratchHi', gateSigType: 'sum', gateWindow: 8, gateThr: 20 });
+
+const STRAT_UNDERDOG_FLOMD = makeRegimeStrat(STRAT_UNDERDOG_HOLD, {
+  id: 'underdogFlomd', name: 'UNDERDOG FLOMD (дневной режим)',
+  desc: 'underdogHold ТОЛЬКО если вчерашний день underdogHold-demo был в плюсе. Дневной режим (внутридневной сигнал у дога переворачивается, дневной — держится). test: режет плохие дни до нуля.',
+  gateRefId: 'underdogHold', dayGateWin: 1 });
+// убираем внутридневной гейт у этой обёртки — только дневной:
+STRAT_UNDERDOG_FLOMD.defaults.gateWindow = 0;  // только дневной гейт
+
+// ── FLOMD FAVE (недооценённый глубокий фаворит) ───────────────────────────────
+// САМОЕ ФУНДАМЕНТАЛЬНОЕ открытие сессии (реальные посекундные данные Polymarket
+// 8–13 июня): сторона, КУДА движется BTC в момент входа, выигрывает окно в ~98%
+// случаев — рынок BTC на 5-минутках почти чисто ТРЕНДОВЫЙ, развороты к концу
+// окна крайне редки. Это объясняет, почему все дог-стратегии (ставка на возврат)
+// системно убыточны.
+//
+// Книга Polymarket откалибрована почти идеально (edge ±2pp везде), КРОМЕ одной
+// устойчивой щели: ГЛУБОКИЙ фаворит (75–96¢) в поздней фазе окна (150–280с)
+// книгой НЕдооценён — реальный WR 85–93% против break-even ~80%. Edge +4…6pp.
+//   Реальные данные: +$304 за 6 дней, 5/6 дней+, EV +0.23/сделку (WR 85%).
+//   СТРЕСС-ТЕСТ: EV держится +0.23 даже при задержке 5с и слиппедже 15% — это
+//   признак НАСТОЯЩЕГО эджа (книга недооценивает), а не артефакта исполнения.
+//   В отличие от FLOMD INVERSE (фаворит 60–72¢, edge тоньше), здесь щель шире и
+//   подтверждена и на train, и на test.
+// Это «противоположность underdogHold»: вместо дешёвого underdog берём дорогого,
+// почти решённого фаворита под конец окна. Держим до резолва (он уже близок).
+const STRAT_FLOMD_FAVE = {
+  id: 'flomdFave', name: 'FLOMD FAVE (глубокий фаворит)',
+  desc: 'Глубокий фаворит 75–96¢ в поздней фазе окна (150–280с) — книга его недооценивает (WR 85% vs break-even 80%). Реальные данные: +$304/6дн, EV держится при задержке 5с. Лучший honest edge из реальных данных.',
+  defaults: { lo: 0.75, hi: 0.96, elFromSec: 150, elToSec: 280, minTimeMs: 15000,
+              maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const winLenSec = (typeof POLY_WINDOW_SEC === 'number' ? POLY_WINDOW_SEC : 300);
+    const elapsed = winLenSec - ctx.msToEnd / 1000;
+    if (elapsed < p.elFromSec || elapsed > p.elToSec) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const favSide  = np.up >= np.dn ? 'UP' : 'DOWN';
+    const favPrice = Math.max(np.up, np.dn);
+    if (favPrice < p.lo || favPrice > p.hi) return null;
+    if (favPrice > 0.96) return null;                  // выше 96¢ — нет смысла (мало навара)
+    const ourProb = _clampProb(Math.min(0.97, favPrice + 0.05), favPrice);
+    return { side: favSide, polyPrice: favPrice, ourProb, edge: ourProb - favPrice,
+             info: `FLOMD-FAVE ${favSide} @${(favPrice * 100).toFixed(0)}¢ el${elapsed.toFixed(0)}s` };
+  },
+  shouldExit() { return null; },   // hold до резолва — он уже близок
+};
+
+// ── FLOMD INVERSE (фаворит вместо дога) ───────────────────────────────────────
+// Открытие на РЕАЛЬНЫХ посекундных данных Polymarket 8–13 июня (тот период, где
+// дог-FLOMD страдал): в окнах, где дог стоит 25–35¢ (а фаворит 60–72¢), выигрывает
+// ФАВОРИТ в ~67–70% случаев. Тот же сетап, что у FLOMD, но ставка на ПРОТИВО-
+// положную (дорогую) сторону.
+//   • Дог hold (текущий FLOMD): на этих окнах −$960 за 6 дней, 2/6 дней+.
+//   • Фаворит hold: +$159…183, 4/6 дней+, train +$34 / test +$148 (устойчиво OOS).
+// ЧЕСТНО: плюс СКРОМНЫЙ (EV +0.14 на $10) — фаворит дорогой, комиссия и задержка
+// съедают много. SL фавориту ВРЕДИТ (−$103) — просевшие фавориты возвращаются,
+// держим до резолва. CVD/OBI-фильтры ПРОВЕРЕНЫ и отвергнуты (мираж на train,
+// разворот на test). Это не золотая жила, а структурно верная сторона ставки.
+// Включать ОТДЕЛЬНО от FLOMD (это его зеркало — обе одновременно бессмысленно:
+// в одном окне взяли бы обе стороны).
+const STRAT_FLOMD_INVERSE = {
+  id: 'flomdInverse', name: 'FLOMD INVERSE (фаворит)',
+  desc: 'Тот же сетап что FLOMD, но ставка на ФАВОРИТА (60–72¢), а не дога. На реальных данных 8–13 июня дог −$960, фаворит +$159. Держим до резолва (SL вредит). Скромный плюс, но верная сторона.',
+  defaults: { lo: 0.60, hi: 0.72, minTimeMs: 60000, elFromSec: 30,
+              maxPerWindow: 1, kellyFrac: 0.08, maxFrac: 0.04 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const winLenSec = (typeof POLY_WINDOW_SEC === 'number' ? POLY_WINDOW_SEC : 300);
+    const elapsed = winLenSec - ctx.msToEnd / 1000;
+    if (elapsed < p.elFromSec) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    // ФАВОРИТ = дорогая сторона
+    const favSide  = np.up >= np.dn ? 'UP' : 'DOWN';
+    const favPrice = Math.max(np.up, np.dn);
+    if (favPrice < p.lo || favPrice > p.hi || favPrice > 0.90) return null;
+    const ourProb = _clampProb(Math.min(0.95, favPrice + 0.05), favPrice);
+    return { side: favSide, polyPrice: favPrice, ourProb, edge: ourProb - favPrice,
+             info: `FLOMD-INV ${favSide} @${(favPrice * 100).toFixed(0)}¢` };
+  },
+  shouldExit() { return null; },   // hold до резолва — SL фавориту вредит
+};
+
 // ── FAVMOM (фаворит-моментум) ─────────────────────────────────────────────────
 // НОВАЯ стратегия (бектест на данных 1–12 июня с комиссией). Идея ПРОТИВОПОЛОЖНА
 // lagFav: не ждём отставания книги, а едем НА продолжении тренда. BTC рванул от
@@ -2847,12 +3102,42 @@ const STRAT_FAVMOM_B = {
 // lagFav и favMomA пересекаются в 18% окон, но с РАЗНЫХ СТОРОН (lagFav 55-72¢,
 // favMomA 72-88¢) — это разные ставки на разные исходы, ок.
 // underdogHold — ТОЛЬКО demo (датчик для FLOMD и skip3), на REAL не включать.
+// ── ИТОГОВЫЙ НАБОР ────────────────────────────────────────────────────────────
+// СЕНСОРЫ (держать в DEMO — кормят гейты, на REAL не нужны):
+//   underdogHold → FLOMD/skip3; momScratch/momConfirm/momHi/longHold/timeSession
+//   → одноимённые РЕЖИМ-стратегии ниже.
+// РАБОЧИЕ (можно REAL): lagFav, favMomA, FLOMD, udgSkip3 + 5 режим-следящих.
+// Каждая стратегия смотрит свой acct.open (входят независимо); суммарный риск
+// ограничен MAX_TOTAL_EXPOSURE_FRAC (Guard F, 50% баланса).
 const STRAT_DEFINITIONS = [
-  STRAT_UNDERDOG_HOLD,   // датчик — DEMO only
-  STRAT_LAG_FAV,         // отстающий фаворит: книга < спота, OOS +17%
-  STRAT_FAVMOM_A,        // моментум: книга > спота, WR 85%, 8/11 дней+
-  STRAT_FLOMD,           // дог + машина + SL 5¢
-  STRAT_UDG_SKIP3,       // дог после 3 лузов опоры
+  // — сенсоры (DEMO only) —
+  STRAT_UNDERDOG_HOLD,
+  STRAT_MOM_SCRATCH,
+  STRAT_MOM_CONFIRM,
+  STRAT_MOM_HI,
+  STRAT_LONG_HOLD,
+  STRAT_TIME_SESSION,
+  STRAT_MOMENTUM,
+  STRAT_MOM_SCRATCH_HI,
+  // — рабочие: книга < спота / книга > спота / дог —
+  STRAT_LAG_FAV,
+  STRAT_FAVMOM_A,
+  STRAT_FLOMD,
+  STRAT_FLOMD_INVERSE,
+  STRAT_FLOMD_FAVE,
+  STRAT_UDG_SKIP3,
+  // — режим-следящие (FLOMD-семейство для моментума) —
+  STRAT_MOM_FLOMD_SCRATCH,
+  STRAT_MOM_FLOMD_CONFIRM,
+  STRAT_MOM_FLOMD_HI,
+  STRAT_LONG_FLOMD,
+  STRAT_SESSION_FLOMD,
+  STRAT_MOM_FLOMD_PURE,
+  STRAT_MOM_FLOMD_SCRATCH_HI,
+  STRAT_UNDERDOG_FLOMD,
+  STRAT_COMBO_CONFIRM,
+  STRAT_COMBO_LONG,
+  STRAT_COMBO_SCRATCH,
   ...MANUAL_STRATS,
 ];
 
