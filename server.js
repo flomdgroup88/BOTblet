@@ -2158,9 +2158,9 @@ const STRAT_UDG_SCORE = {
 const STRAT_UDG_SKIP3 = {
   id: 'udgSkip3',
   name: 'UDG-Skip-3 (Hold + Skip-фильтр)',
-  desc: 'Дог 10–35¢ ТОЛЬКО после 3 лузов underdogHold подряд. Лучший skip по бектесту с комиссией: IS +10.1%, OOS +9.0%, +$214/11дн. Верхнюю границу НЕ поднимать (40¢ → минус).',
+  desc: 'Дог 20–40¢ ТОЛЬКО после 3 лузов underdogHold подряд. Коридор подобран на РЕАЛЬНЫХ данных Polymarket (важнее demo-логов): 20-40 даёт +$157/6дн EV+0.72 4/6 дней+ против 10-35 +$8 EV+0.04. Глубокие доги <20¢ на этом рынке мертвы. 3 луза — оптимум (2 рано, 4-5 поздно). ЧЕСТНО: эдж на реальных данных скромный, нестабилен 4/6 дней.',
   defaults: {
-    lo: 0.10, hi: 0.35,
+    lo: 0.20, hi: 0.40,
     minTimeMs: 60000,
     tpAbs: 0.96,
     skipAfter: 3,
@@ -2719,14 +2719,18 @@ function _flomdRegimeActive(p) {
 }
 const STRAT_FLOMD = {
   id: 'flomd', name: 'FLOMD TACTIC',
-  desc: 'Дог 25–35¢ (ниже 25¢ — токсично) с авто-режимом: стоп после 8 лузов underdogHold, возврат после 3 винов, ночной блок 21–23 UTC, cap движения окна ≥$60, пауза при перемолке $40–300 за 3 окна, дог ПО направлению потока, SL 5¢, TP выкл (держим до резолва).',
+  desc: 'Дог 25–35¢ (ниже 25¢ — токсично) с авто-режимом: стоп после 8 лузов underdogHold, возврат после 3 винов, ночной блок 21–23 UTC, ГЛАВНЫЙ ФИЛЬТР — вход только при малом движении BTC (|Δ|<$20 = рынок пилит у нуля, возврат к 50/50 реален; большое Δ = тренд, дог дохнет), пауза при перемолке, дог ПО направлению потока, SL 5¢, TP выкл. Фильтр |Δ|<$20 на РЕАЛЬНЫХ данных 1–13 июня: +$217 8/13 дней против −$865 5/13 без фильтра; чинит даже трендовую неделю (8-13 июня −$1160 → −$53).',
   // Свип 1¢ (train/test): SL-плато 3-6¢, центр 5¢. TP ВЫКЛЮЧЕН: с SL=5¢
   // «без TP» лучше TP96 на КАЖДОМ SL плато (+$40-60, оба периода) — продажа
   // победителя на 96¢ по bid−fee жертвует ~4-5¢/шэр против $1.00 резолва,
   // а защиту от разворота уже даёт SL. tpAbs можно вернуть из UI (напр. 0.96).
+  // maxEntryMoveUSD=17: ТРИГГЕР РАЗВОРОТА (симметричный |Δ|, свип 1-50). Пик Δ<17:
+  // +$291 EV+0.49 10/13 дней. Направленность (откуп Δ<0 vs рост Δ>0) ПРОВЕРЕНА и
+  // НЕ зашита: эффект «откуп лучше» держался только 1-7 июня (EV +5.25 на 42 сделках),
+  // на 8-13 перевернулся (откуп +0.14 < рост +0.27) — артефакт периода, не сигнал.
   defaults: { lo: 0.25, hi: 0.35, minTimeMs: 60000, tpAbs: 0,
               skipAfter: 8, resumeWins: 3, blockFromUTC: 21, blockToUTC: 23,
-              maxEntryMoveUSD: 60, trendPauseLoUSD: 40, trendPauseHiUSD: 300, trendPauseWindows: 3,
+              maxEntryMoveUSD: 17, trendPauseLoUSD: 40, trendPauseHiUSD: 300, trendPauseWindows: 3,
               skipAgainstGrind: 1, grindDirMinUSD: 20,
               stopLossPrice: 0.05,
               maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
@@ -2745,7 +2749,7 @@ const STRAT_FLOMD = {
     const f = p.blockFromUTC % 24, t = p.blockToUTC % 24;
     const night = (f === t) ? false : (f < t ? (h >= f && h < t) : (h >= f || h < t));
     if (night) return blockedBy('night');
-    // ── Анти-тренд гейт 1: ТЕКУЩЕЕ окно уже уехало слишком далеко ─────────────
+    // ── Анти-тренд гейт 1: ТЕКУЩЕЕ окно уже уехало слишком далеко (|Δ|, симметрично)
     if (ctx.curBTC != null && ctx.openingBTC != null
         && Math.abs(ctx.curBTC - ctx.openingBTC) >= p.maxEntryMoveUSD) return blockedBy('entryMoveCap');
     // ── Анти-тренд гейт 2: однонаправленная перемолка соседних окон ───────────
@@ -2871,6 +2875,21 @@ function _demoSignalGate(refId, sigType, N, thr) {
 // предсказывается СОСТОЯНИЕМ ДРУГИХ стратегий (зеркальные/согласованные режимы),
 // чем собственным. Напр.: momConfirm работает когда momentum ХОЛОДНЫЙ;
 // longHold — когда momScratch холодный; momScratch усиливается когда longHold горячий.
+// ВРЕМЕННОЙ гейт: сумма PnL demo-сделок опоры за последние N МИНУТ > порога.
+// Отличие от _demoSignalGate (последние N сделок): учитывает ПЛОТНОСТЬ сделок —
+// в активный период окно охватит больше сделок, в тихий меньше. Проверено: для
+// momConfirm/longHold/momScratchHi временное окно чуть устойчивее на test, чем
+// счётное. Для momScratch/momentum — счётное лучше (оставлены на нём).
+function _demoTimeGate(refId, windowMin, thr) {
+  const ref = STRATEGIES[refId];
+  if (!ref || !ref.demo || !ref.demo.log) return false;
+  const cutoff = Date.now() - windowMin * 60000;
+  const log = ref.demo.log.filter(t => !t.dirty && t.closeTime && t.closeTime >= cutoff);
+  if (log.length < 3) return false;          // мало сделок в окне — молчим
+  let sum = 0;
+  for (const t of log) sum += (t.pnl || 0);
+  return sum > thr;
+}
 function _comboOk(combo) {
   if (!combo || !combo.length) return true;
   for (const c of combo) {
@@ -2886,12 +2905,14 @@ function makeRegimeStrat(base, opts) {
                 gateSigType: opts.gateSigType || 'sum', gateWindow: opts.gateWindow || 0,
                 gateThr: opts.gateThr != null ? opts.gateThr : 0,
                 dayGateWin: opts.dayGateWin || 0,
+                timeGateMin: opts.timeGateMin || 0, timeGateThr: opts.timeGateThr || 0,
                 kellyFrac: opts.kellyFrac != null ? opts.kellyFrac : 0.08,
                 maxFrac: opts.maxFrac != null ? opts.maxFrac : 0.04 },
     _combo: opts.combo || null,
     shouldEnter(ctx, p) {
-      // режим-гейт: сигнальный (sum/wr/accel) И/ИЛИ дневной (вчера>0) И/ИЛИ комбо
+      // режим-гейт: сигнальный (sum/wr/accel), временной (N минут), дневной (вчера>0), комбо
       if (p.gateWindow && !_demoSignalGate(p.gateRefId, p.gateSigType, p.gateWindow, p.gateThr)) return null;
+      if (p.timeGateMin && !_demoTimeGate(p.gateRefId, p.timeGateMin, p.timeGateThr || 0)) return null;
       if (p.dayGateWin && !_demoDayGate(p.gateRefId, p.dayGateWin)) return null;
       if (this._combo && !_comboOk(this._combo)) return null;
       return base.shouldEnter(ctx, p);
@@ -2923,7 +2944,7 @@ const STRAT_LONG_FLOMD = makeRegimeStrat(STRAT_LONG_HOLD, {
 const STRAT_SESSION_FLOMD = makeRegimeStrat(STRAT_TIME_SESSION, {
   id: 'sessionFlomd', name: 'SESSION FLOMD',
   desc: 'timeSession когда «ускорение» demo timeSession > 10. test EV+15.6 (мало сделок, высокая выборочность).',
-  gateRefId: 'timeSession', gateSigType: 'accel', gateWindow: 10, gateThr: 10 });
+  gateRefId: 'timeSession', gateSigType: 'sum', gateWindow: 10, gateThr: 20 });
 
 // ── КОМБО-СТРАТЕГИИ (режим по СОСТОЯНИЮ ДРУГИХ стратегий) ──────────────────────
 // Глубже self-сигнала: входим по согласованности НЕСКОЛЬКИХ demo-опор.
@@ -2950,7 +2971,7 @@ const STRAT_COMBO_SCRATCH = makeRegimeStrat(STRAT_MOM_SCRATCH, {
 const STRAT_MOM_FLOMD_PURE = makeRegimeStrat(STRAT_MOMENTUM, {
   id: 'momFlomdPure', name: 'MOMENTUM FLOMD PURE',
   desc: 'Чистый momentum (hold) когда Σ15 demo momentum > 5. Сам momentum убыточен (−$537), но в горячем режиме: test EV+4.3 $1444! Окно 15 — ключ (на 8 не ловится).',
-  gateRefId: 'momentum', gateSigType: 'sum', gateWindow: 15, gateThr: 5 });
+  gateRefId: 'momentum', gateSigType: 'sum', gateWindow: 15, gateThr: 0 });  // порог 0: 8/12 дней (стабильнее >5)
 
 const STRAT_MOM_FLOMD_SCRATCH_HI = makeRegimeStrat(STRAT_MOM_SCRATCH_HI, {
   id: 'momFlomdScratchHi', name: 'MOMENTUM FLOMD SCRATCH HI',
@@ -2958,11 +2979,86 @@ const STRAT_MOM_FLOMD_SCRATCH_HI = makeRegimeStrat(STRAT_MOM_SCRATCH_HI, {
   gateRefId: 'momScratchHi', gateSigType: 'sum', gateWindow: 8, gateThr: 20 });
 
 const STRAT_UNDERDOG_FLOMD = makeRegimeStrat(STRAT_UNDERDOG_HOLD, {
-  id: 'underdogFlomd', name: 'UNDERDOG FLOMD (дневной режим)',
-  desc: 'underdogHold ТОЛЬКО если вчерашний день underdogHold-demo был в плюсе. Дневной режим (внутридневной сигнал у дога переворачивается, дневной — держится). test: режет плохие дни до нуля.',
-  gateRefId: 'underdogHold', dayGateWin: 1 });
-// убираем внутридневной гейт у этой обёртки — только дневной:
-STRAT_UNDERDOG_FLOMD.defaults.gateWindow = 0;  // только дневной гейт
+  id: 'underdogFlomd', name: 'UNDERDOG FLOMD (TRADE ON/OFF)',
+  desc: 'underdogHold с авто TRADE ON/OFF (наблюдение из эфира: «прёт → бери, выдохся → стоп»). TRADE OFF = 5 лузов underdogHold подряд (0 винов из 5). TRADE ON = появился ≥1 вин из последних 5. Вся выборка 13 дней: +$3305 (≈ как ≥1из3), но maxDD $360 vs $503 и худший день −$134 vs −$262 — выбрано ради «главное не терять». Проверено: PnL-за-время и стрики 2-5 хуже; ≥1из5 — оптимум риск/доход.',
+  gateRefId: 'underdogHold', gateSigType: 'wr', gateWindow: 5, gateThr: 0 });
+
+// ── UNDERDOG DIP (ЭКСПЕРИМЕНТ: откуп после малого падения) ─────────────────────
+// ГИПОТЕЗА на тест (НЕ подтверждена на всей выборке): дог отыгрывает лучше, когда
+// BTC немного припал ПРОТИВ него ($3-20) — выкуп просадки → отскок. На реальных
+// данных 1-13 июня в СУММЕ выглядела сильно (+$377 EV+1.39 maxDD$76), НО при
+// раздельной проверке эффект держался только 1-7 июня (EV+5.25 на 42 сделках) и
+// ПЕРЕВЕРНУЛСЯ на 8-13 (откуп +0.14 < рост +0.27). Вероятно шум/артефакт периода.
+// Поэтому вынесена ОТДЕЛЬНО для форвард-теста — НЕ включать на реал, пока свежие
+// данные не подтвердят, что направленность реальна. Симметричные версии (FLOMD,
+// UNDERDOG DELTA) остаются на |Δ|<17.
+const STRAT_UNDERDOG_DIP = {
+  id: 'underdogDip', name: 'UNDERDOG DIP (эксперимент, откуп)',
+  desc: 'ЭКСПЕРИМЕНТ для форвард-теста: дог 15-35¢ когда BTC припал против дога на $3-20 (ставка на отскок). На полной выборке +$377, но направленность держалась только 1-7 июня и перевернулась 8-13 — возможно шум. НЕ для реала до подтверждения на свежих данных.',
+  defaults: { lo: 0.15, hi: 0.35, minTimeMs: 60000, tpAbs: 0.96,
+              btcDipMin: 3, btcDipMax: 20,
+              maxPerWindow: 1, kellyFrac: 0.08, maxFrac: 0.04 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const dogPrice = Math.min(np.up, np.dn);
+    if (dogPrice < p.lo || dogPrice > p.hi || dogPrice < MIN_ENTRY_PRICE) return null;
+    if (ctx.curBTC != null && ctx.openingBTC != null) {
+      const delta = ctx.curBTC - ctx.openingBTC;
+      const dipAgainstDog = dogSide === 'UP' ? -delta : delta;  // BTC ушёл ПРОТИВ дога
+      if (dipAgainstDog < p.btcDipMin || dipAgainstDog > p.btcDipMax) return null;
+    }
+    const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
+    return { side: dogSide, polyPrice: dogPrice, ourProb, edge: ourProb - dogPrice,
+             info: `UDG-DIP ${dogSide} @${(dogPrice*100).toFixed(0)}¢ dip$${p.btcDipMin}-${p.btcDipMax}` };
+  },
+  shouldExit(ctx, pos, p) {
+    const cur = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (cur != null && p.tpAbs && cur >= p.tpAbs) return { reason: 'TP', exitPrice: cur };
+    return null;
+  },
+};
+
+// ── UNDERDOG DELTA (дог при штиле BTC) ────────────────────────────────────────
+// ОТКРЫТИЕ на полных реальных данных Polymarket 1–13 июня: дельта-фильтр —
+// универсальный ключ для дешёвых догов. underdogHold САМ ПО СЕБЕ убыточен
+// (−$927, 5/13 дней), НО при МАЛОМ движении BTC (|Δ|<$15-20) выходит в плюс:
+//   |Δ|<$15: +$208, 9/13 дней+, EV +0.39
+//   |Δ|<$20: +$227, 8/13 дней+, EV +0.31 (больше сделок)
+// Логика (зеркало FLOMD FAVE): малое движение = BTC болтается у нуля = возврат к
+// 50/50 реален = дешёвый дог отыгрывает. Большое движение = тренд = дог дохнет.
+// Это та же идея, что спасла FLOMD-дога (|Δ|<$20), но как ОТДЕЛЬНАЯ стратегия на
+// коридоре underdogHold 15-35 (шире, чем FLOMD 25-35 — больше дешёвых догов).
+// ВАЖНО: это НЕ датчик underdogHold (тот без фильтра кормит FLOMD/skip3/underdogFlomd).
+// Это самостоятельная рабочая стратегия. Держим до резолва (TP 96¢), SL не нужен
+// (при штиле дог редко обнуляется). Зеркало: для ФАВОРИТА нужна БОЛЬШАЯ дельта
+// (см. FLOMD INVERSE Δ≥30 / FAVE) — один признак, два направления.
+const STRAT_UNDERDOG_DELTA = {
+  id: 'underdogDelta', name: 'UNDERDOG DELTA (дог при штиле)',
+  desc: 'Дешёвый дог 15–35¢ ТОЛЬКО когда BTC мало двигался (|Δ|<$17, обе стороны). Реальные данные 1–13 июня: +$287, 9/13 дней+, EV +0.48 — против −$927 у underdogHold без фильтра. Направленность (откуп vs рост) проверена и отброшена как шум (перевернулась во 2-м периоде). Держим до резолва.',
+  defaults: { lo: 0.15, hi: 0.35, minTimeMs: 60000, tpAbs: 0.96, btcMoveMax: 17,
+              maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const dogSide  = np.up <= np.dn ? 'UP' : 'DOWN';
+    const dogPrice = Math.min(np.up, np.dn);
+    if (dogPrice < p.lo || dogPrice > p.hi || dogPrice < MIN_ENTRY_PRICE) return null;
+    // ДЕЛЬТА-ФИЛЬТР (симметричный): дог только при малом движении BTC (рынок пилит → возврат)
+    if (p.btcMoveMax && ctx.curBTC != null && ctx.openingBTC != null) {
+      if (Math.abs(ctx.curBTC - ctx.openingBTC) >= p.btcMoveMax) return null;
+    }
+    const ourProb = _clampProb(dogPrice + 0.10, dogPrice);
+    return { side: dogSide, polyPrice: dogPrice, ourProb, edge: ourProb - dogPrice,
+             info: `UDG-Δ ${dogSide} @${(dogPrice*100).toFixed(0)}¢ |Δ|<$${p.btcMoveMax}` };
+  },
+  shouldExit(ctx, pos, p) {
+    const cur = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (cur != null && p.tpAbs && cur >= p.tpAbs) return { reason: 'TP', exitPrice: cur };
+    return null;
+  },
+};
 
 // ── FLOMD FAVE (недооценённый глубокий фаворит) ───────────────────────────────
 // САМОЕ ФУНДАМЕНТАЛЬНОЕ открытие сессии (реальные посекундные данные Polymarket
@@ -3017,9 +3113,9 @@ const STRAT_FLOMD_FAVE = {
 // Включать ОТДЕЛЬНО от FLOMD (это его зеркало — обе одновременно бессмысленно:
 // в одном окне взяли бы обе стороны).
 const STRAT_FLOMD_INVERSE = {
-  id: 'flomdInverse', name: 'FLOMD INVERSE (фаворит)',
-  desc: 'Тот же сетап что FLOMD, но ставка на ФАВОРИТА (60–72¢), а не дога. На реальных данных 8–13 июня дог −$960, фаворит +$159. Держим до резолва (SL вредит). Скромный плюс, но верная сторона.',
-  defaults: { lo: 0.60, hi: 0.72, minTimeMs: 60000, elFromSec: 30,
+  id: 'flomdInverse', name: 'FLOMD INVERSE (умный фаворит)',
+  desc: 'Фаворит 60–72¢ + фильтр: вход ТОЛЬКО когда BTC уже двинулся ≥$30 в его сторону (тренд подтверждён, не шум). Реальные данные 8–13 июня: фильтр поднял EV +0.15→+0.53, WR 67→72%, maxDD $75→$0, 4/5 дней+. Держим до резолва (SL вредит). Движение ≥$50 пересушивает (мало сделок).',
+  defaults: { lo: 0.60, hi: 0.72, minTimeMs: 60000, elFromSec: 30, btcMoveMin: 30,
               maxPerWindow: 1, kellyFrac: 0.08, maxFrac: 0.04 },
   shouldEnter(ctx, p) {
     if (ctx.msToEnd < p.minTimeMs) return null;
@@ -3031,9 +3127,15 @@ const STRAT_FLOMD_INVERSE = {
     const favSide  = np.up >= np.dn ? 'UP' : 'DOWN';
     const favPrice = Math.max(np.up, np.dn);
     if (favPrice < p.lo || favPrice > p.hi || favPrice > 0.90) return null;
+    // УМНЫЙ ФИЛЬТР: BTC должен реально двинуться в сторону фаворита (тренд подтверждён)
+    if (p.btcMoveMin && ctx.curBTC != null && ctx.openingBTC != null) {
+      const delta = ctx.curBTC - ctx.openingBTC;
+      const moveForFav = favSide === 'UP' ? delta : -delta;
+      if (moveForFav < p.btcMoveMin) return null;
+    }
     const ourProb = _clampProb(Math.min(0.95, favPrice + 0.05), favPrice);
     return { side: favSide, polyPrice: favPrice, ourProb, edge: ourProb - favPrice,
-             info: `FLOMD-INV ${favSide} @${(favPrice * 100).toFixed(0)}¢` };
+             info: `FLOMD-INV ${favSide} @${(favPrice * 100).toFixed(0)}¢ Δ≥$${p.btcMoveMin}` };
   },
   shouldExit() { return null; },   // hold до резолва — SL фавориту вредит
 };
@@ -3125,19 +3227,17 @@ const STRAT_DEFINITIONS = [
   STRAT_FLOMD,
   STRAT_FLOMD_INVERSE,
   STRAT_FLOMD_FAVE,
+  STRAT_UNDERDOG_DELTA,
+  STRAT_UNDERDOG_DIP,
   STRAT_UDG_SKIP3,
   // — режим-следящие (FLOMD-семейство для моментума) —
   STRAT_MOM_FLOMD_SCRATCH,
   STRAT_MOM_FLOMD_CONFIRM,
   STRAT_MOM_FLOMD_HI,
-  STRAT_LONG_FLOMD,
   STRAT_SESSION_FLOMD,
   STRAT_MOM_FLOMD_PURE,
   STRAT_MOM_FLOMD_SCRATCH_HI,
   STRAT_UNDERDOG_FLOMD,
-  STRAT_COMBO_CONFIRM,
-  STRAT_COMBO_LONG,
-  STRAT_COMBO_SCRATCH,
   ...MANUAL_STRATS,
 ];
 
