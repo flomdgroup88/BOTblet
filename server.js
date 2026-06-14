@@ -2007,6 +2007,34 @@ const STRAT_UDG_FAV = {
   },
 };
 
+// UDG-LEADER-6472: Лидер (фаворит) в коридоре 0.64–0.72, абсолютные TP/SL.
+// ТЕСТОВАЯ стратегия: вход в сторону с более высокой ценой (лидера), если она
+// в коридоре 64–72¢. Выход: TP — цена дошла до 0.95, SL — цена упала до 0.20
+// (оба порога АБСОЛЮТНЫЕ, не от цены входа). Иначе держим до резолва.
+const STRAT_UDG_LEADER_6472 = {
+  id: 'udgLeader6472', name: 'UDG-Leader 64-72 (TP0.95/SL0.20 абс.)',
+  desc: 'тест: вход в лидера 64–72¢, абсолютный TP 95¢ и абсолютный SL 20¢ (от 0/100, не от входа)',
+  defaults: { lo: 0.64, hi: 0.72, minTimeMs: 60000, tpAbs: 0.95, slAbs: 0.20, maxPerWindow: 1, kellyFrac: 0.09, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    // Берём лидера (сторону с более высокой ценой)
+    const leadSide  = np.up >= np.dn ? 'UP' : 'DOWN';
+    const leadPrice = Math.max(np.up, np.dn);
+    if (leadPrice < p.lo || leadPrice > p.hi) return null;
+    if (leadPrice < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(leadPrice + 0.08, leadPrice);
+    return { side: leadSide, polyPrice: leadPrice, ourProb, edge: ourProb - leadPrice, info: `udgLeader ${leadSide} @${(leadPrice*100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) {
+    const cur = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (cur == null) return null;
+    if (p.tpAbs && cur >= p.tpAbs) return { reason: 'TP', exitPrice: cur };
+    if (p.slAbs && cur <= p.slAbs) return { reason: 'SL', exitPrice: cur };
+    return null;
+  },
+};
+
 // UDG-FLIP: «Первый разворот».
 // «Первый удар» = одна из сторон зашла в диапазон hitLo–hitHi (0.35→0.15).
 // Запоминаем эту сторону. Потом берём ДРУГУЮ сторону, когда она тоже зайдёт
@@ -2666,6 +2694,31 @@ setInterval(() => {
     const gl = Object.entries(r.gates).map(([k, a]) => `• ${_tgEsc(k)}: блокир. ${a.n}, сэкономлено ${a.savedUSD >= 0 ? '+' : ''}$${a.savedUSD}`).join('\n') || '• блокировок не было';
     const fl = r.flags.length ? '\n⚠️ ' + r.flags.map(_tgEsc).join('\n⚠️ ') : '';
     sendTg(`📊 <b>ML-дайджест за сутки</b>\n\n<b>Стратегии (demo):</b>\n${sl}\n\n<b>Гейты FLOMD (контрфакты):</b>\n${gl}${fl}`);
+  } catch (_) {}
+}, 60000);
+
+// ── UNDERDOG HOLD: уведомление, если PnL за последние 30 минут в плюсе ───────
+// Считаем по закрытым (не dirty) сделкам demo-лога underdogHold за последние
+// 30 минут (по closeTime). Если сумма > 0 — шлём в Telegram. Чтобы не спамить,
+// уведомление повторно отправляется только после "сброса" — когда окно
+// перестало быть положительным (или сделок не было) и затем снова стало плюсовым.
+let _udgHold30mWasPositive = false;
+setInterval(() => {
+  try {
+    const ref = STRATEGIES['underdogHold'];
+    if (!ref || !ref.demo || !ref.demo.log) return;
+    const WINDOW_MS = 30 * 60 * 1000;
+    const cutoff = Date.now() - WINDOW_MS;
+    let sum = 0, n = 0;
+    for (const t of ref.demo.log) {
+      if (t.dirty || !t.closeTime || t.closeTime < cutoff) continue;
+      sum += (t.pnl || 0); n++;
+    }
+    const positive = n > 0 && sum > 0;
+    if (positive && !_udgHold30mWasPositive) {
+      sendTg(`✅ <b>Underdog Hold (demo)</b>: PnL за 30 мин в плюсе: ${sum >= 0 ? '+' : ''}$${sum.toFixed(2)} (сделок: ${n})`);
+    }
+    _udgHold30mWasPositive = positive;
   } catch (_) {}
 }, 60000);
 
@@ -3567,6 +3620,7 @@ const STRAT_DEFINITIONS = [
   ...UDG_DELTA_TPSL,     // ← 28 вариантов: коридор × TP, абсолютный SL 8¢
   STRAT_UNDERDOG_DIP,
   STRAT_UDG_SKIP3,
+  STRAT_UDG_LEADER_6472,    // ← ТЕСТ: лидер 64-72¢, абс. TP0.95/SL0.20
   // — режим-следящие (FLOMD-семейство для моментума) —
   STRAT_MOM_FLOMD_SCRATCH,
   STRAT_MOM_FLOMD_CONFIRM,
