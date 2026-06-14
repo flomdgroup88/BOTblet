@@ -3663,13 +3663,14 @@ let INVERT_SIGNAL = ['true', '1', 'yes', 'on']
 //  2) DEMO_MAX_CHASE — если за время задержки цена входа убежала вверх больше чем
 //     на этот %, считаем что «залиться нельзя» (вагон уехал) и пропускаем сделку.
 let DEMO_ENTRY_DELAY_MS = Math.max(0, Math.min(30000,
-  Math.round((parseFloat(process.env.DEMO_ENTRY_DELAY_SEC || '2') || 2) * 1000)));
+  Math.round((parseFloat(process.env.DEMO_ENTRY_DELAY_SEC || '0.8') || 0.8) * 1000)));
 let DEMO_MAX_CHASE = Math.max(0.01, Math.min(2.0,
   (parseFloat(process.env.DEMO_MAX_CHASE_PCT || '15') || 15) / 100));
-// Реальный спред в demo: вход по ask, выход по bid (как реал). По умолчанию ВЫКЛ —
-// тогда demo торгует по mid (идеальная точка отсчёта). Включается тумблером.
+// Реальный спред в demo: вход по ask, выход по bid (как реал). По умолчанию ВКЛ —
+// демо торгует с реальным спредом (вход по ask, выход по bid). Можно выключить
+// тумблером, тогда demo торгует по mid (идеальная точка отсчёта).
 let DEMO_REAL_SPREAD = ['true', '1', 'yes', 'on']
-  .includes((process.env.DEMO_REAL_SPREAD || 'false').toLowerCase().trim());
+  .includes((process.env.DEMO_REAL_SPREAD || 'true').toLowerCase().trim());
 
 // ── РАСПИСАНИЕ ТОРГОВЛИ ───────────────────────────────────────────────────────
 // Ограничивает ОТКРЫТИЕ сделок по часам (МСК, UTC+3). Выходы работают всегда.

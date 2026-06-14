@@ -679,6 +679,12 @@ table.log tr:hover td { background: var(--bg3); }
       <div id="demoSpreadNote" style="font-size:11px;color:var(--tx3);margin-top:8px;"></div>
     </div>
 
+    <!-- СОХРАНЕНИЕ НАСТРОЕК -->
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:12px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px;">
+      <button id="saveCfgBtn" class="cfg-btn on" onclick="saveParams()" style="min-width:160px;font-weight:600;">💾 СОХРАНИТЬ НАСТРОЙКИ</button>
+      <span id="cfgMsg" style="font-size:11px;color:var(--tx3);"></span>
+    </div>
+
     <!-- (РАСПИСАНИЕ, КАСТОМ-ПАРАМЕТРЫ и РУЧНЫЕ СТРАТЕГИИ удалены по запросу — место освобождено) -->
   </div>
 </div>
@@ -1814,17 +1820,8 @@ async function resetParams() {
   $('cfgMsg').textContent = '✅ Сброшено к базе (50/30 и т.д.)';
 }
 async function saveParams() {
-  const num = id => parseFloat($(id).value);
+  const num = id => { const el = $(id); return el ? parseFloat(el.value) : NaN; };
   const body = {
-    minEdge:    num('p-minEdge') / 100,
-    minConf:    num('p-minConf'),
-    tpPct:      num('p-tpPct') / 100,
-    slPct:      num('p-slPct') / 100,
-    flipConf:   num('p-flipConf'),
-    advMovePct: num('p-advMovePct'),
-    kellyFrac:  num('p-kellyFrac'),
-    maxFrac:    num('p-maxFrac') / 100,
-    minTimeMs:  num('p-minTimeSec') * 1000,
     tpAbsPrice: num('p-tpAbs') / 100,
     minEntryPrice: num('p-minEntry') / 100,
     minBalance: num('p-minBalance'),
@@ -1836,8 +1833,7 @@ async function saveParams() {
   const r = await (await fetch(`/api/strategy/${MOM}/params`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
   if (r.ok) {
     _dirty.clear(); // сохранено — снимаем защиту, поля синхронизируются с сервером
-    const be = (r.params.slPct/(r.params.tpPct+r.params.slPct)*100).toFixed(1);
-    $('cfgMsg').textContent = `✅ Сохранено · TP ${Math.round(r.params.tpPct*100)}% / SL ${Math.round(r.params.slPct*100)}% · абс.TP ${Math.round((r.tpAbsPrice||0)*100)}¢ · мин.вход ${Math.round((r.minEntryPrice||0)*100)}¢ · мин.баланс $${(r.minBalance??0)} · безубыток ${be}%` + (r.customEnabled ? '' : ' (включи КАСТОМ для TP/SL!)');
+    $('cfgMsg').textContent = `✅ Сохранено · абс.TP ${Math.round((r.tpAbsPrice||0)*100)}¢ · мин.вход ${Math.round((r.minEntryPrice||0)*100)}¢ · мин.баланс $${(r.minBalance??0)} · задержка demo ${r.demoDelaySec ?? 0}с · макс.рывок ${Math.round(r.demoMaxChasePct||0)}%`;
   } else $('cfgMsg').textContent = 'Ошибка сохранения';
 }
 
