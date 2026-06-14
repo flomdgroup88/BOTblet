@@ -52,6 +52,14 @@ let   _copyPollBusy      = false;
 let   _copyDirty         = false;              // были ли изменения, требующие сохранения
 let   _copyLastSave      = 0;
 let   _turbo             = { provider: null, connected: false, listeners: [], reconnectMs: 3000, lastEventTs: 0, started: false };
+// Глобальный размер ставки копитрейда (единый калькулятор для всех кошельков).
+//   fixed:        ставлю myMax$ на каждый вход.
+//   proportional: ставлю myMax × (X / MaxT), X — шэры их сделки, MaxT — их макс. сделка.
+//   В обоих режимах — не меньше minShares шэров (пол Polymarket).
+let   COPY_SIZING        = { mode: 'fixed', myMax: 20, minShares: 5 };
+// Персистентный журнал сделок — НЕ очищается при сбросе демо-результатов.
+let   tradeJournal       = [];
+const TRADE_JOURNAL_MAX  = 3000;
 const CHAINLINK_ADDR   = '0xc907E116054Ad103354f2D350FD2514433D57F6f'; // BTC/USD Polygon
 const POLYGON_RPCS     = [
   'https://polygon-bor-rpc.publicnode.com',
@@ -220,8 +228,9 @@ function saveState() {
     };
     out.__calib = calibLog.slice(-CALIB_MAX);
     out.__copy = {
+      sizing: COPY_SIZING,
       wallets: COPY_WALLETS.map(w => ({
-        id: w.id, address: w.address, label: w.label, copyUSD: w.copyUSD,
+        id: w.id, address: w.address, label: w.label, copyUSD: w.copyUSD, maxTradeShares: w.maxTradeShares || 0,
         demoEnabled: w.demoEnabled, realEnabled: w.realEnabled,
         startTs: w.startTs, createdAt: w.createdAt,
         feed: w.feed.slice(0, 30), seen: [...w.seen].slice(-2000),
@@ -229,6 +238,7 @@ function saveState() {
         real: { balance: w.real.balance, positions: w.real.positions, log: w.real.log.slice(-500) },
       })),
     };
+    out.__journal = tradeJournal.slice(-TRADE_JOURNAL_MAX);
     fs.writeFileSync(STATE_FILE, JSON.stringify(out, null, 2));
   } catch (e) { console.error('[state] save error:', e.message); }
 }
@@ -297,10 +307,18 @@ function loadState() {
     }
     if (Array.isArray(stored.__calib)) calibLog = stored.__calib.slice(-CALIB_MAX);
     if (stored.__copy && Array.isArray(stored.__copy.wallets)) {
+      if (stored.__copy.sizing && typeof stored.__copy.sizing === 'object') {
+        const s = stored.__copy.sizing;
+        COPY_SIZING = {
+          mode: s.mode === 'proportional' ? 'proportional' : 'fixed',
+          myMax: Math.max(1, Number(s.myMax) || 20),
+          minShares: Math.max(1, Number(s.minShares) || 5),
+        };
+      }
       COPY_WALLETS = stored.__copy.wallets.filter(w => w && w.address).map(w => ({
         id: w.id || _copyId(), address: String(w.address).toLowerCase(),
         label: w.label || (String(w.address).slice(0, 6) + '…' + String(w.address).slice(-4)),
-        copyUSD: Math.max(1, Number(w.copyUSD) || 20),
+        copyUSD: Math.max(1, Number(w.copyUSD) || 20), maxTradeShares: Number(w.maxTradeShares) || 0,
         demoEnabled: w.demoEnabled ?? true, realEnabled: w.realEnabled ?? false,
         demo: { balance: w.demo?.balance ?? COPY_START_BALANCE, positions: w.demo?.positions || {}, log: w.demo?.log || [] },
         real: { balance: w.real?.balance ?? COPY_START_BALANCE, positions: w.real?.positions || {}, log: w.real?.log || [] },
@@ -309,6 +327,7 @@ function loadState() {
         lastPollTs: 0, lastErr: null,
       })).slice(0, COPY_MAX_WALLETS);
     }
+    if (Array.isArray(stored.__journal)) tradeJournal = stored.__journal.slice(-TRADE_JOURNAL_MAX);
     console.log('[state] loaded');
   } catch (e) { console.error('[state] load error:', e.message); }
 }
@@ -1184,7 +1203,7 @@ const STRAT_MOMENTUM = {
   id: 'momentum',
   name: 'Momentum / Trend',
   desc: 'Высокая уверенность модели + edge ≥ 3pp',
-  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, tpPct: 0.50, slPct: 0.30, flipConf: 50, advMovePct: 0.25, kellyFrac: 0.25, maxFrac: 0.10 },
+  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, tpPct: 0.50, slPct: 0.30, flipConf: 50, advMovePct: 0.25, kellyFrac: 0.25, maxFrac: 0.10, fixedSizeUSD: 5 },
   shouldEnter(ctx, p) {
     if (ctx.sigP.dir === 'WAIT') return null;
     if (ctx.sigP.conf < p.minConf) return null;
@@ -1300,7 +1319,7 @@ const STRAT_MOM_SCRATCH = {
   id: 'momScratch',
   name: 'Momentum Scratch (ранний выход)',
   desc: 'momentum + фиксация малой прибыли, если TP недостижим',
-  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, tpPct: 0.50, slPct: 0.30, flipConf: 50, advMovePct: 0.25, kellyFrac: 0.25, maxFrac: 0.10, scratchMin: 0.08, scratchTimeMs: 120000 },
+  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, tpPct: 0.50, slPct: 0.30, flipConf: 50, advMovePct: 0.25, kellyFrac: 0.25, maxFrac: 0.10, scratchMin: 0.08, scratchTimeMs: 120000, fixedSizeUSD: 5 },
   shouldEnter(ctx, p) { return _momentumEntry(ctx, p, INVERT_SIGNAL); },
   shouldExit(ctx, pos, p) {
     const curMid = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
@@ -1411,7 +1430,7 @@ const STRAT_BOOK_IMB = {
 const STRAT_MOM_HI = {
   id: 'momHi', name: 'Momentum Strong (высокая увер.)',
   desc: 'momentum, но только conf≥50 и edge≥6pp',
-  defaults: { minConf: 50, minEdge: 0.06, minTimeMs: 60000, tpPct: 0.50, slPct: 0.30, flipConf: 55, advMovePct: 0.30, kellyFrac: 0.25, maxFrac: 0.10 },
+  defaults: { minConf: 50, minEdge: 0.06, minTimeMs: 60000, tpPct: 0.50, slPct: 0.30, flipConf: 55, advMovePct: 0.30, kellyFrac: 0.25, maxFrac: 0.10, fixedSizeUSD: 5 },
   shouldEnter(ctx, p) { return _momentumEntry(ctx, p, INVERT_SIGNAL); },
   shouldExit(ctx, pos, p) { return _tpSlExit(ctx, pos, p) || _advExit(ctx, pos, p); },
 };
@@ -1564,7 +1583,7 @@ const STRAT_BREAKOUT = {
 const STRAT_MOM_CONFIRM = {
   id: 'momConfirm', name: 'Mom Confirm (момент + стакан)',
   desc: 'вход по моменту только если дисбаланс стакана подтверждает сторону',
-  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, imbMin: 0.15, maxPerWindow: 3, tpPct: 0.50, slPct: 0.40, flipConf: 50, advMovePct: 0.30, kellyFrac: 0.22, maxFrac: 0.09 },
+  defaults: { minConf: 35, minEdge: 0.03, minTimeMs: 60000, imbMin: 0.15, maxPerWindow: 3, tpPct: 0.50, slPct: 0.40, flipConf: 50, advMovePct: 0.30, kellyFrac: 0.22, maxFrac: 0.09, fixedSizeUSD: 5 },
   shouldEnter(ctx, p) {
     const e = _momentumEntry(ctx, p, INVERT_SIGNAL);
     if (!e) return null;
@@ -2697,29 +2716,64 @@ setInterval(() => {
   } catch (_) {}
 }, 60000);
 
-// ── UNDERDOG HOLD: уведомление, если PnL за последние 30 минут в плюсе ───────
-// Считаем по закрытым (не dirty) сделкам demo-лога underdogHold за последние
-// 30 минут (по closeTime). Если сумма > 0 — шлём в Telegram. Чтобы не спамить,
-// уведомление повторно отправляется только после "сброса" — когда окно
-// перестало быть положительным (или сделок не было) и затем снова стало плюсовым.
-let _udgHold30mWasPositive = false;
+// ── UNDERDOG HOLD: алерты по PnL за последние 30 минут (ТОЛЬКО для этой стратегии) ──
+// • Σ PnL > $20  → «в плюсе» (порог по запросу).
+// • Σ PnL < $0   → «снова в минусе».
+// Гистерезис pos/neg/mid: каждый алерт шлётся один раз на переход (без спама).
+// Между порогами (0..20) — состояние mid, оно перевзводит оба алерта. dirty не в счёт.
+let _uhState = 'mid';   // 'pos' | 'neg' | 'mid'
 setInterval(() => {
   try {
     const ref = STRATEGIES['underdogHold'];
     if (!ref || !ref.demo || !ref.demo.log) return;
-    const WINDOW_MS = 30 * 60 * 1000;
-    const cutoff = Date.now() - WINDOW_MS;
+    const cutoff = Date.now() - 30 * 60 * 1000;
     let sum = 0, n = 0;
     for (const t of ref.demo.log) {
       if (t.dirty || !t.closeTime || t.closeTime < cutoff) continue;
       sum += (t.pnl || 0); n++;
     }
-    const positive = n > 0 && sum > 0;
-    if (positive && !_udgHold30mWasPositive) {
-      sendTg(`✅ <b>Underdog Hold (demo)</b>: PnL за 30 мин в плюсе: ${sum >= 0 ? '+' : ''}$${sum.toFixed(2)} (сделок: ${n})`);
+    if (n === 0) { _uhState = 'mid'; return; }
+    if (sum > 20 && _uhState !== 'pos') {
+      sendTg(`✅ <b>Underdog Hold (demo)</b>: PnL за 30 мин +$${sum.toFixed(2)} (>$20, сделок: ${n}). Возможно, момент протестить свои стратегии на реал вручную.`);
+      _uhState = 'pos';
+    } else if (sum < 0 && _uhState !== 'neg') {
+      sendTg(`⚠️ <b>Underdog Hold (demo)</b>: PnL за 30 мин снова В МИНУСЕ: -$${Math.abs(sum).toFixed(2)} (сделок: ${n}).`);
+      _uhState = 'neg';
+    } else if (sum >= 0 && sum <= 20) {
+      _uhState = 'mid';   // между порогами — перевзвод обоих алертов
     }
-    _udgHold30mWasPositive = positive;
   } catch (_) {}
+}, 60000);
+
+// ── АЛЕРТЫ ПО СЕРИИ ПОБЕД ПОДРЯД (demo) ──────────────────────────────────────
+// FLOMD Inverse и UDG Leader — 5 побед подряд; Momentum — 7 подряд.
+// В уведомлении — сумма PnL текущей серии. Шлём ОДИН раз на серию (до первого луза).
+const WIN_STREAK_ALERTS = [
+  { id: 'flomdInverse',  name: 'FLOMD Inverse', wins: 5 },
+  { id: 'udgLeader6472', name: 'UDG Leader',    wins: 5 },
+  { id: 'momentum',      name: 'Momentum',      wins: 7 },
+];
+const _winStreakAlerted = {};
+setInterval(() => {
+  for (const cfg of WIN_STREAK_ALERTS) {
+    try {
+      const ref = STRATEGIES[cfg.id];
+      if (!ref || !ref.demo || !ref.demo.log.length) continue;
+      let streak = 0, pnl = 0;                          // серия побед с конца лога (не-dirty)
+      for (let i = ref.demo.log.length - 1; i >= 0; i--) {
+        const t = ref.demo.log[i];
+        if (t.dirty) continue;
+        if (t.won) { streak++; pnl += (t.pnl || 0); }
+        else break;
+      }
+      if (streak >= cfg.wins && !_winStreakAlerted[cfg.id]) {
+        sendTg(`🔥 <b>${cfg.name} (demo)</b>: ${streak} побед подряд! Σ PnL серии: +$${pnl.toFixed(2)}.`);
+        _winStreakAlerted[cfg.id] = true;
+      } else if (streak < cfg.wins) {
+        _winStreakAlerted[cfg.id] = false;              // серия прервана — перевзвод
+      }
+    } catch (_) {}
+  }
 }, 60000);
 
 // ── LAG FAVORITE («отстающий фаворит») ────────────────────────────────────────
@@ -3598,38 +3652,105 @@ const STRAT_REGIME_SWITCH = {
 };
 
 
+// ═══════════════════════════════════════════════════════════════════════════
+// СТРИК-СТОПЫ ПО СОБСТВЕННЫМ ИСХОДАМ (форвард-тест) ────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Гистерезис по demo-логу САМОЙ стратегии (не по опоре underdogHold):
+//   старт АКТИВЕН → пауза после skipAfter лузов подряд → возврат после resumeWins
+//   винов подряд. Проигрыш = pnl<0 (по требованию). dirty-записи (sim/feed) не в счёт.
+// ВНИМАНИЕ (дисклеймер пользователя): на 14-дн. бектесте +$125@$2, но без стриков
+// −$103, t-test p=0.34 — статистически НЕ отличимо от шума. Стрики могут быть
+// подгонкой под прошлое. Поэтому это ДЕМО-ONLY форвард-тест, а не реальная торговля.
+function _ownStreakActive(stratId, skipAfter, resumeWins) {
+  const ref = STRATEGIES[stratId];
+  if (!ref || !ref.demo || !ref.demo.log.length) return true;   // своих сделок ещё нет — торгуем
+  let active = true, ls = 0, ws = 0;
+  for (const t of ref.demo.log) {
+    if (t.dirty) continue;
+    const loss = (t.pnl || 0) < 0;                              // проигрыш = pnl<0
+    if (active) {
+      ls = loss ? ls + 1 : 0;
+      if (ls >= skipAfter) { active = false; ws = 0; ls = 0; }  // серия лузов → пауза
+    } else {
+      ws = loss ? 0 : ws + 1;
+      if (ws >= resumeWins) { active = true; ls = 0; ws = 0; }  // серия винов → возврат
+    }
+  }
+  return active;
+}
+
+// 1) UDG-LEADER STREAK — фаворит на тренде + стрик-стоп по своим исходам (skip5/resume1).
+//    Вход: лидер (дорогая сторона) 64–72¢ в фазе окна 30–270с, при движении BTC В
+//    СТОРОНУ фаворита ≥ btcMoveMin ($20). Выход: абс. TP 0.99 / абс. SL 0.35.
+//    DEMO-ONLY (на реал не ставится). Параметры — в defaults, крутятся из UI.
+const STRAT_UDG_LEADER = {
+  id: 'udgLeaderStreak', name: 'UDG-LEADER STREAK (64-72, 5луз/1вин · свои)',
+  desc: 'Форвард-тест. Лидер 64–72¢, фаза 30–270с, движение BTC в сторону фаворита ≥$20. TP 0.99 / SL 0.35 (абс.). Стрик по СВОИМ demo-исходам: пауза после 5 лузов, возврат после 1 вина. DEMO-ONLY. Бектест: +$125@$2 со стриком vs −$103 без, p=0.34 (возможна подгонка).',
+  demoOnly: true,
+  defaults: { lo: 0.64, hi: 0.72, phaseFromS: 30, phaseToS: 270, btcMoveMin: 20, btcMoveMax: 0,
+              tpAbs: 0.99, slAbs: 0.35, skipN: 5, resumeN: 1, maxBtcAgeMs: 3000,
+              maxPerWindow: 1, kellyFrac: 0.09, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (!_ownStreakActive('udgLeaderStreak', p.skipN, p.resumeN)) return null;     // стрик-стоп
+    const elapsed = (POLY_WINDOW_SEC * 1000) - ctx.msToEnd;
+    if (elapsed < p.phaseFromS * 1000 || elapsed > p.phaseToS * 1000) return null; // фаза окна 30–270с
+    if (p.maxBtcAgeMs && ctx.btcAgeMs != null && ctx.btcAgeMs > p.maxBtcAgeMs) return null; // свежесть
+    const np = _normPoly(ctx); if (!np) return null;
+    const leadSide  = np.up >= np.dn ? 'UP' : 'DOWN';
+    const leadPrice = Math.max(np.up, np.dn);
+    if (leadPrice < p.lo || leadPrice > p.hi || leadPrice < MIN_ENTRY_PRICE) return null;
+    if (ctx.curBTC == null || ctx.openingBTC == null) return null;
+    const delta = ctx.curBTC - ctx.openingBTC;
+    const moveToward = leadSide === 'UP' ? delta : -delta;       // движение В СТОРОНУ фаворита
+    if (p.btcMoveMin && moveToward < p.btcMoveMin) return null;
+    if (p.btcMoveMax && Math.abs(delta) > p.btcMoveMax) return null;  // опц. верхний кап
+    const ourProb = _clampProb(leadPrice + 0.08, leadPrice);
+    return { side: leadSide, polyPrice: leadPrice, ourProb, edge: ourProb - leadPrice,
+             info: `udgLeaderStrk ${leadSide} @${(leadPrice*100).toFixed(0)}¢ Δ→$${moveToward.toFixed(0)}` };
+  },
+  shouldExit(ctx, pos, p) {
+    const cur = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (cur == null) return null;
+    if (p.tpAbs && cur >= p.tpAbs) return { reason: 'TP', exitPrice: cur };
+    if (p.slAbs && cur <= p.slAbs) return { reason: 'SL', exitPrice: cur };
+    return null;
+  },
+};
+
+// 2) UNDERDOG DELTA STREAK — копия UNDERDOG DELTA + стрик-стоп по своим исходам (skip3/resume2).
+//    Вход/выход полностью делегируются базовому STRAT_UNDERDOG_DELTA (дешёвый дог 15–35¢,
+//    |Δ|<$17, фильтр свежести, TP 0.96, без SL). Поверх — гейт по СВОИМ demo-исходам.
+//    DEMO-ONLY. Базовый UNDERDOG DELTA НЕ трогаем — он рядом для сравнения без стрика.
+const STRAT_UNDERDOG_DELTA_STREAK = {
+  id: 'underdogDeltaStreak', name: 'UNDERDOG DELTA STREAK (3луз/2вин · свои)',
+  desc: 'Копия UNDERDOG DELTA (дог 15–35¢ при |Δ|<$17, свежесть ≤3с, TP 0.96, без SL) + стрик по СВОИМ demo-исходам: пауза после 3 лузов подряд, возврат после 2 винов. DEMO-ONLY. Форвард-тест — проверяем, держится ли эдж стрика на новых данных.',
+  demoOnly: true,
+  defaults: { ...STRAT_UNDERDOG_DELTA.defaults, skipN: 3, resumeN: 2 },
+  shouldEnter(ctx, p) {
+    if (!_ownStreakActive('underdogDeltaStreak', p.skipN, p.resumeN)) return null;
+    return STRAT_UNDERDOG_DELTA.shouldEnter(ctx, p);
+  },
+  shouldExit(ctx, pos, p) { return STRAT_UNDERDOG_DELTA.shouldExit(ctx, pos, p); },
+};
+
 const STRAT_DEFINITIONS = [
-  // — сенсоры (DEMO only) —
-  STRAT_UNDERDOG_HOLD,
-  STRAT_MOM_SCRATCH,
-  STRAT_MOM_CONFIRM,
-  STRAT_MOM_HI,
-  STRAT_LONG_HOLD,
-  STRAT_TIME_SESSION,
-  STRAT_MOMENTUM,
-  STRAT_MOM_SCRATCH_HI,
-  STRAT_REGIME_SWITCH,   // ← авто-переключатель дог↔momentum
-  // — рабочие: книга < спота / книга > спота / дог —
-  STRAT_LAG_FAV,
-  STRAT_FAVMOM_A,
-  STRAT_FLOMD,
-  STRAT_FLOMD_INVERSE,
-  STRAT_FLOMD_FAVE,
-  STRAT_UNDERDOG_DELTA,
-  ...UDG_DELTA_GATED,    // ← 9 аналогов с авто-стопом по underdogHold (стрики + pnl-окна)
-  ...UDG_DELTA_TPSL,     // ← 28 вариантов: коридор × TP, абсолютный SL 8¢
-  STRAT_UNDERDOG_DIP,
-  STRAT_UDG_SKIP3,
-  STRAT_UDG_LEADER_6472,    // ← ТЕСТ: лидер 64-72¢, абс. TP0.95/SL0.20
-  // — режим-следящие (FLOMD-семейство для моментума) —
-  STRAT_MOM_FLOMD_SCRATCH,
-  STRAT_MOM_FLOMD_CONFIRM,
-  STRAT_MOM_FLOMD_HI,
-  STRAT_SESSION_FLOMD,
-  STRAT_MOM_FLOMD_PURE,
-  STRAT_MOM_FLOMD_SCRATCH_HI,
-  STRAT_UNDERDOG_FLOMD,
-  ...MANUAL_STRATS,
+  // ── ОСТАВЛЕНЫ ПО ЗАПРОСУ (13 стратегий со скринов) ──────────────────────────
+  STRAT_UNDERDOG_HOLD,        // UNDERDOG HOLD (★опора)
+  STRAT_MOMENTUM,             // MOMENTUM / TREND (★опора)  · фикс. вход $5
+  STRAT_MOM_SCRATCH,          // MOMENTUM SCRATCH           · фикс. вход $5
+  STRAT_MOM_HI,               // MOMENTUM STRONG            · фикс. вход $5
+  STRAT_MOM_CONFIRM,          // MOM CONFIRM                · фикс. вход $5
+  STRAT_MOM_FLOMD_PURE,       // MOMENTUM FLOMD PURE        · фикс. вход $5 (наследует от momentum)
+  STRAT_FLOMD,                // FLOMD TACTIC
+  STRAT_FLOMD_INVERSE,        // FLOMD INVERSE
+  STRAT_LAG_FAV,              // LAG FAVORITE
+  STRAT_UDG_SKIP3,            // UDG-SKIP-3
+  STRAT_UDG_LEADER_6472,      // UDG-LEADER 64-72 (без стрика — для сравнения)
+  STRAT_UNDERDOG_DELTA,       // UNDERDOG DELTA (без стрика — для сравнения)
+  UDG_DELTA_TPSL.find(d => d.id === 'udgDelta2232t38'),   // UDG Δ 22-32 TP38 SL8¢
+  // ── НОВЫЕ: стрик-версии для форвард-теста (DEMO-ONLY) ────────────────────────
+  STRAT_UDG_LEADER,           // UDG-LEADER STREAK (skip5/resume1, свои исходы)
+  STRAT_UNDERDOG_DELTA_STREAK,// UNDERDOG DELTA STREAK (skip3/resume2, свои исходы)
 ];
 
 // ─── UNDERDOG HOLD LOSS-STREAK CIRCUIT BREAKER ───────────────────────────────
@@ -3902,6 +4023,7 @@ function stratOpen(s, ctx, entry, acct, isReal) {
   }
   let sizeUSDC = sizingByKelly(effectiveBalance, entry.ourProb, entry.polyPrice, s.params.kellyFrac, s.params.maxFrac);
   if (entry.fixedUSD != null && entry.fixedUSD > 0) sizeUSDC = entry.fixedUSD;   // ручные стратегии: фикс. сумма входа
+  if (s.params.fixedSizeUSD != null && s.params.fixedSizeUSD > 0) sizeUSDC = s.params.fixedSizeUSD;  // стратегия с фикс. ставкой ($), крутится из UI
   // For sim: reject tiny sizes immediately. For real: check AFTER the 5-share
   // bump below, so a $0.94 Kelly still becomes $3.03 (5 shares × 60.5¢) and passes.
   if (!isReal && sizeUSDC < 1)            return;
@@ -4245,6 +4367,11 @@ function stratClose(s, ctx, reason, exitPolyPrice, acct, isReal) {
   acct.balance    += proceeds;
   acct.peakBalance = Math.max(acct.peakBalance, acct.balance);
   acct.log.push(entry);
+  // Персистентный журнал (переживает сброс демо-результатов).
+  tradeJournal.push({ mode: isReal ? 'real' : 'demo', strategy: s.def.id, side: o.side,
+    polyEntryPrice: o.polyEntryPrice, polyExitPrice: exitPolyPrice, sizeUSDC: o.sizeUSDC,
+    pnl, reason, closeTime: entry.closeTime });
+  if (tradeJournal.length > TRADE_JOURNAL_MAX) tradeJournal.shift();
   if (acct === s.demo) { try { mlExit(s, o, pnl, won, reason, entry.dirty === 1); } catch (_) {} }  // ML-ЛОГ
   if (acct.log.length > 500) acct.log.shift();
   acct.open = null;
@@ -4668,7 +4795,7 @@ function processStrategies() {
     }
 
     // Real account — places CLOB orders if wallet is configured; otherwise sim
-    if (s.realEnabled && !s.pendingReal) {
+    if (s.realEnabled && !s.pendingReal && !(s.def && s.def.demoOnly)) {
       // FIX: в SIM-режиме реальные ордера ЗАПРЕЩЕНЫ — данные BTC симулированные.
       const canReal = REAL_TRADING && !!polyWallet && !!polyApiCreds && !isSim;
       try { processAccount(s, ctx, s.real, canReal); }
@@ -4830,6 +4957,7 @@ function buildSnapshot() {
       name:        s.def.name,
       desc:        s.def.desc,
       manual:      !!s.def.manual,
+      demoOnly:    !!s.def.demoOnly,
       demoEnabled: s.demoEnabled,
       realEnabled: s.realEnabled,
       schedEnabled: s.schedEnabled, schedFrom: s.schedFrom, schedTo: s.schedTo,
@@ -4873,6 +5001,7 @@ function buildSnapshot() {
       balance:  realBalance,
     },
     copy: copySnapshot(),
+    journal: tradeJournal.slice(-120).reverse(),
     config: {
       invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE,
       dailyLossCap: REAL_DAILY_LOSS_CAP, minBalance: REAL_MIN_BALANCE,
@@ -4942,6 +5071,7 @@ async function _copyRouteFill(wallet, fill, txHash, src) {
   if (wallet.seen.has(key)) return false;
   wallet.seen.add(key);
   if (fill.ts < wallet.startTs - 5000) return false;             // копируем только сделки ПОСЛЕ добавления
+  wallet.maxTradeShares = Math.max(wallet.maxTradeShares || 0, fill.shares);   // для пропорц. размера
   wallet.feed.unshift({ side: fill.side, price: fill.price, shares: fill.shares,
     usd: fill.usd, market: fill.market, outcome: fill.outcome, ts: fill.ts, src: src || 'poll' });
   if (wallet.feed.length > 30) wallet.feed.pop();
@@ -4966,9 +5096,33 @@ async function _copyTryRealOrder(wallet, side, fill, usd) {
   } catch (e) { console.error(`[copy] real ${side} error:`, e && e.message); }
 }
 
+// Размер ставки копии в $ по глобальному калькулятору COPY_SIZING.
+function _copyBetUSD(wallet, fill) {
+  const sz = COPY_SIZING || { mode: 'fixed', myMax: 20, minShares: 5 };
+  let usd;
+  if (sz.mode === 'proportional') {
+    const maxT = Math.max(wallet.maxTradeShares || 0, fill.shares) || fill.shares;
+    const ratio = maxT > 0 ? Math.min(1, fill.shares / maxT) : 1;
+    usd = (sz.myMax || 20) * ratio;
+  } else {
+    usd = (sz.myMax || 20);
+  }
+  const minUSD = (sz.minShares || 5) * fill.price;          // пол по шэрам Polymarket
+  if (usd < minUSD) usd = minUSD;
+  return Math.max(0.01, usd);
+}
+
+// Запись копи-закрытия в персистентный журнал (переживает сброс демо).
+function _copyJournalClose(wallet, isReal, pos, exitPrice, pnl, reason, closeTime) {
+  tradeJournal.push({ mode: isReal ? 'real' : 'demo', strategy: '🐋 ' + wallet.label, side: 'COPY',
+    polyEntryPrice: pos.avgPrice, polyExitPrice: exitPrice, sizeUSDC: pos.costUSD,
+    pnl, reason, closeTime: closeTime || Date.now() });
+  if (tradeJournal.length > TRADE_JOURNAL_MAX) tradeJournal.shift();
+}
+
 // Зеркалируем один филл в счёт (demo или real).
 async function _copyApplyFill(wallet, acct, fill, isReal) {
-  const copyUSD = Math.max(1, wallet.copyUSD || 20);
+  const copyUSD = _copyBetUSD(wallet, fill);
   if (fill.side === 'BUY') {
     if (acct.balance < copyUSD) return;                          // нет средств на копию
     const addShares = copyUSD / fill.price;
@@ -4996,6 +5150,7 @@ async function _copyApplyFill(wallet, acct, fill, isReal) {
       entryPrice: pos.avgPrice, exitPrice: fill.price, shares: pos.shares, sizeUSD: pos.costUSD,
       pnl, won: pnl > 0, openTime: pos.openTime, closeTime: fill.ts, reason: 'COPY-SELL' });
     if (acct.log.length > 500) acct.log = acct.log.slice(-500);
+    _copyJournalClose(wallet, isReal, pos, fill.price, pnl, 'COPY-SELL', fill.ts);
     const shares = pos.shares;
     delete acct.positions[fill.tokenId];
     if (isReal) await _copyTryRealOrder(wallet, 'SELL', { ...fill, shares }, null);
@@ -5020,6 +5175,7 @@ async function _copyMarkAndResolve(wallet, acct, isReal) {
         entryPrice: pos.avgPrice, exitPrice: resolved, shares: pos.shares, sizeUSD: pos.costUSD,
         pnl, won: pnl > 0, openTime: pos.openTime, closeTime: Date.now(), reason: 'RESOLVE' });
       if (acct.log.length > 500) acct.log = acct.log.slice(-500);
+      _copyJournalClose(wallet, isReal, pos, resolved, pnl, 'RESOLVE', Date.now());
       delete acct.positions[tk];
     }
   }
@@ -5119,6 +5275,35 @@ function _copyDecodeOnchain(parsed, walletAddr) {
   return { side, price, shares, tokenId, market: '⚡ on-chain', slug: '', outcome: '', ts: Date.now(), usd: price * shares };
 }
 
+// Кэш названий рынков по tokenId — чтобы ончейн-сделки (где есть только tokenId)
+// показывались с читаемым названием рынка, а не «⚡ on-chain».
+const _copyTitleCache = new Map();
+async function _copyResolveTitle(tokenId) {
+  if (_copyTitleCache.has(tokenId)) return _copyTitleCache.get(tokenId);
+  let out = null;
+  try {
+    const res = await fetch(`${POLY_GAMMA}/markets?clob_token_ids=${tokenId}`, { signal: AbortSignal.timeout(5000) });
+    if (res.ok) {
+      const arr = await res.json();
+      const m = Array.isArray(arr) ? arr[0] : (arr && arr.data ? arr.data[0] : null);
+      if (m) {
+        const title = m.question || m.title || m.groupItemTitle || null;
+        let outcome = '';
+        try {
+          const ids = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : (m.clobTokenIds || []);
+          const outs = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : (m.outcomes || []);
+          const i = ids.findIndex(x => String(x) === String(tokenId));
+          if (i >= 0 && outs[i]) outcome = outs[i];
+        } catch (_) {}
+        if (title) out = { title, outcome };
+      }
+    }
+  } catch (_) {}
+  _copyTitleCache.set(tokenId, out);
+  if (_copyTitleCache.size > 2000) _copyTitleCache.clear();
+  return out;
+}
+
 async function _copyOnChainLog(log) {
   try {
     _turbo.lastEventTs = Date.now();
@@ -5128,8 +5313,10 @@ async function _copyOnChainLog(log) {
     for (const w of COPY_WALLETS) {
       const fill = _copyDecodeOnchain(parsed, w.address);
       if (!fill) continue;
+      const info = await _copyResolveTitle(fill.tokenId);       // дотягиваем читаемое имя рынка
+      if (info) { fill.market = info.title; if (info.outcome) fill.outcome = info.outcome; }
       const applied = await _copyRouteFill(w, fill, txHash, 'onchain');
-      if (applied) console.log(`[copy] ⚡ ончейн ${fill.side} ${w.label} ${(fill.price*100).toFixed(0)}¢ ×${fill.shares.toFixed(1)}`);
+      if (applied) console.log(`[copy] ⚡ ончейн ${fill.side} ${w.label} ${(fill.price*100).toFixed(0)}¢ ×${fill.shares.toFixed(1)} ${fill.market}`);
     }
   } catch (e) { /* нерелевантный лог — игнор */ }
 }
@@ -5198,7 +5385,7 @@ copyTurboStart();
 console.log(`[copy] poll=${COPY_POLL_MS}ms recon=${COPY_POLL_RECON_MS}ms limit=${COPY_FETCH_LIMIT} maxWallets=${COPY_MAX_WALLETS} real-live=${COPY_REAL_LIVE} turbo=${COPY_WSS_URL ? 'on' : 'off'}`);
 
 
-function _copyAccountSummary(acct) {
+function _copyAccountSummary(acct, liveBalance) {
   const log  = acct.log;
   const wins = log.filter(t => t.won).length;
   const realized = log.reduce((a, t) => a + t.pnl, 0);
@@ -5208,8 +5395,11 @@ function _copyAccountSummary(acct) {
     uPnl: (p.lastPrice != null ? p.shares * p.lastPrice - p.costUSD : 0), openTime: p.openTime,
   }));
   const uPnl = open.reduce((a, p) => a + p.uPnl, 0);
+  const useLive = (typeof liveBalance === 'number' && isFinite(liveBalance));
   return {
-    balance: acct.balance, realizedPnl: realized, unrealizedPnl: uPnl,
+    // Для REAL-счёта показываем РЕАЛЬНЫЙ баланс кошелька (общий с BTC-реалом), а не paper-$1000.
+    balance: useLive ? liveBalance : acct.balance, paperBalance: acct.balance, liveBalance: useLive,
+    realizedPnl: realized, unrealizedPnl: uPnl,
     trades: log.length, wins, winRate: log.length ? wins / log.length : 0,
     openCount: open.length, open: open.slice(0, 8), lastTrades: log.slice(-6).reverse(),
   };
@@ -5218,12 +5408,15 @@ function _copyAccountSummary(acct) {
 function copySnapshot() {
   return {
     live: COPY_REAL_LIVE, maxWallets: COPY_MAX_WALLETS,
+    sizing: COPY_SIZING,
+    realWallet: (typeof realBalance === 'number' && isFinite(realBalance)) ? realBalance : null,
+    realReady: !!(polyWallet && polyApiCreds),
     turbo: { enabled: !!COPY_WSS_URL, connected: !!_turbo.connected, pollMs: _turbo.connected ? COPY_POLL_RECON_MS : COPY_POLL_MS },
     wallets: COPY_WALLETS.map(w => ({
       id: w.id, address: w.address, label: w.label, copyUSD: w.copyUSD,
       demoEnabled: w.demoEnabled, realEnabled: w.realEnabled,
       lastPollTs: w.lastPollTs, lastErr: w.lastErr, createdAt: w.createdAt,
-      demo: _copyAccountSummary(w.demo), real: _copyAccountSummary(w.real),
+      demo: _copyAccountSummary(w.demo), real: _copyAccountSummary(w.real, realBalance),
       feed: w.feed.slice(0, 12),
     })),
   };
@@ -5400,8 +5593,32 @@ app.post('/api/copy/:id/reset', (req, res) => {
   res.json({ ok: true, copy: copySnapshot() });
 });
 
+// Глобальный размер ставки копитрейда (единый калькулятор для всех кошельков).
+app.post('/api/copy/sizing', (req, res) => {
+  const b = req.body || {};
+  const mode = b.mode === 'proportional' ? 'proportional' : 'fixed';
+  const myMax = Math.max(1, Math.min(100000, Number(b.myMax) || COPY_SIZING.myMax));
+  const minShares = Math.max(1, Math.min(100000, Number(b.minShares) || COPY_SIZING.minShares));
+  COPY_SIZING = { mode, myMax, minShares };
+  saveState();
+  console.log(`[copy] размер ставки → ${mode} myMax=$${myMax} minShares=${minShares}`);
+  res.json({ ok: true, copy: copySnapshot() });
+});
 
-// Переключить инверсию сигнала (база ↔ наоборот). Глобально для всех стратегий.
+// Сброс ВСЕХ демо-результатов (стратегии + копитрейд). Журнал сделок сохраняется!
+app.post('/api/demo/reset-all', (req, res) => {
+  let n = 0;
+  for (const id in STRATEGIES) {
+    const s = STRATEGIES[id];
+    s.demo.balance = 1000; s.demo.peakBalance = 1000; s.demo.open = null; s.demo.log = [];
+    n++;
+  }
+  for (const w of COPY_WALLETS) { w.demo = _copyAccount(); w.maxTradeShares = 0; }
+  saveState();
+  console.log(`[demo] сброшены демо-результаты: ${n} стратегий + ${COPY_WALLETS.length} копи (журнал сохранён: ${tradeJournal.length})`);
+  res.json({ ok: true, reset: n, journalKept: tradeJournal.length });
+});
+
 app.post('/api/invert/toggle', (req, res) => {
   INVERT_SIGNAL = typeof (req.body || {}).enabled === 'boolean' ? req.body.enabled : !INVERT_SIGNAL;
   saveState();
@@ -5499,6 +5716,10 @@ app.post('/api/strategy/:id/demo/toggle', (req, res) => {
 app.post('/api/strategy/:id/real/toggle', (req, res) => {
   const s = STRATEGIES[req.params.id];
   if (!s) return res.status(404).json({ error: 'not found' });
+  if (s.def && s.def.demoOnly) {                       // demo-only стратегии нельзя ставить на реал
+    s.realEnabled = false;
+    return res.status(403).json({ error: 'demo-only', id: req.params.id, realEnabled: false });
+  }
   s.realEnabled = !s.realEnabled;
   // Если пользователь вручную включает real — снимаем блокировку стрик-брейкера.
   // Выключение вручную блокировку не ставит (это действие самого пользователя).
@@ -5568,6 +5789,31 @@ app.get('/api/export/csv', (_, res) => {
           (t.entryInfo || '').replace(/,/g, ';'),
           t.realOrderId || '',
           t.dirty ? 1 : 0,
+        ]);
+      }
+    }
+  }
+  // ── Копитрейд: сделки кошельков в тот же лог ──────────────────────────────
+  for (const w of COPY_WALLETS) {
+    for (const [mode, acct] of [['demo', w.demo], ['real', w.real]]) {
+      for (const t of acct.log) {
+        rows.push([
+          mode,
+          ('copy:' + w.label).replace(/,/g, ';'),
+          t.openTime ? new Date(t.openTime).toISOString() : '',
+          t.closeTime ? new Date(t.closeTime).toISOString() : '',
+          'COPY',
+          (t.market || '').replace(/,/g, ';'),
+          (t.entryPrice ?? 0).toFixed(4),
+          (t.exitPrice ?? 0).toFixed(4),
+          '0.00', '0.00',
+          (t.sizeUSD ?? 0).toFixed(4),
+          (t.pnl ?? 0).toFixed(4),
+          '',
+          t.reason || '', t.won ? 1 : 0,
+          (t.outcome || '').replace(/,/g, ';'),
+          w.address || '',
+          0,
         ]);
       }
     }
