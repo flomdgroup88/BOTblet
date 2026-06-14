@@ -553,6 +553,10 @@ table.log tr:hover td { background: var(--bg3); }
       <span id="strat-count-badge" style="font-size:9px;color:var(--tx3);"></span>
     </div>
     <div style="display:flex;align-items:center;gap:10px;">
+      <span style="font-size:9px;color:var(--tx3);">сорт:</span>
+      <button onclick="event.stopPropagation();setStratSort('default')" id="sort-default" class="sort-btn on" style="font-size:9px;padding:2px 8px;border:1px solid var(--bd);background:var(--bg2);color:var(--tx2);border-radius:4px;cursor:pointer;font-family:inherit;">мой порядок</button>
+      <button onclick="event.stopPropagation();setStratSort('pnl')" id="sort-pnl" class="sort-btn" style="font-size:9px;padding:2px 8px;border:1px solid var(--bd);background:var(--bg2);color:var(--tx2);border-radius:4px;cursor:pointer;font-family:inherit;">P&amp;L ↓</button>
+      <button onclick="event.stopPropagation();setStratSort('wr')" id="sort-wr" class="sort-btn" style="font-size:9px;padding:2px 8px;border:1px solid var(--bd);background:var(--bg2);color:var(--tx2);border-radius:4px;cursor:pointer;font-family:inherit;">WR ↓</button>
       <button onclick="event.stopPropagation();toggleAllDemoStrategies()" id="demo-all-btn" style="font-size:9px;padding:2px 9px;border:1px solid rgba(100,130,255,.45);background:transparent;color:#7090ff;border-radius:4px;cursor:pointer;font-family:inherit;letter-spacing:.04em;">▣ вкл все демо</button>
       <button onclick="event.stopPropagation();toggleAllCards()" id="collapse-all-btn" style="font-size:9px;padding:2px 9px;border:1px solid var(--bd);background:var(--bg2);color:var(--tx2);border-radius:4px;cursor:pointer;font-family:inherit;letter-spacing:.04em;">свернуть все</button>
       <span id="strat-collapse-hint" style="font-size:9px;color:var(--tx3);">скрыть</span>
@@ -563,6 +567,47 @@ table.log tr:hover td { background: var(--bg3); }
     <!-- injected by JS -->
   </div>
 </div>
+<style>.sort-btn.on{border-color:rgba(0,232,122,.6)!important;color:var(--up)!important;}</style>
+
+<!-- 🐋 КОПИТРЕЙДИНГ POLYMARKET (отдельная фича, не зависит от BTC) -->
+<div id="copy-section" style="background:linear-gradient(180deg,rgba(43,196,212,.05),transparent 120px);border-top:2px solid rgba(43,196,212,.45);">
+  <div onclick="toggleCopySection()" id="copy-header" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:9px 14px;border-bottom:1px solid rgba(43,196,212,.25);user-select:none;">
+    <div style="display:flex;align-items:center;gap:8px;">
+      <span style="font-size:11px;font-weight:700;letter-spacing:.08em;color:#2bc4d4;text-transform:uppercase;">🐋 Копитрейдинг Polymarket</span>
+      <span id="copy-count-badge" style="font-size:9px;color:var(--tx3);"></span>
+      <span id="copy-live-badge" style="font-size:8px;font-weight:700;letter-spacing:.05em;padding:1px 6px;border-radius:3px;"></span>
+      <span id="copy-turbo-badge" style="font-size:8px;font-weight:700;letter-spacing:.05em;padding:1px 6px;border-radius:3px;"></span>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span style="font-size:9px;color:var(--tx3);">не зависит от BTC-стратегий</span>
+      <span id="copy-chevron" style="font-size:11px;color:#2bc4d4;transition:transform .2s;">▲</span>
+    </div>
+  </div>
+  <div id="copyBody" style="padding:14px;">
+    <!-- форма добавления кошелька -->
+    <div id="copy-add" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px;padding:12px;background:rgba(43,196,212,.06);border:1px solid rgba(43,196,212,.3);border-radius:8px;">
+      <div class="cfg-field" style="flex:2 1 260px;"><label>Адрес кошелька (0x…)</label><input id="cp-addr" class="cfg-input" type="text" placeholder="0x..." spellcheck="false"></div>
+      <div class="cfg-field" style="flex:1 1 120px;"><label>Метка (необязательно)</label><input id="cp-label" class="cfg-input" type="text" placeholder="напр. Whale-1"></div>
+      <div class="cfg-field" style="flex:0 0 110px;"><label>Размер копии $</label><input id="cp-size" class="cfg-input" type="number" step="1" min="1" value="20"></div>
+      <button class="cfg-btn" onclick="copyAddWallet()" style="border-color:rgba(43,196,212,.6);color:#2bc4d4;">＋ Добавить кошелёк</button>
+      <span id="cp-msg" style="font-size:11px;color:#2bc4d4;min-height:14px;flex-basis:100%;"></span>
+    </div>
+    <div id="copy-grid" class="strat-grid"><!-- карточки кошельков --></div>
+    <div id="copy-empty" style="font-size:12px;color:var(--tx3);padding:8px 2px;">Кошельки не добавлены. Вставь адрес 0x… кошелька с Polymarket — demo-счёт начнёт копировать его новые сделки.</div>
+  </div>
+</div>
+<style>
+  .cp-card{background:var(--bg2);border:1px solid rgba(43,196,212,.3);border-radius:10px;padding:12px;}
+  .cp-acct{border:1px solid var(--bd);border-radius:8px;padding:10px;}
+  .cp-acct.demo{background:rgba(100,130,255,.05);}
+  .cp-acct.real{background:rgba(255,136,51,.05);}
+  .cp-stat{font-size:10px;color:var(--tx3);}
+  .cp-stat b{color:var(--tx);font-size:13px;font-weight:600;}
+  table.cp-log{width:100%;border-collapse:collapse;font-size:9px;}
+  table.cp-log td,table.cp-log th{padding:2px 4px;text-align:left;border-bottom:1px solid rgba(28,28,53,.5);color:var(--tx2);}
+  table.cp-log th{color:var(--tx3);font-weight:500;}
+</style>
+
 
 <!-- ⚙️ НАСТРОЙКИ СТРАТЕГИИ + ИНВЕРСИЯ -->
 <div style="background:var(--bg);border-top:1px solid var(--bd);">
@@ -634,51 +679,7 @@ table.log tr:hover td { background: var(--bg3); }
       <div id="demoSpreadNote" style="font-size:11px;color:var(--tx3);margin-top:8px;"></div>
     </div>
 
-    <!-- РАСПИСАНИЕ ТОРГОВЛИ -->
-    <div style="margin-bottom:18px;padding:12px;background:var(--bg2);border:1px solid var(--bd);border-radius:8px;">
-      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px;">
-        <span style="font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px;">Расписание торговли</span>
-        <button id="schedBtn" class="cfg-btn" onclick="toggleSchedule()">РАСПИСАНИЕ OFF</button>
-        <span id="schedNote" style="font-size:11px;color:var(--tx3);"></span>
-      </div>
-      <div style="font-size:11px;color:var(--tx3);margin-bottom:10px;">ограничивает ОТКРЫТИЕ сделок по часам (МСК, UTC+3). Выходы работают всегда. Можно через полночь (например 22 → 6).</div>
-      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-        <span style="font-size:11px;color:var(--tx3);">торговать с</span>
-        <input id="p-schedFrom" class="cfg-input" type="number" step="1" min="0" max="24" style="width:70px;">
-        <span style="font-size:11px;color:var(--tx3);">до</span>
-        <input id="p-schedTo" class="cfg-input" type="number" step="1" min="0" max="24" style="width:70px;">
-        <span style="font-size:11px;color:var(--tx3);">час МСК</span>
-        <button class="cfg-btn" onclick="saveSchedule()">💾 Сохранить расписание</button>
-        <span id="schedMsg" style="font-size:11px;color:var(--up);"></span>
-      </div>
-    </div>
-
-    <!-- КАСТОМ ПАРАМЕТРЫ -->
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
-      <span style="font-size:11px;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px;">Параметры:</span>
-      <span style="font-size:11px;color:var(--tx3);">база (как сейчас)</span>
-      <button id="customBtn" class="cfg-btn" onclick="toggleCustom()">КАСТОМ OFF</button>
-      <span id="customNote" style="font-size:11px;color:var(--tx3);"></span>
-    </div>
-
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px;">
-      <div class="cfg-field"><label>Edge мин. (pp) — порог выгоды</label><input id="p-minEdge" class="cfg-input" type="number" step="0.5"></div>
-      <div class="cfg-field"><label>Уверенность мин. (%)</label><input id="p-minConf" class="cfg-input" type="number" step="1"></div>
-      <div class="cfg-field"><label>Take Profit (%)</label><input id="p-tpPct" class="cfg-input" type="number" step="5" oninput="_beNote()"></div>
-      <div class="cfg-field"><label>Stop Loss (%)</label><input id="p-slPct" class="cfg-input" type="number" step="5" oninput="_beNote()"></div>
-      <div class="cfg-field"><label>Разворот: уверенность (%)</label><input id="p-flipConf" class="cfg-input" type="number" step="1"></div>
-      <div class="cfg-field"><label>Adverse move BTC (%)</label><input id="p-advMovePct" class="cfg-input" type="number" step="0.05"></div>
-      <div class="cfg-field"><label>Kelly доля (0–1)</label><input id="p-kellyFrac" class="cfg-input" type="number" step="0.05"></div>
-      <div class="cfg-field"><label>Макс. доля баланса (%)</label><input id="p-maxFrac" class="cfg-input" type="number" step="1"></div>
-      <div class="cfg-field"><label>Мин. время до конца (сек)</label><input id="p-minTimeSec" class="cfg-input" type="number" step="5"></div>
-    </div>
-
-    <div id="beNote" style="font-size:11px;color:#fa7;margin-bottom:10px;"></div>
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-      <button class="cfg-btn" onclick="saveParams()" style="border-color:rgba(0,232,122,.5);color:var(--up);">💾 Сохранить параметры</button>
-      <button class="cfg-btn" onclick="resetParams()">↺ Сброс к базе</button>
-      <span id="cfgMsg" style="font-size:11px;color:var(--up);min-height:14px;"></span>
-    </div>
+    <!-- (РАСПИСАНИЕ, КАСТОМ-ПАРАМЕТРЫ и РУЧНЫЕ СТРАТЕГИИ удалены по запросу — место освобождено) -->
   </div>
 </div>
 <style>
@@ -700,24 +701,7 @@ table.log tr:hover td { background: var(--bg3); }
   .man-dir button.both{border-color:rgba(120,140,255,.6);color:#7c8cff;background:rgba(120,140,255,.10);}
 </style>
 
-<!-- РУЧНЫЕ ПАРАМЕТРИЧЕСКИЕ СТРАТЕГИИ -->
-<div style="background:var(--bg);border-top:1px solid var(--bd);">
-  <div onclick="toggleManualSection()" id="manual-header" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:8px 14px;border-bottom:1px solid var(--bd);user-select:none;">
-    <div style="display:flex;align-items:center;gap:8px;">
-      <span style="font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--tx2);text-transform:uppercase;">🎛 Ручные стратегии — единая форма настройки</span>
-      <span style="color:var(--tx3);font-size:9px;">(нажми, чтобы свернуть)</span>
-    </div>
-    <div style="display:flex;align-items:center;gap:10px;">
-      <span id="manual-collapse-hint" style="font-size:9px;color:var(--tx3);">скрыть</span>
-      <span id="manual-chevron" style="font-size:11px;color:var(--tx3);transition:transform .2s;">▲</span>
-    </div>
-  </div>
-  <div id="manualBody" style="padding:16px;">
-    <div style="font-size:11px;color:var(--tx3);margin-bottom:12px;">Настрой параметры → выбери слот → «Сохранить». Форма не сбрасывается — меняй слот и сохраняй следующую. Работа каждой видна карточкой в общей сетке выше (баланс, сделки, спред и задержка — как у авто-стратегий).</div>
-    <div id="manualWrap"></div>
-    <span id="manMsg" style="font-size:11px;color:var(--up);min-height:14px;display:block;margin-top:6px;"></span>
-  </div>
-</div>
+<!-- (РУЧНЫЕ СТРАТЕГИИ удалены по запросу) -->
 
 <!-- RECENT TRADES LOG -->
 <div style="padding:16px 16px 0;background:var(--bg);border-top:1px solid var(--bd);">
@@ -928,10 +912,14 @@ function updateAll(d) {
   }
 
   // Strategy cards
+  window._lastPoly = d.poly; window._lastReal = d.realTrading;
   updateStratCards(d.strats, d.poly, d.realTrading);
   strats_last = d.strats;
   if (!_manBuilt) buildManualCards(d.strats);   // строим карточки ручных стратегий один раз
   updateConfigPanel(d);
+
+  // Copytrading
+  if (typeof renderCopy === 'function') renderCopy(d.copy);
 
   // Combined log
   updateLog(d.strats);
@@ -1373,8 +1361,174 @@ function updateStratCards(strats, polyData, realTrading) {
       } else { sellB.style.display = 'none'; }
     }
   }
-  // Apply user-defined drag order (runs after new cards are added)
-  _applyCustomOrder();
+  // Apply ordering: sort by P&L / WR, or user drag order ('default')
+  _applyStratSort(strats);
+}
+
+// ── Сортировка стратегий: мой порядок / по P&L / по WR ───────────────────────
+let STRAT_SORT = (function(){ try { return localStorage.getItem('stratSort') || 'default'; } catch(e){ return 'default'; } })();
+window.addEventListener('DOMContentLoaded', () => {
+  ['default','pnl','wr'].forEach(m => { const b = document.getElementById('sort-'+m); if (b) b.classList.toggle('on', m===STRAT_SORT); });
+});
+
+function setStratSort(mode) {
+  STRAT_SORT = mode;
+  try { localStorage.setItem('stratSort', mode); } catch(e){}
+  ['default','pnl','wr'].forEach(m => { const b = document.getElementById('sort-'+m); if (b) b.classList.toggle('on', m===mode); });
+  if (strats_last) _applyStratSort(strats_last);
+}
+
+function _applyStratSort(strats) {
+  const grid = document.getElementById('strat-grid');
+  if (!grid || !strats) return;
+  if (STRAT_SORT === 'default') {
+    Array.from(grid.children).forEach(el => { if (!el.classList.contains('real-live-card')) el.style.order = ''; });
+    _applyCustomOrder();
+    return;
+  }
+  const score = (s) => {
+    if (!s) return -Infinity;
+    if (STRAT_SORT === 'pnl') return (s.demo?.pnl || 0) + (s.real?.pnl || 0);
+    const tr = (s.demo?.trades || 0) + (s.real?.trades || 0);
+    const wi = (s.demo?.wins || 0) + (s.real?.wins || 0);
+    return tr > 0 ? (wi / tr) : -1;        // без сделок — в конец
+  };
+  Object.entries(strats)
+    .sort((a, b) => score(b[1]) - score(a[1]))
+    .forEach(([id], i) => {
+      const card = document.getElementById('scard-' + id);
+      if (card && !card.classList.contains('real-live-card')) card.style.order = String(i + 1);
+    });
+}
+
+// ── КОПИТРЕЙДИНГ — UI ────────────────────────────────────────────────────────
+let COPY_LIVE = false;
+let _copyCollapsed = false;
+function toggleCopySection(){
+  _copyCollapsed = !_copyCollapsed;
+  const b=document.getElementById('copyBody'), c=document.getElementById('copy-chevron');
+  if(b) b.style.display=_copyCollapsed?'none':'';
+  if(c) c.style.transform=_copyCollapsed?'rotate(180deg)':'';
+}
+function _cpMoney(v){ const n=Number(v)||0; const s=n>=0?'+':''; return `<span style="color:${n>=0?'var(--up)':'var(--dn)'}">${s}$${n.toFixed(2)}</span>`; }
+function _cpTime(ts){ if(!ts) return '—'; const d=new Date(ts); return d.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}); }
+function _cpEsc(s){ return String(s==null?'':s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
+
+function _cpAcctPanel(w, a, kind){
+  const title = kind==='demo' ? 'DEMO' : 'REAL';
+  const enabled = kind==='demo' ? w.demoEnabled : w.realEnabled;
+  const accent = kind==='demo' ? '#7090ff' : 'var(--warn)';
+  const wr = ((a.winRate||0)*100).toFixed(0);
+  const open = (a.open||[]).map(p=>`<tr><td>${_cpEsc(p.market).slice(0,22)}</td><td>${_cpEsc(p.outcome).slice(0,8)}</td><td>${(p.avgPrice*100).toFixed(0)}¢→${p.lastPrice!=null?(p.lastPrice*100).toFixed(0)+'¢':'—'}</td><td>${_cpMoney(p.uPnl)}</td></tr>`).join('');
+  const log = (a.lastTrades||[]).map(t=>`<tr><td>${_cpTime(t.closeTime)}</td><td>${_cpEsc(t.market).slice(0,20)}</td><td>${(t.entryPrice*100).toFixed(0)}→${(t.exitPrice*100).toFixed(0)}¢</td><td>${t.reason||''}</td><td>${_cpMoney(t.pnl)}</td></tr>`).join('');
+  return `
+  <div class="cp-acct ${kind}">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+      <div style="display:flex;align-items:center;gap:6px;">
+        <span style="font-size:10px;font-weight:700;letter-spacing:.06em;color:${accent};">${title}</span>
+        ${kind==='real' && !COPY_LIVE ? '<span style="font-size:7px;padding:1px 4px;border:1px solid var(--bd);border-radius:3px;color:var(--tx3);">PAPER</span>':''}
+      </div>
+      <div style="display:flex;gap:6px;">
+        <button style="font-size:9px;padding:2px 8px;border-radius:4px;cursor:pointer;background:transparent;font-family:inherit;border:1px solid ${enabled?(kind==='demo'?'rgba(100,130,255,.5)':'rgba(255,136,51,.5)'):'var(--bd)'};color:${enabled?accent:'var(--tx3)'};" onclick="copyToggle('${w.id}','${kind}',${!enabled})">${enabled?'ON':'OFF'}</button>
+        <button style="font-size:9px;padding:2px 7px;border-radius:4px;cursor:pointer;background:transparent;border:1px solid var(--bd);color:var(--tx3);font-family:inherit;" onclick="copyReset('${w.id}','${kind}')">сброс</button>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px;">
+      <div><div class="cp-stat">БАЛАНС</div><div class="cp-stat"><b>$${(a.balance||0).toFixed(2)}</b></div></div>
+      <div><div class="cp-stat">P&L реал / нереал</div><div class="cp-stat"><b>${_cpMoney(a.realizedPnl)}</b> / ${_cpMoney(a.unrealizedPnl)}</div></div>
+      <div><div class="cp-stat">СДЕЛКИ / WR</div><div class="cp-stat"><b>${a.trades||0}</b> / ${wr}% · откр.${a.openCount||0}</div></div>
+    </div>
+    ${open?`<div class="cp-stat" style="margin:6px 0 2px;">Открытые копии</div><table class="cp-log"><tr><th>рынок</th><th>исход</th><th>цена</th><th>uPnL</th></tr>${open}</table>`:''}
+    ${log?`<div class="cp-stat" style="margin:8px 0 2px;">Последние закрытия</div><table class="cp-log"><tr><th>время</th><th>рынок</th><th>цена</th><th>как</th><th>PnL</th></tr>${log}</table>`:'<div class="cp-stat" style="margin-top:6px;">нет закрытых копий</div>'}
+  </div>`;
+}
+
+function renderCopy(copy){
+  if(!copy) return;
+  COPY_LIVE = !!copy.live;
+  const grid=document.getElementById('copy-grid'), empty=document.getElementById('copy-empty');
+  const badge=document.getElementById('copy-count-badge'), live=document.getElementById('copy-live-badge');
+  const turbo=document.getElementById('copy-turbo-badge');
+  if(badge) badge.textContent = `${copy.wallets.length}/${copy.maxWallets} кошельков`;
+  if(live){
+    if(copy.live){ live.textContent='LIVE-РЕАЛ ВКЛ'; live.style.cssText='font-size:8px;font-weight:700;padding:1px 6px;border-radius:3px;background:rgba(255,136,51,.18);color:var(--warn);border:1px solid rgba(255,136,51,.4);'; }
+    else { live.textContent='РЕАЛ = PAPER'; live.style.cssText='font-size:8px;font-weight:700;padding:1px 6px;border-radius:3px;background:var(--bg2);color:var(--tx3);border:1px solid var(--bd);'; }
+  }
+  if(turbo){
+    const t=copy.turbo||{};
+    if(t.connected){ turbo.textContent='⚡ ТУРБО'; turbo.style.cssText='font-size:8px;font-weight:700;padding:1px 6px;border-radius:3px;background:rgba(43,196,212,.18);color:#2bc4d4;border:1px solid rgba(43,196,212,.5);'; }
+    else if(t.enabled){ turbo.textContent='⚡ турбо: реконнект'; turbo.style.cssText='font-size:8px;font-weight:700;padding:1px 6px;border-radius:3px;background:var(--bg2);color:var(--warn);border:1px solid rgba(255,136,51,.4);'; }
+    else { turbo.textContent=`опрос ${((t.pollMs||2500)/1000).toFixed(1)}с`; turbo.style.cssText='font-size:8px;font-weight:700;padding:1px 6px;border-radius:3px;background:var(--bg2);color:var(--tx3);border:1px solid var(--bd);'; }
+  }
+  if(!grid) return;
+  if(empty) empty.style.display = copy.wallets.length ? 'none' : '';
+  // Сортируем кошельки по чистому P&L demo (реализ.+нереализ.) — самые профитные сверху
+  const _net = w => (w.demo.realizedPnl||0)+(w.demo.unrealizedPnl||0);
+  const wallets = copy.wallets.slice().sort((a,b)=>_net(b)-_net(a));
+  grid.innerHTML = wallets.map((w,idx)=>{
+    const net = _net(w);
+    const netCol = net>=0?'var(--up)':'var(--dn)';
+    const wr = ((w.demo.winRate||0)*100).toFixed(0);
+    const rank = idx===0&&net>0 ? '<span style="font-size:8px;font-weight:700;padding:1px 5px;border-radius:3px;background:rgba(0,232,122,.15);color:var(--up);border:1px solid rgba(0,232,122,.4);">★ лучший</span>' : '';
+    const feed = (w.feed||[]).slice(0,6).map(f=>`<tr><td>${_cpTime(f.ts)}</td><td>${f.src==='onchain'?'⚡':''}</td><td style="color:${f.side==='BUY'?'var(--up)':'var(--dn)'}">${f.side}</td><td>${_cpEsc(f.market).slice(0,22)}</td><td>${(f.price*100).toFixed(0)}¢</td><td>$${(f.usd||0).toFixed(0)}</td></tr>`).join('');
+    const err = w.lastErr ? `<span style="color:var(--dn);font-size:9px;">⚠ ${_cpEsc(w.lastErr).slice(0,40)}</span>` : '';
+    const poll = w.lastPollTs ? _cpTime(w.lastPollTs) : '—';
+    return `
+    <div class="cp-card" style="grid-column:1/-1;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
+        <div style="display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap;">
+          <span style="font-size:13px;font-weight:600;color:#2bc4d4;">🐋 ${_cpEsc(w.label)}</span>
+          ${rank}
+          <a href="https://polymarket.com/profile/${w.address}" target="_blank" style="font-size:10px;color:var(--tx3);text-decoration:none;">${w.address.slice(0,6)}…${w.address.slice(-4)} ↗</a>
+          <span style="font-size:9px;color:var(--tx3);">обновл.: ${poll}</span> ${err}
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span style="font-size:10px;color:var(--tx3);">копия $</span>
+          <input type="number" min="1" step="1" value="${w.copyUSD}" style="width:64px;background:var(--bg);border:1px solid var(--bd);color:var(--tx2);border-radius:5px;padding:4px 6px;font-size:12px;font-family:inherit;" onchange="copySize('${w.id}',this.value)">
+          <button style="font-size:9px;padding:3px 9px;border-radius:4px;cursor:pointer;background:transparent;border:1px solid rgba(224,85,106,.5);color:#e0556a;font-family:inherit;" onclick="copyRemove('${w.id}','${_cpEsc(w.label)}')">удалить</button>
+        </div>
+      </div>
+      <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:10px;padding:8px 12px;background:rgba(43,196,212,.06);border-radius:8px;">
+        <div><span style="font-size:9px;color:var(--tx3);text-transform:uppercase;letter-spacing:.05em;">Итог demo на дистанции</span><br><b style="font-size:18px;color:${netCol};">${net>=0?'+':''}$${net.toFixed(2)}</b></div>
+        <div style="font-size:11px;color:var(--tx3);">WR <b style="color:var(--tx);">${wr}%</b> · сделок <b style="color:var(--tx);">${w.demo.trades||0}</b> · откр. ${w.demo.openCount||0}</div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        ${_cpAcctPanel(w,w.demo,'demo')}
+        ${_cpAcctPanel(w,w.real,'real')}
+      </div>
+      ${feed?`<div class="cp-stat" style="margin:10px 0 2px;">Активность кошелька (⚡ = ончейн-турбо · копируем сделки ПОСЛЕ добавления)</div><table class="cp-log"><tr><th>время</th><th></th><th>сторона</th><th>рынок</th><th>цена</th><th>$</th></tr>${feed}</table>`:'<div class="cp-stat" style="margin-top:10px;">Ждём новых сделок кошелька…</div>'}
+    </div>`;
+  }).join('');
+}
+
+async function copyAddWallet(){
+  const addr=document.getElementById('cp-addr').value.trim();
+  const label=document.getElementById('cp-label').value.trim();
+  const size=document.getElementById('cp-size').value;
+  const msg=document.getElementById('cp-msg');
+  msg.style.color='#2bc4d4'; msg.textContent='Добавляю…';
+  try{
+    const r=await fetch('/api/copy/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr,label,copyUSD:Number(size)})});
+    const j=await r.json();
+    if(!r.ok){ msg.style.color='var(--dn)'; msg.textContent='✕ '+(j.error||'ошибка'); return; }
+    msg.style.color='#2bc4d4'; msg.textContent='✓ добавлен — копируем новые сделки';
+    document.getElementById('cp-addr').value=''; document.getElementById('cp-label').value='';
+    renderCopy(j.copy);
+  }catch(e){ msg.style.color='var(--dn)'; msg.textContent='✕ '+e.message; }
+}
+async function copyToggle(id,account,enabled){
+  try{ const r=await fetch(`/api/copy/${id}/toggle`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account,enabled})}); const j=await r.json(); if(j.copy) renderCopy(j.copy);}catch(e){}
+}
+async function copyRemove(id,label){
+  if(!confirm(`Удалить кошелёк ${label} из копитрейдинга?\nИстория его копий очистится.`)) return;
+  try{ const r=await fetch(`/api/copy/${id}/remove`,{method:'POST'}); const j=await r.json(); if(j.copy) renderCopy(j.copy);}catch(e){}
+}
+async function copyReset(id,account){
+  if(!confirm(`Сбросить ${account.toUpperCase()} счёт копитрейда?\nБаланс → $1000, позиции и лог очистятся.`)) return;
+  try{ const r=await fetch(`/api/copy/${id}/reset`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account})}); const j=await r.json(); if(j.copy) renderCopy(j.copy);}catch(e){}
+}
+async function copySize(id,v){
+  try{ await fetch(`/api/copy/${id}/size`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({copyUSD:Number(v)})}); }catch(e){}
 }
 
 // ─── COMBINED LOG ─────────────────────────────────────────────────────────────
@@ -1424,8 +1578,10 @@ function _setIfBlur(id, val) {
   if (el && document.activeElement !== el && !_dirty.has(id)) el.value = val;
 }
 function _beNote() {
-  const tp = +$('p-tpPct').value, sl = +$('p-slPct').value;
-  $('beNote').textContent = (tp && sl) ? `Безубыток по винрейту: ${(sl/(tp+sl)*100).toFixed(1)}%  (SL/(TP+SL))` : '';
+  const tpEl = $('p-tpPct'), slEl = $('p-slPct'), note = $('beNote');
+  if (!tpEl || !slEl || !note) return;
+  const tp = +tpEl.value, sl = +slEl.value;
+  note.textContent = (tp && sl) ? `Безубыток по винрейту: ${(sl/(tp+sl)*100).toFixed(1)}%  (SL/(TP+SL))` : '';
 }
 function updateConfigPanel(d) {
   // 🆘 ручной выход: показываем блок только при открытой реальной позиции
@@ -1491,13 +1647,16 @@ function updateConfigPanel(d) {
     _setIfBlur('p-schedFrom', d.config.schedFrom);
     _setIfBlur('p-schedTo', d.config.schedTo);
   }
-  // кастом-режим
+  // кастом-режим (блок мог быть удалён с дашборда — всё под guard)
   const s = d.strats && d.strats[MOM];
   if (!s) return;
   const cb = $('customBtn');
-  cb.textContent = s.customEnabled ? 'КАСТОМ ON' : 'КАСТОМ OFF';
-  cb.className = 'cfg-btn ' + (s.customEnabled ? 'on' : '');
-  $('customNote').textContent = s.customEnabled ? 'кастом включён — значения применяются' : 'выключено — работают базовые';
+  if (cb) {
+    cb.textContent = s.customEnabled ? 'КАСТОМ ON' : 'КАСТОМ OFF';
+    cb.className = 'cfg-btn ' + (s.customEnabled ? 'on' : '');
+    const cn = $('customNote');
+    if (cn) cn.textContent = s.customEnabled ? 'кастом включён — значения применяются' : 'выключено — работают базовые';
+  }
   // показываем то, что РЕДАКТИРУЕМ (customParams), а не активные — чтобы правки не «прыгали»
   const p = s.customParams || s.params; if (!p) return;
   _setIfBlur('p-minEdge',    (p.minEdge * 100).toFixed(1));
@@ -1514,7 +1673,7 @@ function updateConfigPanel(d) {
 // ── РУЧНЫЕ СТРАТЕГИИ: единая форма + слот-селектор ───────────────────────────
 let _manBuilt=false, _manSlot='manual1', _manStrats={};
 function buildManualCards(strats){
-  const wrap=document.getElementById('manualWrap'); if(!wrap) return;
+  const wrap=document.getElementById('manualWrap'); if(!wrap){ _manBuilt=true; return; }   // секция удалена — больше не пытаемся
   const ids=Object.keys(strats).filter(k=>strats[k].manual).sort();
   if(!ids.length) return;
   _manStrats=strats;

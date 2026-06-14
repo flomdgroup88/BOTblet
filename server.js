@@ -23,8 +23,35 @@ const PORT             = process.env.PORT || 3000;
 const STATE_FILE       = path.join(__dirname, 'state.json');
 const POLY_GAMMA       = 'https://gamma-api.polymarket.com';
 const POLY_CLOB        = 'https://clob.polymarket.com';
+const POLY_DATA        = 'https://data-api.polymarket.com';   // публичный Data API (история сделок кошельков)
 const POLY_INTERVAL    = 'btc-updown-5m';
 const POLY_WINDOW_SEC  = 300;
+
+// ── КОПИТРЕЙДИНГ POLYMARKET (независимая от BTC фича) ─────────────────────────
+const COPY_MAX_WALLETS   = 15;                // максимум кошельков на копитрейдинге
+// Период опроса истории сделок кошелька (фолбэк-режим). Настраивается env COPY_POLL_MS.
+// Пол — 1000мс: чаще раза в секунду публичный Data API не имеет смысла дёргать.
+const COPY_POLL_MS       = Math.max(1000, parseInt(process.env.COPY_POLL_MS || '2500', 10) || 2500);
+const COPY_POLL_RECON_MS = 20000;             // когда ТУРБО (ончейн-WS) активен — опрос только для сверки, реже
+const COPY_FETCH_LIMIT   = 20;                // сколько последних сделок тянуть за опрос
+const COPY_MARK_MS       = 20000;             // как часто маркуем открытые позиции по midpoint
+const COPY_BACKOFF_429   = 60000;             // пауза по кошельку после rate-limit (429)
+const COPY_BACKOFF_ERR   = 12000;             // пауза по кошельку после прочей ошибки сети
+const COPY_SAVE_MS       = 8000;              // не чаще раза в 8с пишем состояние из быстрого цикла
+const COPY_START_BALANCE = 1000;              // стартовый баланс копи-счёта (demo и real-paper)
+// Мастер-предохранитель реального исполнения копитрейда. По умолчанию ВЫКЛ:
+// реальный режим считается как «бумажный» (paper), пока явно не включить флаг.
+const COPY_REAL_LIVE     = ['true','1','yes','on'].includes((process.env.COPY_REAL_LIVE||'false').toLowerCase().trim());
+// ТУРБО-режим: ончейн-вотчер фиксированных событий OrderFilled на Polygon.
+// Нужен WSS-RPC (Alchemy/Infura/QuickNode) в env POLYGON_WSS. Push, без задержки Data API.
+const COPY_WSS_URL       = (process.env.POLYGON_WSS || '').trim();
+// Адреса бирж Polymarket на Polygon (CTF Exchange + Neg-Risk CTF Exchange).
+const COPY_EXCHANGES     = ['0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E', '0xC5d563A36AE78145C45a50134d48A1215220f80a'];
+let   COPY_WALLETS       = [];                 // массив кошельков (см. _copyMakeWallet)
+let   _copyPollBusy      = false;
+let   _copyDirty         = false;              // были ли изменения, требующие сохранения
+let   _copyLastSave      = 0;
+let   _turbo             = { provider: null, connected: false, listeners: [], reconnectMs: 3000, lastEventTs: 0, started: false };
 const CHAINLINK_ADDR   = '0xc907E116054Ad103354f2D350FD2514433D57F6f'; // BTC/USD Polygon
 const POLYGON_RPCS     = [
   'https://polygon-bor-rpc.publicnode.com',
@@ -192,6 +219,16 @@ function saveState() {
       schedEnabled: SCHEDULE_ENABLED, schedFrom: SCHEDULE_FROM, schedTo: SCHEDULE_TO,
     };
     out.__calib = calibLog.slice(-CALIB_MAX);
+    out.__copy = {
+      wallets: COPY_WALLETS.map(w => ({
+        id: w.id, address: w.address, label: w.label, copyUSD: w.copyUSD,
+        demoEnabled: w.demoEnabled, realEnabled: w.realEnabled,
+        startTs: w.startTs, createdAt: w.createdAt,
+        feed: w.feed.slice(0, 30), seen: [...w.seen].slice(-2000),
+        demo: { balance: w.demo.balance, positions: w.demo.positions, log: w.demo.log.slice(-500) },
+        real: { balance: w.real.balance, positions: w.real.positions, log: w.real.log.slice(-500) },
+      })),
+    };
     fs.writeFileSync(STATE_FILE, JSON.stringify(out, null, 2));
   } catch (e) { console.error('[state] save error:', e.message); }
 }
@@ -259,6 +296,19 @@ function loadState() {
       if (isFinite(Number(g.schedTo)))          SCHEDULE_TO        = Math.max(0, Math.min(24, parseInt(g.schedTo, 10)));
     }
     if (Array.isArray(stored.__calib)) calibLog = stored.__calib.slice(-CALIB_MAX);
+    if (stored.__copy && Array.isArray(stored.__copy.wallets)) {
+      COPY_WALLETS = stored.__copy.wallets.filter(w => w && w.address).map(w => ({
+        id: w.id || _copyId(), address: String(w.address).toLowerCase(),
+        label: w.label || (String(w.address).slice(0, 6) + '…' + String(w.address).slice(-4)),
+        copyUSD: Math.max(1, Number(w.copyUSD) || 20),
+        demoEnabled: w.demoEnabled ?? true, realEnabled: w.realEnabled ?? false,
+        demo: { balance: w.demo?.balance ?? COPY_START_BALANCE, positions: w.demo?.positions || {}, log: w.demo?.log || [] },
+        real: { balance: w.real?.balance ?? COPY_START_BALANCE, positions: w.real?.positions || {}, log: w.real?.log || [] },
+        feed: Array.isArray(w.feed) ? w.feed : [], seen: new Set(w.seen || []),
+        startTs: w.startTs || Date.now(), createdAt: w.createdAt || Date.now(),
+        lastPollTs: 0, lastErr: null,
+      })).slice(0, COPY_MAX_WALLETS);
+    }
     console.log('[state] loaded');
   } catch (e) { console.error('[state] load error:', e.message); }
 }
@@ -4553,16 +4603,21 @@ function processStrategies() {
     const s = STRATEGIES[id];
     if (ticks.length < 60) continue;
 
+    // ИЗОЛЯЦИЯ: ошибка в одной стратегии/аккаунте НЕ должна срывать обработку
+    // остальных (раньше throw в любой shouldEnter/shouldExit/stratOpen прерывал
+    // ВЕСЬ тик — все стратегии ПОСЛЕ сбойной переставали торговать и в demo, и в real).
     // Demo account — always simulation, never real orders
     if (s.demoEnabled) {
-      processAccount(s, ctx, s.demo, false);
+      try { processAccount(s, ctx, s.demo, false); }
+      catch (e) { console.error(`[tick] ${id} demo error:`, e && e.message); }
     }
 
     // Real account — places CLOB orders if wallet is configured; otherwise sim
     if (s.realEnabled && !s.pendingReal) {
       // FIX: в SIM-режиме реальные ордера ЗАПРЕЩЕНЫ — данные BTC симулированные.
       const canReal = REAL_TRADING && !!polyWallet && !!polyApiCreds && !isSim;
-      processAccount(s, ctx, s.real, canReal);
+      try { processAccount(s, ctx, s.real, canReal); }
+      catch (e) { console.error(`[tick] ${id} real error:`, e && e.message); }
     }
   }
 }
@@ -4762,6 +4817,7 @@ function buildSnapshot() {
       wallet:   polyWallet?.address ?? null,
       balance:  realBalance,
     },
+    copy: copySnapshot(),
     config: {
       invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE,
       dailyLossCap: REAL_DAILY_LOSS_CAP, minBalance: REAL_MIN_BALANCE,
@@ -4772,6 +4828,349 @@ function buildSnapshot() {
       calibTotal: calibLog.length,
       calibResolved: calibLog.filter(r => r.outcome === 'UP' || r.outcome === 'DOWN').length,
     },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// КОПИТРЕЙДИНГ POLYMARKET — движок ────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// До 5 кошельков. Опрашиваем публичный Data API (история сделок). Сделки ПОСЛЕ
+// добавления кошелька копируются в copy-счёт фиксированным размером copyUSD на
+// вход. SELL источника закрывает нашу копию по их цене (реализуем PnL). Открытые
+// позиции маркуем по midpoint CLOB и авто-закрываем при резолве (mid→1 / →0).
+// Реальный режим — те же расчёты; реальные ордера только при COPY_REAL_LIVE.
+// Полностью отделён от BTC-стратегий: свой реестр, свой цикл, свой раздел на UI.
+
+function _copyId()      { return 'cw_' + Math.random().toString(36).slice(2, 9); }
+function _copyAccount() { return { balance: COPY_START_BALANCE, positions: {}, log: [] }; }
+
+function _copyMakeWallet({ address, label, copyUSD }) {
+  const addr = String(address || '').trim().toLowerCase();
+  return {
+    id: _copyId(), address: addr,
+    label: (label || '').trim() || (addr.slice(0, 6) + '…' + addr.slice(-4)),
+    copyUSD: Math.max(1, Number(copyUSD) || 20),
+    demoEnabled: true, realEnabled: false,
+    demo: _copyAccount(), real: _copyAccount(),
+    feed: [], seen: new Set(),
+    startTs: Date.now(), createdAt: Date.now(),
+    lastPollTs: 0, lastErr: null,
+  };
+}
+
+function _copyParseFill(t) {
+  const side   = String(t.side || '').toUpperCase();
+  const price  = Number(t.price);
+  const shares = Number(t.size);
+  const token  = t.asset || t.tokenId || t.token_id;
+  if (!token || !(price > 0) || !(shares > 0) || (side !== 'BUY' && side !== 'SELL')) return null;
+  return {
+    side, price, shares, tokenId: String(token),
+    market:  t.title || t.market || t.eventSlug || 'Polymarket',
+    slug:    t.slug || t.eventSlug || '',
+    outcome: t.outcome || (t.outcomeIndex != null ? `#${t.outcomeIndex}` : ''),
+    ts:      (Number(t.timestamp) || Math.floor(Date.now() / 1000)) * 1000,
+    usd:     price * shares,
+  };
+}
+
+// Единый ключ дедупликации — общий для опроса (Data API) и турбо (ончейн),
+// чтобы один и тот же филл не применился дважды из двух источников.
+function _copyFillKey(fill, txHash) {
+  return (txHash || ('t' + fill.ts)) + ':' + fill.tokenId + ':' + fill.side + ':' + (Math.round(fill.shares * 10) / 10);
+}
+
+// Применяет филл к кошельку: дедуп → лента → demo/real счета. Возвращает true, если применён.
+async function _copyRouteFill(wallet, fill, txHash, src) {
+  if (!fill) return false;
+  const key = _copyFillKey(fill, txHash);
+  if (wallet.seen.has(key)) return false;
+  wallet.seen.add(key);
+  if (fill.ts < wallet.startTs - 5000) return false;             // копируем только сделки ПОСЛЕ добавления
+  wallet.feed.unshift({ side: fill.side, price: fill.price, shares: fill.shares,
+    usd: fill.usd, market: fill.market, outcome: fill.outcome, ts: fill.ts, src: src || 'poll' });
+  if (wallet.feed.length > 30) wallet.feed.pop();
+  if (wallet.demoEnabled) await _copyApplyFill(wallet, wallet.demo, fill, false);
+  if (wallet.realEnabled) await _copyApplyFill(wallet, wallet.real, fill, true);
+  _copyDirty = true;
+  return true;
+}
+
+// Реальный ордер копитрейда — только при мастер-флаге COPY_REAL_LIVE и кошельке/ключах.
+async function _copyTryRealOrder(wallet, side, fill, usd) {
+  if (!COPY_REAL_LIVE) return;                                  // мастер-предохранитель (paper по умолчанию)
+  if (!REAL_TRADING || !polyClob || !polyApiCreds || isSim) return;
+  if (side === 'BUY' && realBalance !== null && (realBalance - (usd || 0)) < REAL_MIN_BALANCE) {
+    console.log(`[copy] real BUY skip — ниже пола баланса $${REAL_MIN_BALANCE}`); return;
+  }
+  try {
+    const price = Math.min(0.99, Math.max(0.01, side === 'BUY' ? fill.price + 0.02 : fill.price - 0.02));
+    await placeClobOrder({ tokenId: fill.tokenId, side,
+      size: side === 'BUY' ? usd : fill.shares, price, orderType: 'GTC' });
+    console.log(`[copy] REAL ${side} placed (${wallet.label}) token=${fill.tokenId.slice(0, 10)}…`);
+  } catch (e) { console.error(`[copy] real ${side} error:`, e && e.message); }
+}
+
+// Зеркалируем один филл в счёт (demo или real).
+async function _copyApplyFill(wallet, acct, fill, isReal) {
+  const copyUSD = Math.max(1, wallet.copyUSD || 20);
+  if (fill.side === 'BUY') {
+    if (acct.balance < copyUSD) return;                          // нет средств на копию
+    const addShares = copyUSD / fill.price;
+    const pos = acct.positions[fill.tokenId];
+    if (pos) {
+      if ((pos.adds || 1) >= 4) return;                          // не усредняем бесконечно
+      pos.shares += addShares; pos.costUSD += copyUSD;
+      pos.avgPrice = pos.costUSD / pos.shares; pos.adds = (pos.adds || 1) + 1; pos.lastPrice = fill.price;
+    } else {
+      acct.positions[fill.tokenId] = {
+        tokenId: fill.tokenId, market: fill.market, slug: fill.slug, outcome: fill.outcome,
+        shares: addShares, avgPrice: fill.price, costUSD: copyUSD,
+        openTime: fill.ts, lastPrice: fill.price, adds: 1,
+      };
+    }
+    acct.balance -= copyUSD;
+    if (isReal) await _copyTryRealOrder(wallet, 'BUY', fill, copyUSD);
+  } else {                                                       // SELL → закрываем копию по их цене
+    const pos = acct.positions[fill.tokenId];
+    if (!pos) return;
+    const proceeds = pos.shares * fill.price;
+    const pnl = proceeds - pos.costUSD;
+    acct.balance += proceeds;
+    acct.log.push({ tokenId: fill.tokenId, market: pos.market, outcome: pos.outcome,
+      entryPrice: pos.avgPrice, exitPrice: fill.price, shares: pos.shares, sizeUSD: pos.costUSD,
+      pnl, won: pnl > 0, openTime: pos.openTime, closeTime: fill.ts, reason: 'COPY-SELL' });
+    if (acct.log.length > 500) acct.log = acct.log.slice(-500);
+    const shares = pos.shares;
+    delete acct.positions[fill.tokenId];
+    if (isReal) await _copyTryRealOrder(wallet, 'SELL', { ...fill, shares }, null);
+  }
+}
+
+// Маркируем открытые позиции по midpoint CLOB и авто-закрываем при резолве.
+async function _copyMarkAndResolve(wallet, acct, isReal) {
+  for (const tk of Object.keys(acct.positions).slice(0, 8)) {
+    const pos = acct.positions[tk];
+    if (!pos) continue;
+    let mid = null;
+    try { mid = await fetchPolyMidpoint(tk); } catch (_) {}
+    if (mid == null || !isFinite(mid)) continue;
+    pos.lastPrice = mid;
+    const resolved = mid >= 0.97 ? 1 : (mid <= 0.03 ? 0 : null);
+    if (resolved != null && (Date.now() - pos.openTime) > 60000) {
+      const proceeds = pos.shares * resolved;
+      const pnl = proceeds - pos.costUSD;
+      acct.balance += proceeds;
+      acct.log.push({ tokenId: tk, market: pos.market, outcome: pos.outcome,
+        entryPrice: pos.avgPrice, exitPrice: resolved, shares: pos.shares, sizeUSD: pos.costUSD,
+        pnl, won: pnl > 0, openTime: pos.openTime, closeTime: Date.now(), reason: 'RESOLVE' });
+      if (acct.log.length > 500) acct.log = acct.log.slice(-500);
+      delete acct.positions[tk];
+    }
+  }
+}
+
+async function _copyPollWallet(wallet) {
+  if (wallet._backoffUntil && Date.now() < wallet._backoffUntil) return;   // под rate-limit/ошибкой — ждём
+  let trades = [];
+  try {
+    const res = await fetch(`${POLY_DATA}/trades?user=${wallet.address}&limit=${COPY_FETCH_LIMIT}`, { signal: AbortSignal.timeout(7000) });
+    if (res.status === 429) { wallet._backoffUntil = Date.now() + COPY_BACKOFF_429; wallet.lastErr = 'rate-limit (429) — пауза'; wallet.lastPollTs = Date.now(); return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const j = await res.json();
+    trades = Array.isArray(j) ? j : (j.data || j.trades || []);
+    wallet.lastErr = null; wallet._backoffUntil = 0;
+  } catch (e) {
+    wallet.lastErr = e.message || String(e);
+    wallet._backoffUntil = Date.now() + COPY_BACKOFF_ERR;                  // не долбим API при сетевых сбоях
+    wallet.lastPollTs = Date.now(); return;
+  }
+
+  const parsed = [];
+  for (const t of trades) {
+    const fill = _copyParseFill(t);
+    if (!fill) continue;
+    parsed.push({ fill, txHash: (t.transactionHash || t.transaction_hash || '') });
+  }
+  parsed.sort((a, b) => a.fill.ts - b.fill.ts);                            // старые → новые
+  for (const { fill, txHash } of parsed) {
+    await _copyRouteFill(wallet, fill, txHash, 'poll');
+  }
+  if (wallet.seen.size > 6000) wallet.seen = new Set([...wallet.seen].slice(-3000));
+
+  // Маркировка открытых позиций по midpoint — дорого, поэтому реже, чем опрос сделок.
+  if (Date.now() - (wallet._lastMarkTs || 0) >= COPY_MARK_MS) {
+    wallet._lastMarkTs = Date.now();
+    const before = (wallet.demo.log.length + wallet.real.log.length);
+    if (wallet.demoEnabled) await _copyMarkAndResolve(wallet, wallet.demo, false);
+    if (wallet.realEnabled) await _copyMarkAndResolve(wallet, wallet.real, true);
+    if ((wallet.demo.log.length + wallet.real.log.length) !== before) _copyDirty = true;
+  }
+  wallet.lastPollTs = Date.now();
+}
+
+async function copyPollAll() {
+  if (_copyPollBusy || !COPY_WALLETS.length) return;
+  _copyPollBusy = true;
+  try {
+    // Параллельно: один медленный кошелёк не задерживает остальные.
+    await Promise.allSettled(COPY_WALLETS.map(w =>
+      _copyPollWallet(w).catch(e => { console.error('[copy] poll', w.label, e && e.message); })));
+    if (_copyDirty && Date.now() - _copyLastSave >= COPY_SAVE_MS) {
+      saveState(); _copyLastSave = Date.now(); _copyDirty = false;
+    }
+  } finally { _copyPollBusy = false; }
+}
+
+// Адаптивный цикл: когда ТУРБО (ончейн-WS) подключён — опрос редкий (только сверка),
+// иначе быстрый. Самопланируется, чтобы менять темп на лету.
+function _copyScheduleLoop() {
+  const delay = (_turbo.connected ? COPY_POLL_RECON_MS : COPY_POLL_MS);
+  setTimeout(async () => { try { await copyPollAll(); } catch (_) {} _copyScheduleLoop(); }, delay);
+}
+_copyScheduleLoop();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ТУРБО-РЕЖИМ: ончейн-вотчер OrderFilled (push, без задержки Data API) ─────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Слушаем событие OrderFilled контрактов биржи Polymarket на Polygon через WSS-RPC.
+// Фильтр по topic: maker ∈ {наши адреса} ИЛИ taker ∈ {наши адреса} — RPC шлёт только
+// нужные логи. Падает безопасно: при отвале WS работает обычный опрос (фолбэк).
+const _ORDER_FILLED_ABI = ['event OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker, uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmountFilled, uint256 takerAmountFilled, uint256 fee)'];
+const _ifaceOF   = new ethers.Interface(_ORDER_FILLED_ABI);
+const _OF_TOPIC  = ethers.id('OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)');
+
+// Декод одного лога OrderFilled в наш fill для конкретного кошелька (или null).
+function _copyDecodeOnchain(parsed, walletAddr) {
+  const maker = parsed.args.maker.toLowerCase();
+  const taker = parsed.args.taker.toLowerCase();
+  const w = walletAddr.toLowerCase();
+  const isMaker = maker === w, isTaker = taker === w;
+  if (!isMaker && !isTaker) return null;
+  const mId = parsed.args.makerAssetId, tId = parsed.args.takerAssetId;       // BigInt
+  const mAmt = Number(parsed.args.makerAmountFilled) / 1e6;
+  const tAmt = Number(parsed.args.takerAmountFilled) / 1e6;
+  let side, tokenId, shares, price;
+  if (isMaker) {
+    if (mId === 0n)      { side = 'BUY';  tokenId = tId.toString(); shares = tAmt; price = tAmt > 0 ? mAmt / tAmt : 0; }
+    else if (tId === 0n) { side = 'SELL'; tokenId = mId.toString(); shares = mAmt; price = mAmt > 0 ? tAmt / mAmt : 0; }
+    else return null;
+  } else {
+    if (tId === 0n)      { side = 'BUY';  tokenId = mId.toString(); shares = mAmt; price = mAmt > 0 ? tAmt / mAmt : 0; }
+    else if (mId === 0n) { side = 'SELL'; tokenId = tId.toString(); shares = tAmt; price = tAmt > 0 ? mAmt / tAmt : 0; }
+    else return null;
+  }
+  if (!(price > 0) || !(shares > 0) || price > 1) return null;
+  return { side, price, shares, tokenId, market: '⚡ on-chain', slug: '', outcome: '', ts: Date.now(), usd: price * shares };
+}
+
+async function _copyOnChainLog(log) {
+  try {
+    _turbo.lastEventTs = Date.now();
+    const parsed = _ifaceOF.parseLog(log);
+    if (!parsed) return;
+    const txHash = log.transactionHash + ':' + log.index;       // лог-уникальный ключ
+    for (const w of COPY_WALLETS) {
+      const fill = _copyDecodeOnchain(parsed, w.address);
+      if (!fill) continue;
+      const applied = await _copyRouteFill(w, fill, txHash, 'onchain');
+      if (applied) console.log(`[copy] ⚡ ончейн ${fill.side} ${w.label} ${(fill.price*100).toFixed(0)}¢ ×${fill.shares.toFixed(1)}`);
+    }
+  } catch (e) { /* нерелевантный лог — игнор */ }
+}
+
+function _copyTurboUnsub() {
+  if (!_turbo.provider) return;
+  for (const f of _turbo.listeners) { try { _turbo.provider.off(f, _copyOnChainLog); } catch (_) {} }
+  _turbo.listeners = [];
+}
+
+// (Пере)подписка под текущий набор адресов. Два фильтра: maker-set и taker-set.
+function copyTurboResubscribe() {
+  if (!_turbo.provider || !_turbo.connected) return;
+  _copyTurboUnsub();
+  if (!COPY_WALLETS.length) return;
+  const padded = COPY_WALLETS.map(w => ethers.zeroPadValue(w.address, 32));
+  const fMaker = { address: COPY_EXCHANGES, topics: [_OF_TOPIC, null, padded] };        // maker ∈ set
+  const fTaker = { address: COPY_EXCHANGES, topics: [_OF_TOPIC, null, null, padded] };  // taker ∈ set
+  try {
+    _turbo.provider.on(fMaker, _copyOnChainLog);
+    _turbo.provider.on(fTaker, _copyOnChainLog);
+    _turbo.listeners = [fMaker, fTaker];
+    console.log(`[copy] ⚡ турбо подписан на ${COPY_WALLETS.length} кошельков (${COPY_EXCHANGES.length} контракта)`);
+  } catch (e) { console.error('[copy] turbo subscribe error:', e && e.message); }
+}
+
+async function copyTurboStart() {
+  if (!COPY_WSS_URL) { console.log('[copy] ТУРБО выключен (нет POLYGON_WSS) — работает опрос Data API'); return; }
+  if (_turbo.started) return;
+  _turbo.started = true;
+  const connect = () => {
+    try {
+      const provider = new ethers.WebSocketProvider(COPY_WSS_URL, 137, { staticNetwork: ethers.Network.from(137) });
+      _turbo.provider = provider;
+      provider.on('error', (e) => { console.error('[copy] turbo WS error:', e && e.message); });
+      // ждём готовности сети и подписываемся
+      provider.getBlockNumber().then(bn => {
+        _turbo.connected = true; _turbo.reconnectMs = 3000;
+        console.log(`[copy] ⚡ ТУРБО подключён к Polygon (block ${bn})`);
+        copyTurboResubscribe();
+      }).catch(err => { console.error('[copy] turbo connect failed:', err && err.message); _turbo.connected = false; });
+    } catch (e) { console.error('[copy] turbo init error:', e && e.message); _turbo.connected = false; }
+  };
+  connect();
+  // Хартбит + авто-реконнект: если WS отвалился — переподключаемся, опрос тем временем подстраховывает.
+  setInterval(async () => {
+    if (!_turbo.provider) { connect(); return; }
+    try {
+      await Promise.race([
+        _turbo.provider.getBlockNumber(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('hb timeout')), 8000)),
+      ]);
+      _turbo.connected = true;
+    } catch (e) {
+      console.warn('[copy] turbo heartbeat fail → reconnect:', e && e.message);
+      _turbo.connected = false;
+      try { _copyTurboUnsub(); await _turbo.provider.destroy(); } catch (_) {}
+      _turbo.provider = null;
+      setTimeout(connect, _turbo.reconnectMs);
+      _turbo.reconnectMs = Math.min(30000, _turbo.reconnectMs * 1.7);
+    }
+  }, 15000);
+}
+copyTurboStart();
+
+console.log(`[copy] poll=${COPY_POLL_MS}ms recon=${COPY_POLL_RECON_MS}ms limit=${COPY_FETCH_LIMIT} maxWallets=${COPY_MAX_WALLETS} real-live=${COPY_REAL_LIVE} turbo=${COPY_WSS_URL ? 'on' : 'off'}`);
+
+
+function _copyAccountSummary(acct) {
+  const log  = acct.log;
+  const wins = log.filter(t => t.won).length;
+  const realized = log.reduce((a, t) => a + t.pnl, 0);
+  const open = Object.values(acct.positions).map(p => ({
+    market: p.market, outcome: p.outcome, shares: p.shares, avgPrice: p.avgPrice,
+    lastPrice: p.lastPrice, costUSD: p.costUSD,
+    uPnl: (p.lastPrice != null ? p.shares * p.lastPrice - p.costUSD : 0), openTime: p.openTime,
+  }));
+  const uPnl = open.reduce((a, p) => a + p.uPnl, 0);
+  return {
+    balance: acct.balance, realizedPnl: realized, unrealizedPnl: uPnl,
+    trades: log.length, wins, winRate: log.length ? wins / log.length : 0,
+    openCount: open.length, open: open.slice(0, 8), lastTrades: log.slice(-6).reverse(),
+  };
+}
+
+function copySnapshot() {
+  return {
+    live: COPY_REAL_LIVE, maxWallets: COPY_MAX_WALLETS,
+    turbo: { enabled: !!COPY_WSS_URL, connected: !!_turbo.connected, pollMs: _turbo.connected ? COPY_POLL_RECON_MS : COPY_POLL_MS },
+    wallets: COPY_WALLETS.map(w => ({
+      id: w.id, address: w.address, label: w.label, copyUSD: w.copyUSD,
+      demoEnabled: w.demoEnabled, realEnabled: w.realEnabled,
+      lastPollTs: w.lastPollTs, lastErr: w.lastErr, createdAt: w.createdAt,
+      demo: _copyAccountSummary(w.demo), real: _copyAccountSummary(w.real),
+      feed: w.feed.slice(0, 12),
+    })),
   };
 }
 
@@ -4880,6 +5279,72 @@ app.post('/api/strategy/:id/params/reset', (req, res) => {
   console.log(`[params] ${req.params.id} reset to defaults`);
   res.json({ ok: true, customEnabled: s.customEnabled, customParams: s.customParams, params: s.params });
 });
+
+// ── КОПИТРЕЙДИНГ POLYMARKET — API ────────────────────────────────────────────
+function _copyFind(id) { return COPY_WALLETS.find(w => w.id === id); }
+const _ADDR_RE = /^0x[a-fA-F0-9]{40}$/;
+
+// Добавить кошелёк на копитрейдинг.
+app.post('/api/copy/add', (req, res) => {
+  const b = req.body || {};
+  const address = String(b.address || '').trim();
+  if (!_ADDR_RE.test(address)) return res.status(400).json({ error: 'Некорректный адрес кошелька (нужен 0x… 42 символа)' });
+  if (COPY_WALLETS.length >= COPY_MAX_WALLETS) return res.status(400).json({ error: `Максимум ${COPY_MAX_WALLETS} кошельков` });
+  if (COPY_WALLETS.some(w => w.address === address.toLowerCase())) return res.status(400).json({ error: 'Этот кошелёк уже добавлен' });
+  const w = _copyMakeWallet({ address, label: b.label, copyUSD: b.copyUSD });
+  COPY_WALLETS.push(w);
+  saveState();
+  copyPollAll();   // первый опрос (зафиксирует базовую историю как «уже видели»)
+  copyTurboResubscribe();   // обновить ончейн-подписку под новый адрес
+  console.log(`[copy] добавлен кошелёк ${w.label} (${w.address})`);
+  res.json({ ok: true, copy: copySnapshot() });
+});
+
+// Удалить кошелёк.
+app.post('/api/copy/:id/remove', (req, res) => {
+  const i = COPY_WALLETS.findIndex(w => w.id === req.params.id);
+  if (i === -1) return res.status(404).json({ error: 'not found' });
+  const [w] = COPY_WALLETS.splice(i, 1);
+  saveState();
+  copyTurboResubscribe();   // обновить ончейн-подписку
+  console.log(`[copy] удалён кошелёк ${w.label}`);
+  res.json({ ok: true, copy: copySnapshot() });
+});
+
+// Тумблер demo/real для кошелька.
+app.post('/api/copy/:id/toggle', (req, res) => {
+  const w = _copyFind(req.params.id);
+  if (!w) return res.status(404).json({ error: 'not found' });
+  const acct = (req.body || {}).account === 'real' ? 'real' : 'demo';
+  if (acct === 'demo') w.demoEnabled = typeof req.body.enabled === 'boolean' ? req.body.enabled : !w.demoEnabled;
+  else                 w.realEnabled = typeof req.body.enabled === 'boolean' ? req.body.enabled : !w.realEnabled;
+  saveState();
+  res.json({ ok: true, copy: copySnapshot() });
+});
+
+// Изменить размер копии ($ на вход).
+app.post('/api/copy/:id/size', (req, res) => {
+  const w = _copyFind(req.params.id);
+  if (!w) return res.status(404).json({ error: 'not found' });
+  const v = Number((req.body || {}).copyUSD);
+  if (!isFinite(v) || v < 1) return res.status(400).json({ error: 'copyUSD ≥ 1' });
+  w.copyUSD = Math.min(100000, v);
+  saveState();
+  res.json({ ok: true, copy: copySnapshot() });
+});
+
+// Сброс copy-счёта (demo или real): баланс, позиции и лог.
+app.post('/api/copy/:id/reset', (req, res) => {
+  const w = _copyFind(req.params.id);
+  if (!w) return res.status(404).json({ error: 'not found' });
+  const acct = (req.body || {}).account === 'real' ? 'real' : 'demo';
+  w[acct] = _copyAccount();
+  w.startTs = Date.now();          // заново копируем только будущие сделки
+  if (acct === 'demo') { w.feed = []; w.seen = new Set(); }
+  saveState();
+  res.json({ ok: true, copy: copySnapshot() });
+});
+
 
 // Переключить инверсию сигнала (база ↔ наоборот). Глобально для всех стратегий.
 app.post('/api/invert/toggle', (req, res) => {
