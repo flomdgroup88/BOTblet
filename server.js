@@ -39,6 +39,10 @@ const COPY_BACKOFF_429   = 60000;             // пауза по кошельк�
 const COPY_BACKOFF_ERR   = 12000;             // пауза по кошельку после прочей ошибки сети
 const COPY_SAVE_MS       = 8000;              // не чаще раза в 8с пишем состояние из быстрого цикла
 const COPY_START_BALANCE = 1000;              // стартовый баланс копи-счёта (demo и real-paper)
+// Резолв копий по фактическому исходу рынка (как редим в реале):
+const COPY_RESOLVE_HI        = 0.94;          // mid ≥ → позиция ВЫИГРАЛА ($1/доля)
+const COPY_RESOLVE_LO        = 0.06;          // mid ≤ → позиция ПРОИГРАЛА ($0)
+const COPY_RESOLVE_MIN_AGE_MS = 25000;        // не закрываем моложе 25с (защита от шумного mid на старте)
 // Мастер-предохранитель реального исполнения копитрейда. По умолчанию ВЫКЛ:
 // реальный режим считается как «бумажный» (paper), пока явно не включить флаг.
 const COPY_REAL_LIVE     = ['true','1','yes','on'].includes((process.env.COPY_REAL_LIVE||'false').toLowerCase().trim());
@@ -2750,7 +2754,7 @@ setInterval(() => {
 // В уведомлении — сумма PnL текущей серии. Шлём ОДИН раз на серию (до первого луза).
 const WIN_STREAK_ALERTS = [
   { id: 'flomdInverse',  name: 'FLOMD Inverse', wins: 5 },
-  { id: 'udgLeader6472', name: 'UDG Leader',    wins: 5 },
+  { id: 'udgLeader6472', name: 'UDG Leader',    wins: 4 },
   { id: 'momentum',      name: 'Momentum',      wins: 7 },
 ];
 const _winStreakAlerted = {};
@@ -3733,6 +3737,43 @@ const STRAT_UNDERDOG_DELTA_STREAK = {
   shouldExit(ctx, pos, p) { return STRAT_UNDERDOG_DELTA.shouldExit(ctx, pos, p); },
 };
 
+// 3) UDG-LEADER PHASE — фаворит на тренде в СРЕДНЕЙ фазе окна. Включена на РЕАЛ малым размером.
+//    Вход: лидер (дорогая сторона) 64–72¢; фаза окна elapsed=POLY_WINDOW_SEC−msToEnd/1000 ∈ [90;210]с;
+//    движение BTC В СТОРОНУ фаворита ≥ btcMoveMin ($20). Выход: абс. TP 0.99 / абс. SL 0.35,
+//    держим до TP/SL/резолва, без стриков и поминутных правил — простой фиксированный фильтр.
+//    Малый реальный размер (kellyFrac/maxFrac). Все пороги — в defaults, крутятся из UI.
+const STRAT_UDG_LEADER_PHASE = {
+  id: 'udgLeaderPhase', name: 'UDG-LEADER PHASE (64-72, фаза 90-210с) · РЕАЛ',
+  desc: 'Лидер 64–72¢ в фазе окна 90–210с при движении BTC в сторону фаворита ≥$20. TP 0.99 / SL 0.35 (абс.), держим до TP/SL/резолва, без стриков. Включена на РЕАЛ малым размером — форвард-тест на живых деньгах.',
+  realDefault: true, demoDefault: true,
+  defaults: { lo: 0.64, hi: 0.72, elFromSec: 90, elToSec: 210, btcMoveMin: 20,
+              tpAbs: 0.99, slAbs: 0.35, maxBtcAgeMs: 3000, maxPerWindow: 1,
+              kellyFrac: 0.08, maxFrac: 0.04 },
+  shouldEnter(ctx, p) {
+    const elapsed = POLY_WINDOW_SEC - ctx.msToEnd / 1000;        // секунд от открытия окна
+    if (elapsed < p.elFromSec || elapsed > p.elToSec) return null;
+    if (p.maxBtcAgeMs && ctx.btcAgeMs != null && ctx.btcAgeMs > p.maxBtcAgeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const leadSide  = np.up >= np.dn ? 'UP' : 'DOWN';
+    const leadPrice = Math.max(np.up, np.dn);
+    if (leadPrice < p.lo || leadPrice > p.hi || leadPrice < MIN_ENTRY_PRICE) return null;
+    if (ctx.curBTC == null || ctx.openingBTC == null) return null;
+    const delta = ctx.curBTC - ctx.openingBTC;
+    const moveToward = leadSide === 'UP' ? delta : -delta;       // движение В СТОРОНУ фаворита
+    if (p.btcMoveMin && moveToward < p.btcMoveMin) return null;
+    const ourProb = _clampProb(leadPrice + 0.08, leadPrice);
+    return { side: leadSide, polyPrice: leadPrice, ourProb, edge: ourProb - leadPrice,
+             info: `udgLeaderPhase ${leadSide} @${(leadPrice * 100).toFixed(0)}¢ Δ→$${moveToward.toFixed(0)}` };
+  },
+  shouldExit(ctx, pos, p) {
+    const cur = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (cur == null) return null;
+    if (p.tpAbs && cur >= p.tpAbs) return { reason: 'TP', exitPrice: cur };
+    if (p.slAbs && cur <= p.slAbs) return { reason: 'SL', exitPrice: cur };
+    return null;
+  },
+};
+
 const STRAT_DEFINITIONS = [
   // ── ОСТАВЛЕНЫ ПО ЗАПРОСУ (13 стратегий со скринов) ──────────────────────────
   STRAT_UNDERDOG_HOLD,        // UNDERDOG HOLD (★опора)
@@ -3751,6 +3792,8 @@ const STRAT_DEFINITIONS = [
   // ── НОВЫЕ: стрик-версии для форвард-теста (DEMO-ONLY) ────────────────────────
   STRAT_UDG_LEADER,           // UDG-LEADER STREAK (skip5/resume1, свои исходы)
   STRAT_UNDERDOG_DELTA_STREAK,// UNDERDOG DELTA STREAK (skip3/resume2, свои исходы)
+  // ── НА РЕАЛ малым размером (форвард-тест на живых деньгах) ────────────────────
+  STRAT_UDG_LEADER_PHASE,     // UDG-LEADER PHASE (64-72, фаза 90-210с) — realDefault
 ];
 
 // ─── UNDERDOG HOLD LOSS-STREAK CIRCUIT BREAKER ───────────────────────────────
@@ -3882,8 +3925,8 @@ function initStrategies() {
   for (const def of STRAT_DEFINITIONS) {
     STRATEGIES[def.id] = {
       def,
-      demoEnabled:  false,
-      realEnabled:  false,
+      demoEnabled:  !!def.demoDefault,   // по умолчанию выкл; стратегия может стартовать включённой
+      realEnabled:  !!def.realDefault,   // только если стратегия явно помечена realDefault
       schedEnabled: false,   // своё расписание выкл → действует глобальное
       schedFrom:    7,       // час МСК «от»
       schedTo:      24,      // час МСК «до» (24 = до полуночи)
@@ -5083,17 +5126,18 @@ async function _copyRouteFill(wallet, fill, txHash, src) {
 
 // Реальный ордер копитрейда — только при мастер-флаге COPY_REAL_LIVE и кошельке/ключах.
 async function _copyTryRealOrder(wallet, side, fill, usd) {
-  if (!COPY_REAL_LIVE) return;                                  // мастер-предохранитель (paper по умолчанию)
-  if (!REAL_TRADING || !polyClob || !polyApiCreds || isSim) return;
+  if (!COPY_REAL_LIVE) return false;                              // paper-режим — реальный ордер не ставим
+  if (!REAL_TRADING || !polyClob || !polyApiCreds || isSim) return false;
   if (side === 'BUY' && realBalance !== null && (realBalance - (usd || 0)) < REAL_MIN_BALANCE) {
-    console.log(`[copy] real BUY skip — ниже пола баланса $${REAL_MIN_BALANCE}`); return;
+    console.log(`[copy] real BUY skip — ниже пола баланса $${REAL_MIN_BALANCE}`); return false;
   }
   try {
     const price = Math.min(0.99, Math.max(0.01, side === 'BUY' ? fill.price + 0.02 : fill.price - 0.02));
     await placeClobOrder({ tokenId: fill.tokenId, side,
       size: side === 'BUY' ? usd : fill.shares, price, orderType: 'GTC' });
     console.log(`[copy] REAL ${side} placed (${wallet.label}) token=${fill.tokenId.slice(0, 10)}…`);
-  } catch (e) { console.error(`[copy] real ${side} error:`, e && e.message); }
+    return true;                                                  // ордер ВЫСТАВЛЕН (но не факт что налит/резолвнут)
+  } catch (e) { console.error(`[copy] real ${side} error:`, e && e.message); return false; }
 }
 
 // Размер ставки копии в $ по глобальному калькулятору COPY_SIZING.
@@ -5124,6 +5168,13 @@ function _copyJournalClose(wallet, isReal, pos, exitPrice, pnl, reason, closeTim
 async function _copyApplyFill(wallet, acct, fill, isReal) {
   const copyUSD = _copyBetUSD(wallet, fill);
   if (fill.side === 'BUY') {
+    // РЕАЛ: сперва пытаемся реально выставить ордер. Не вышло (paper-режим / пол баланса /
+    // нет средств / ошибка) — НИЧЕГО не пишем в реал-счёт. Так дашборд не рисует копии,
+    // которых на самом деле не было.
+    if (isReal) {
+      const placed = await _copyTryRealOrder(wallet, 'BUY', fill, copyUSD);
+      if (!placed) return;
+    }
     if (acct.balance < copyUSD) return;                          // нет средств на копию
     const addShares = copyUSD / fill.price;
     const pos = acct.positions[fill.tokenId];
@@ -5139,10 +5190,14 @@ async function _copyApplyFill(wallet, acct, fill, isReal) {
       };
     }
     acct.balance -= copyUSD;
-    if (isReal) await _copyTryRealOrder(wallet, 'BUY', fill, copyUSD);
   } else {                                                       // SELL → закрываем копию по их цене
     const pos = acct.positions[fill.tokenId];
     if (!pos) return;
+    // РЕАЛ: пытаемся реально продать. Не вышло — позицию в учёте НЕ закрываем.
+    if (isReal) {
+      const placed = await _copyTryRealOrder(wallet, 'SELL', { ...fill, shares: pos.shares }, null);
+      if (!placed) return;
+    }
     const proceeds = pos.shares * fill.price;
     const pnl = proceeds - pos.costUSD;
     acct.balance += proceeds;
@@ -5151,13 +5206,13 @@ async function _copyApplyFill(wallet, acct, fill, isReal) {
       pnl, won: pnl > 0, openTime: pos.openTime, closeTime: fill.ts, reason: 'COPY-SELL' });
     if (acct.log.length > 500) acct.log = acct.log.slice(-500);
     _copyJournalClose(wallet, isReal, pos, fill.price, pnl, 'COPY-SELL', fill.ts);
-    const shares = pos.shares;
     delete acct.positions[fill.tokenId];
-    if (isReal) await _copyTryRealOrder(wallet, 'SELL', { ...fill, shares }, null);
   }
 }
 
-// Маркируем открытые позиции по midpoint CLOB и авто-закрываем при резолве.
+// Маркируем открытые копии по live-midpoint и закрываем по ФАКТИЧЕСКОМУ исходу рынка
+// ($1 победа / $0 проигрыш) — как редим в реале. Симметрично для винеров и лузеров,
+// чтобы реализованный P&L не выглядел зелёным, пока проигрыши «висят» открытыми.
 async function _copyMarkAndResolve(wallet, acct, isReal) {
   for (const tk of Object.keys(acct.positions).slice(0, 8)) {
     const pos = acct.positions[tk];
@@ -5165,17 +5220,17 @@ async function _copyMarkAndResolve(wallet, acct, isReal) {
     let mid = null;
     try { mid = await fetchPolyMidpoint(tk); } catch (_) {}
     if (mid == null || !isFinite(mid)) continue;
-    pos.lastPrice = mid;
-    const resolved = mid >= 0.97 ? 1 : (mid <= 0.03 ? 0 : null);
-    if (resolved != null && (Date.now() - pos.openTime) > 60000) {
-      const proceeds = pos.shares * resolved;
+    pos.lastPrice = mid;                                         // mark-to-market: открытый лузер сразу тянет вниз
+    const resolved = mid >= COPY_RESOLVE_HI ? 1 : (mid <= COPY_RESOLVE_LO ? 0 : null);
+    if (resolved != null && (Date.now() - pos.openTime) > COPY_RESOLVE_MIN_AGE_MS) {
+      const proceeds = pos.shares * resolved;                   // $1/доля если выиграл, $0 если проиграл
       const pnl = proceeds - pos.costUSD;
       acct.balance += proceeds;
       acct.log.push({ tokenId: tk, market: pos.market, outcome: pos.outcome,
         entryPrice: pos.avgPrice, exitPrice: resolved, shares: pos.shares, sizeUSD: pos.costUSD,
-        pnl, won: pnl > 0, openTime: pos.openTime, closeTime: Date.now(), reason: 'RESOLVE' });
+        pnl, won: resolved === 1, openTime: pos.openTime, closeTime: Date.now(), reason: resolved === 1 ? 'WIN' : 'LOSS' });
       if (acct.log.length > 500) acct.log = acct.log.slice(-500);
-      _copyJournalClose(wallet, isReal, pos, resolved, pnl, 'RESOLVE', Date.now());
+      _copyJournalClose(wallet, isReal, pos, resolved, pnl, resolved === 1 ? 'WIN' : 'LOSS', Date.now());
       delete acct.positions[tk];
     }
   }
@@ -5395,13 +5450,16 @@ function _copyAccountSummary(acct, liveBalance) {
     uPnl: (p.lastPrice != null ? p.shares * p.lastPrice - p.costUSD : 0), openTime: p.openTime,
   }));
   const uPnl = open.reduce((a, p) => a + p.uPnl, 0);
+  const openCost = open.reduce((a, p) => a + (p.costUSD || 0), 0);   // деньги «под риском» в открытых
   const useLive = (typeof liveBalance === 'number' && isFinite(liveBalance));
   return {
     // Для REAL-счёта показываем РЕАЛЬНЫЙ баланс кошелька (общий с BTC-реалом), а не paper-$1000.
     balance: useLive ? liveBalance : acct.balance, paperBalance: acct.balance, liveBalance: useLive,
-    realizedPnl: realized, unrealizedPnl: uPnl,
+    realizedPnl: realized, unrealizedPnl: uPnl, openCost,
+    netPnl: realized + uPnl,
     trades: log.length, wins, winRate: log.length ? wins / log.length : 0,
     openCount: open.length, open: open.slice(0, 8), lastTrades: log.slice(-6).reverse(),
+    unverified: useLive,   // real-счёт: цифры — оценка по ценам источника, факт смотри в кошельке Polymarket
   };
 }
 

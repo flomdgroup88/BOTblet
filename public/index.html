@@ -1458,10 +1458,10 @@ function _cpAcctPanel(w, a, kind){
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px;">
       <div><div class="cp-stat">БАЛАНС${kind==='real'&&a.liveBalance?' (кошелёк)':''}</div><div class="cp-stat"><b>$${(a.balance||0).toFixed(2)}</b></div></div>
-      <div><div class="cp-stat">P&L реал / нереал</div><div class="cp-stat"><b>${_cpMoney(a.realizedPnl)}</b> / ${_cpMoney(a.unrealizedPnl)}</div></div>
+      <div><div class="cp-stat">${kind==='real'?'P&L (оценка, не факт)':'P&L реал / нереал'}</div><div class="cp-stat" style="${kind==='real'?'opacity:.55;':''}"><b>${_cpMoney(a.realizedPnl)}</b> / ${_cpMoney(a.unrealizedPnl)}</div></div>
       <div><div class="cp-stat">СДЕЛКИ / WR</div><div class="cp-stat"><b>${a.trades||0}</b> / ${wr}% · откр.${a.openCount||0}</div></div>
     </div>
-    ${kind==='real'&&a.liveBalance?`<div class="cp-stat" style="margin:-4px 0 6px;color:var(--tx3);">баланс — реальный USDC кошелька (общий с BTC-реалом)${!COPY_LIVE?'; копи-PnL пока бумажный (paper)':''}</div>`:''}
+    ${kind==='real'?`<div style="margin:-2px 0 8px;padding:7px 9px;background:rgba(255,136,51,.08);border:1px solid rgba(255,136,51,.35);border-radius:6px;font-size:10px;color:var(--warn);line-height:1.5;">⚠️ Это <b>оценка</b> копий по ценам кошелька-источника, а <b>не</b> фактический результат. Реальные ордера могут не налиться/не резолвнуться. <b>Фактический P&L и позиции — в твоём кошельке Polymarket</b>, не здесь. Баланс ниже — реальный USDC.${!COPY_LIVE?' Реальное исполнение сейчас ВЫКЛ (paper).':''}</div>`:''}
     ${open?`<div class="cp-stat" style="margin:6px 0 2px;">Открытые копии</div><table class="cp-log"><tr><th>рынок</th><th>исход</th><th>цена</th><th>uPnL</th></tr>${open}</table>`:''}
     ${log?`<div class="cp-stat" style="margin:8px 0 2px;">Последние закрытия</div><table class="cp-log"><tr><th>время</th><th>рынок</th><th>цена</th><th>как</th><th>PnL</th></tr>${log}</table>`:'<div class="cp-stat" style="margin-top:6px;">нет закрытых копий</div>'}
   </div>`;
@@ -1513,8 +1513,8 @@ function renderCopy(copy){
         </div>
       </div>
       <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:10px;padding:8px 12px;background:rgba(43,196,212,.06);border-radius:8px;">
-        <div><span style="font-size:9px;color:var(--tx3);text-transform:uppercase;letter-spacing:.05em;">Итог demo на дистанции</span><br><b style="font-size:18px;color:${netCol};">${net>=0?'+':''}$${net.toFixed(2)}</b></div>
-        <div style="font-size:11px;color:var(--tx3);">WR <b style="color:var(--tx);">${wr}%</b> · сделок <b style="color:var(--tx);">${w.demo.trades||0}</b> · откр. ${w.demo.openCount||0}</div>
+        <div><span style="font-size:9px;color:var(--tx3);text-transform:uppercase;letter-spacing:.05em;">Итог demo (реализ.+открытые)</span><br><b style="font-size:18px;color:${netCol};">${net>=0?'+':''}$${net.toFixed(2)}</b></div>
+        <div style="font-size:11px;color:var(--tx3);line-height:1.5;">реализовано <b style="color:${(w.demo.realizedPnl||0)>=0?'var(--up)':'var(--dn)'};">${(w.demo.realizedPnl||0)>=0?'+':''}$${(w.demo.realizedPnl||0).toFixed(2)}</b> · в открытых <b style="color:var(--tx);">$${(w.demo.openCost||0).toFixed(0)}</b> под риском (${w.demo.openCount||0})<br>WR <b style="color:var(--tx);">${wr}%</b> · закрыто <b style="color:var(--tx);">${w.demo.trades||0}</b></div>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
         ${_cpAcctPanel(w,w.demo,'demo')}
