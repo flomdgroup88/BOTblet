@@ -452,11 +452,11 @@ table.log tr:hover td { background: var(--bg3); }
   </div>
 </div>
 
-<!-- MAIN GRID -->
-<div class="grid">
+<!-- MAIN GRID (скрыт — сигналы и суммарный PNL убраны по запросу) -->
+<div class="grid" style="display:none;">
 
-  <!-- SIGNAL -->
-  <div class="panel signal-box" id="signal-panel">
+  <!-- SIGNAL (скрыт по запросу — бот сигналы получает, но не показывает) -->
+  <div class="panel signal-box" id="signal-panel" style="display:none;">
     <div class="lbl">Основной сигнал</div>
     <div id="sig-dir">ЖДУ</div>
     <div id="sig-conf">уверенность: —</div>
@@ -466,8 +466,8 @@ table.log tr:hover td { background: var(--bg3); }
     </div>
   </div>
 
-  <!-- SIGNALS BREAKDOWN -->
-  <div class="panel">
+  <!-- SIGNALS BREAKDOWN (скрыт по запросу) -->
+  <div class="panel" style="display:none;">
     <div class="lbl">Сигналы моделей</div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;">
       <div>
@@ -509,7 +509,7 @@ table.log tr:hover td { background: var(--bg3); }
         <div class="lbl">Суммарный баланс</div>
         <div id="total-bal" class="num-lg">$4000.00</div>
       </div>
-      <div>
+      <div style="display:none;">
         <div class="lbl">Суммарный P&L</div>
         <div id="total-pnl" class="num-lg">$0.00</div>
       </div>
@@ -545,8 +545,23 @@ table.log tr:hover td { background: var(--bg3); }
   <span id="real-usdc-bal" style="font-size:10px;color:var(--tx2);">—</span>
 </div>
 
+<!-- TAB BAR -->
+<div id="tabbar" style="display:flex;border-bottom:2px solid var(--bd);background:var(--bg);position:sticky;top:0;z-index:50;">
+  <button class="tabbtn on" data-tabbtn="5m"       onclick="showTab('5m')">5 минут</button>
+  <button class="tabbtn"    data-tabbtn="15m"      onclick="showTab('15m')">15 минут</button>
+  <button class="tabbtn"    data-tabbtn="copy"     onclick="showTab('copy')">🐋 Копитрейдинг</button>
+  <button class="tabbtn"    data-tabbtn="settings" onclick="showTab('settings')">⚙️ Настройки</button>
+</div>
+<style>
+.tabbtn{flex:1;padding:11px 8px;font-size:12px;font-weight:600;letter-spacing:.03em;background:transparent;border:none;border-bottom:2px solid transparent;color:var(--tx3);cursor:pointer;font-family:inherit;transition:all .15s;margin-bottom:-2px;}
+.tabbtn:hover{color:var(--tx2);background:var(--bg2);}
+.tabbtn.on{color:var(--up);border-bottom-color:var(--up);background:var(--bg2);}
+.tab-panel{display:none;}
+.tab-panel.on{display:block;}
+</style>
+
 <!-- STRATEGY CARDS -->
-<div id="strat-section">
+<div id="strat-section" class="tab-panel on" data-tab="5m">
   <div onclick="toggleStratGrid()" id="strat-header" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:8px 14px;background:var(--bg);border-top:1px solid var(--bd);border-bottom:1px solid var(--bd);user-select:none;">
     <div style="display:flex;align-items:center;gap:8px;">
       <span style="font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--tx2);text-transform:uppercase;">Стратегии</span>
@@ -570,8 +585,20 @@ table.log tr:hover td { background: var(--bg3); }
 </div>
 <style>.sort-btn.on{border-color:rgba(0,232,122,.6)!important;color:var(--up)!important;}</style>
 
+<!-- 15-МИНУТНАЯ ДОРОЖКА -->
+<div class="tab-panel" data-tab="15m" id="track15-section">
+  <div style="padding:10px 14px;border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+    <span style="font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--tx2);text-transform:uppercase;">15-мин дорожка · демо-обкатка</span>
+    <span id="t15-status" style="font-size:10px;color:var(--tx3);">—</span>
+    <span style="font-size:10px;color:var(--tx3);">UP <b id="t15-up" style="color:var(--up);">—¢</b> · DN <b id="t15-dn" style="color:var(--dn);">—¢</b> · до конца <b id="t15-timer">—</b></span>
+    <button onclick="resetAll15()" style="font-size:9px;padding:2px 9px;border:1px solid rgba(224,85,106,.45);background:transparent;color:#e0556a;border-radius:4px;cursor:pointer;font-family:inherit;margin-left:auto;">↺ сброс демо 15м</button>
+  </div>
+  <div class="strat-grid" id="track15-grid"><!-- injected by JS --></div>
+  <div style="font-size:10px;color:var(--tx3);padding:10px 14px;line-height:1.5;">Демо-симуляция на реальных ценах 15-мин рынка Polymarket. Позиции закрываются по <b>фактическому исходу окна</b> — сравнивай с кошельком. Реальные ордера здесь не ставятся (обкатка).</div>
+</div>
+
 <!-- 🐋 КОПИТРЕЙДИНГ POLYMARKET (отдельная фича, не зависит от BTC) -->
-<div id="copy-section" style="background:linear-gradient(180deg,rgba(43,196,212,.05),transparent 120px);border-top:2px solid rgba(43,196,212,.45);">
+<div id="copy-section" class="tab-panel" data-tab="copy" style="background:linear-gradient(180deg,rgba(43,196,212,.05),transparent 120px);border-top:2px solid rgba(43,196,212,.45);">
   <div onclick="toggleCopySection()" id="copy-header" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:9px 14px;border-bottom:1px solid rgba(43,196,212,.25);user-select:none;">
     <div style="display:flex;align-items:center;gap:8px;">
       <span style="font-size:11px;font-weight:700;letter-spacing:.08em;color:#2bc4d4;text-transform:uppercase;">🐋 Копитрейдинг Polymarket</span>
@@ -624,7 +651,7 @@ table.log tr:hover td { background: var(--bg3); }
 
 
 <!-- ⚙️ НАСТРОЙКИ СТРАТЕГИИ + ИНВЕРСИЯ -->
-<div style="background:var(--bg);border-top:1px solid var(--bd);">
+<div class="tab-panel" data-tab="settings" style="background:var(--bg);border-top:1px solid var(--bd);">
   <div onclick="toggleCfgSection()" id="cfg-header" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:8px 14px;border-bottom:1px solid var(--bd);user-select:none;">
     <div style="display:flex;align-items:center;gap:8px;">
       <span style="font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--tx2);text-transform:uppercase;">⚙️ Настройки — параметры входа и режим торговли</span>
@@ -940,6 +967,7 @@ function updateAll(d) {
 
   // Copytrading
   if (typeof renderCopy === 'function') renderCopy(d.copy);
+  if (typeof render15 === 'function') render15(d.track15);
 
   // Combined log
   updateLog(d.journal, d.strats);
@@ -1351,19 +1379,24 @@ function updateStratCards(strats, polyData, realTrading) {
     // Combined position badge in card header
     const posB = $('spos-' + id);
     const card = $('scard-' + id);
-    // ── Реальная сделка открыта → карточка всплывает наверх + живой ценник ──
-    if (s.real.open) {
-      const o = s.real.open;
-      const cur = (o.side === 'UP' ? polyData.up : polyData.down);   // текущая цена шэра нашей стороны
-      const entry = o.polyEntryPrice;
-      let read = `<span class="pos-badge pos-${o.side.toLowerCase()}">${o.side}</span>`;
-      if (cur != null && entry) {
-        const pct = ((cur / entry - 1) * 100);
-        const pcol = pct >= 0 ? 'var(--up)' : 'var(--dn)';
-        read += ` <span class="live-readout">${Math.round(entry*100)}¢ → ${Math.round(cur*100)}¢ <span style="color:${pcol}">(${pct>=0?'+':''}${pct.toFixed(0)}%)</span></span>`;
-      }
-      posB.innerHTML = read;
+    // ── Стратегия с включённым REAL → карточка ВСЕГДА закреплена наверху ──
+    if (s.realEnabled) {
       if (card) { card.style.order = '-2'; card.classList.add('real-live-card'); }
+      if (s.real.open) {
+        const o = s.real.open;
+        const cur = (o.side === 'UP' ? polyData.up : polyData.down);   // текущая цена шэра нашей стороны
+        const entry = o.polyEntryPrice;
+        let read = `<span class="pos-badge pos-${o.side.toLowerCase()}">${o.side}</span>`;
+        if (cur != null && entry) {
+          const pct = ((cur / entry - 1) * 100);
+          const pcol = pct >= 0 ? 'var(--up)' : 'var(--dn)';
+          read += ` <span class="live-readout">${Math.round(entry*100)}¢ → ${Math.round(cur*100)}¢ <span style="color:${pcol}">(${pct>=0?'+':''}${pct.toFixed(0)}%)</span></span>`;
+        }
+        posB.innerHTML = read;
+      } else {
+        const anyOpen = s.demo.open;
+        posB.innerHTML = anyOpen ? `<span class="pos-badge pos-${anyOpen.side.toLowerCase()}">${anyOpen.side}</span>` : '';
+      }
     } else {
       if (card) { card.style.order = ''; card.classList.remove('real-live-card'); }
       const anyOpen = s.demo.open;
@@ -1423,6 +1456,60 @@ function _applyStratSort(strats) {
       if (card && !card.classList.contains('real-live-card')) card.style.order = String(i + 1);
     });
 }
+
+// ── ВКЛАДКИ ──────────────────────────────────────────────────────────────────
+function showTab(name){
+  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.toggle('on', p.dataset.tab===name));
+  document.querySelectorAll('.tabbtn').forEach(b=>b.classList.toggle('on', b.dataset.tabbtn===name));
+  try{ localStorage.setItem('activeTab', name); }catch(e){}
+}
+(function(){ try{ const t=localStorage.getItem('activeTab'); if(t && t!=='5m') showTab(t); }catch(e){} })();
+
+// ── 15-МИНУТНАЯ ДОРОЖКА — UI ─────────────────────────────────────────────────
+function _t15Timer(ms){ const m=Math.floor(ms/60000), s=Math.floor((ms%60000)/1000); return m+':'+String(s).padStart(2,'0'); }
+function render15(t15){
+  if(!t15) return;
+  const st=t15.poly||{};
+  const setT=(id,v)=>{const e=document.getElementById(id); if(e) e.textContent=v;};
+  setT('t15-status', st.status==='live'?'🟢 live':(st.status==='fail'?('⚠️ '+(st.lastErr||'fail')):(st.status||'—')));
+  setT('t15-up', st.up!=null?Math.round(st.up*100)+'¢':'—¢');
+  setT('t15-dn', st.down!=null?Math.round(st.down*100)+'¢':'—¢');
+  setT('t15-timer', st.msToEnd!=null?_t15Timer(st.msToEnd):'—');
+  const grid=document.getElementById('track15-grid'); if(!grid||!t15.strats) return;
+  let html='';
+  for(const id of Object.keys(t15.strats)){
+    const s=t15.strats[id], d=s.demo||{}, r=s.real||{};
+    const pnl=d.pnl||0, wr=d.trades?Math.round(100*d.wins/d.trades):0;
+    const rpnl=r.pnl||0, rwr=r.trades?Math.round(100*r.wins/r.trades):0;
+    const open=d.open?`<span class="pos-badge pos-${d.open.side.toLowerCase()}">${d.open.side} @${Math.round((d.open.polyEntryPrice||0)*100)}¢</span>`:'<span style="font-size:10px;color:var(--tx3)">нет позиции (демо)</span>';
+    const ropen=r.open?` · <span class="pos-badge pos-${r.open.side.toLowerCase()}">РЕАЛ ${r.open.side} @${Math.round((r.open.polyEntryPrice||0)*100)}¢</span>`:'';
+    const last=(d.lastTrades||[]).map(t=>`<tr><td style="color:var(--tx3);padding:2px 4px;">${new Date(t.closeTime).toLocaleTimeString('ru')}</td><td style="color:${t.side==='UP'?'var(--up)':'var(--dn)'}">${t.side}</td><td>${Math.round((t.polyEntryPrice||0)*100)}→${Math.round((t.polyExitPrice||0)*100)}¢</td><td style="color:var(--tx3)">${t.reason}</td><td style="color:${t.pnl>=0?'var(--up)':'var(--dn)'};text-align:right;">${t.pnl>=0?'+':''}$${(t.pnl||0).toFixed(2)}</td></tr>`).join('');
+    const showReal = s.realEnabled || (r.trades||0)>0;
+    const realRow = `<div style="padding:6px 12px;border-top:1px solid var(--bd);display:flex;align-items:center;gap:10px;background:${s.realEnabled?'rgba(224,85,106,.06)':'transparent'};">
+        <button onclick="toggle15real('${id}')" class="toggle-btn ${s.realEnabled?'on':'off'}" style="flex-shrink:0;border-color:rgba(224,85,106,.5);">${s.realEnabled?'◈ РЕАЛ ON':'◈ РЕАЛ OFF'}</button>
+        ${showReal?`<span style="font-size:11px;">P&L (оценка): <b style="color:${rpnl>=0?'var(--up)':'var(--dn)'}">${rpnl>=0?'+':''}$${rpnl.toFixed(2)}</b></span><span style="font-size:11px;color:var(--tx3);">${r.trades||0} сд / ${rwr}%</span>${ropen}`:'<span style="font-size:10px;color:var(--tx3);">реал выкл</span>'}
+      </div>
+      ${s.realEnabled?'<div style="font-size:9px;color:var(--warn);padding:0 12px 6px;">⚠️ P&L реала — оценка по цене сигнала; факт смотри в кошельке Polymarket. Ордер пойдёт только при балансе выше пола.</div>':''}`;
+    html+=`<div class="panel" style="padding:0;">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--bd);gap:8px;">
+        <div style="font-size:11px;font-weight:600;color:var(--tx);">${s.name}</div>
+        <button onclick="toggle15('${id}')" class="toggle-btn ${s.demoEnabled?'on':'off'}" style="flex-shrink:0;">${s.demoEnabled?'демо ON':'демо OFF'}</button>
+      </div>
+      <div style="padding:8px 12px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+        <div><div class="lbl" style="margin:0;">Баланс (демо)</div><div style="font-size:13px;">$${(d.balance||0).toFixed(2)}</div></div>
+        <div><div class="lbl" style="margin:0;">P&L (демо)</div><div style="font-size:13px;color:${pnl>=0?'var(--up)':'var(--dn)'}">${pnl>=0?'+':''}$${pnl.toFixed(2)}</div></div>
+        <div><div class="lbl" style="margin:0;">Сделок / WR</div><div style="font-size:13px;">${d.trades||0} / ${wr}%</div></div>
+      </div>
+      <div style="padding:0 12px 6px;">${open}${ropen}</div>
+      ${last?`<table style="width:100%;font-size:10px;border-collapse:collapse;border-top:1px solid var(--bd);"><tbody>${last}</tbody></table>`:''}
+      ${realRow}
+    </div>`;
+  }
+  grid.innerHTML=html;
+}
+async function toggle15(id){ try{ const r=await fetch(`/api/strat15/${id}/toggle`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); const j=await r.json(); if(j.track15) render15(j.track15); }catch(e){} }
+async function toggle15real(id){ if(!confirm('Включить РЕАЛ для этой 15-мин стратегии? Будет ставить реальные ордера на Polymarket (только при балансе выше пола).'))return; try{ const r=await fetch(`/api/strat15/${id}/toggle`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account:'real'})}); const j=await r.json(); if(j.track15) render15(j.track15); }catch(e){} }
+async function resetAll15(){ if(!confirm('Сбросить демо-результаты 15-минутки? Балансы → $1000, журнал общий сохранится.'))return; try{ const r=await fetch('/api/strat15/reset-all',{method:'POST'}); const j=await r.json(); if(j.track15) render15(j.track15); }catch(e){} }
 
 // ── КОПИТРЕЙДИНГ — UI ────────────────────────────────────────────────────────
 let COPY_LIVE = false;

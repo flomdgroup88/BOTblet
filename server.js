@@ -243,6 +243,13 @@ function saveState() {
       })),
     };
     out.__journal = tradeJournal.slice(-TRADE_JOURNAL_MAX);
+    out.__track15 = {};
+    for (const id in STRATEGIES_15) {
+      const s = STRATEGIES_15[id];
+      out.__track15[id] = { demoEnabled: s.demoEnabled, realEnabled: s.realEnabled,
+        demo: { balance: s.demo.balance, open: s.demo.open, log: s.demo.log.slice(-500) },
+        real: { balance: s.real.balance, open: s.real.open, log: s.real.log.slice(-500) } };
+    }
     fs.writeFileSync(STATE_FILE, JSON.stringify(out, null, 2));
   } catch (e) { console.error('[state] save error:', e.message); }
 }
@@ -332,6 +339,16 @@ function loadState() {
       })).slice(0, COPY_MAX_WALLETS);
     }
     if (Array.isArray(stored.__journal)) tradeJournal = stored.__journal.slice(-TRADE_JOURNAL_MAX);
+    if (stored.__track15) {
+      for (const id in STRATEGIES_15) {
+        const st = stored.__track15[id]; if (!st) continue;
+        const s = STRATEGIES_15[id];
+        s.demoEnabled = st.demoEnabled ?? false;
+        s.realEnabled = st.realEnabled ?? false;
+        if (st.demo) { s.demo.balance = st.demo.balance ?? 1000; s.demo.open = st.demo.open ?? null; s.demo.log = st.demo.log ?? []; }
+        if (st.real) { s.real.balance = st.real.balance ?? 1000; s.real.open = st.real.open ?? null; s.real.log = st.real.log ?? []; }
+      }
+    }
     console.log('[state] loaded');
   } catch (e) { console.error('[state] load error:', e.message); }
 }
@@ -784,8 +801,305 @@ async function fetchPolyMarket() {
   }
 }
 
-// ─── CHAINLINK ───────────────────────────────────────────────────────────────
-// Cache one provider per RPC so we don't re-detect network on every call.
+// ═══════════════════════════════════════════════════════════════════════════
+// 15-МИНУТНАЯ ДОРОЖКА — полностью ИЗОЛИРОВАНА от 5-мин реал-движка ──────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Свой рынок Polymarket (btc-updown-15m, окно 900с), свои стратегии, свой ДЕМО-
+// симулятор. Реальные ордера тут НЕ ставятся (демо-обкатка). Позиции закрываются
+// по ФАКТИЧЕСКОМУ исходу окна Polymarket — чтобы сравнивать с реальным кошельком.
+const POLY_WINDOW_SEC_15 = 900;
+const POLY_INTERVAL_15   = process.env.POLY_INTERVAL_15 || 'btc-updown-15m';
+let   poly15 = { market: null, prices: { up: null, down: null, ts: 0 }, windowOpeningBTC: null,
+                 windowOpeningSource: null, winHist: [], winHi: null, winLo: null, status: 'init', lastErr: null, clobOk: true };
+let   STRATEGIES_15  = {};
+const winnerBySlug15 = {};
+
+function currentPolyWindow15() {
+  const now   = Math.floor(Date.now() / 1000);
+  const start = now - (now % POLY_WINDOW_SEC_15);
+  return { slug: `${POLY_INTERVAL_15}-${start}`, startTs: start * 1000, endTs: (start + POLY_WINDOW_SEC_15) * 1000 };
+}
+
+// Опрос 15-мин рынка (зеркало fetchPolyMarket, но на poly15). Переиспользует
+// fetchPolyEvent / parseEventMarket / fetchClobMidpoint.
+async function fetchPolyMarket15() {
+  const win = currentPolyWindow15();
+  const slugChanged = !poly15.market || poly15.market.eventSlug !== win.slug;
+  let gammaUp = null, gammaDn = null;
+  if (slugChanged) {
+    poly15.status = 'searching'; poly15.clobOk = true;
+    // зафиксировать завершённое окно (победитель по последней цене книги ≥98¢)
+    try {
+      if (poly15.market && poly15.prices.up != null && poly15.prices.down != null) {
+        const u = poly15.prices.up, d = poly15.prices.down;
+        if (Math.max(u, d) >= RESOLVE_CONFIRM && Math.min(u, d) <= (1 - RESOLVE_CONFIRM)) {
+          const curBTC = chain.currentPrice || (ticks.length ? ticks[ticks.length - 1].price : null);
+          const move = (curBTC != null && poly15.windowOpeningBTC != null) ? (curBTC - poly15.windowOpeningBTC) : 0;
+          poly15.winHist.push({ slug: poly15.market.eventSlug, winner: u > d ? 'UP' : 'DOWN', move: +move.toFixed(2) });
+          if (poly15.winHist.length > WINHIST_MAX) poly15.winHist.shift();
+          winnerBySlug15[poly15.market.eventSlug] = u > d ? 'UP' : 'DOWN';
+          const wk = Object.keys(winnerBySlug15); if (wk.length > 200) delete winnerBySlug15[wk[0]];
+        }
+      }
+    } catch (_) {}
+    poly15.winHi = null; poly15.winLo = null;
+    try {
+      const ev = await fetchPolyEvent(win.slug);
+      const parsed = parseEventMarket(ev);
+      const endTs  = parsed.endDate ? new Date(parsed.endDate).getTime() : win.endTs;
+      poly15.market = { ...parsed, endDate: new Date(endTs).toISOString(), windowEnd: endTs, windowStart: win.startTs };
+      gammaUp = parsed.outcomePriceUp; gammaDn = parsed.outcomePriceDown;
+      poly15.status = 'live'; poly15.lastErr = null;
+      poly15.windowOpeningBTC = chain.currentPrice || (ticks.length ? ticks[ticks.length - 1].price : null);
+      poly15.windowOpeningSource = chain.currentPrice ? 'chainlink' : 'coinbase-ws';
+      console.log(`[poly15] new window: ${win.slug}`);
+    } catch (e) { poly15.status = 'fail'; poly15.lastErr = e.message; console.error('[poly15] event fetch error:', e.message); return; }
+  }
+  let up = null, dn = null;
+  if (poly15.clobOk && poly15.market) {
+    try {
+      const [u, d] = await Promise.all([fetchClobMidpoint(poly15.market.tokenIdUp), fetchClobMidpoint(poly15.market.tokenIdDown)]);
+      up = u; dn = d;
+    } catch (e) { poly15.clobOk = false; up = gammaUp; dn = gammaDn; }
+  } else { up = gammaUp; dn = gammaDn; }
+  if (up != null && dn != null) {
+    if (poly15.winHi == null || up > poly15.winHi) poly15.winHi = up;
+    if (poly15.winLo == null || up < poly15.winLo) poly15.winLo = up;
+    poly15.prices = { up, down: dn, ts: Date.now() };
+  }
+}
+
+function getStratContext15() {
+  const win    = currentPolyWindow15();
+  const curBTC = chain.currentPrice || (ticks.length ? ticks[ticks.length - 1].price : null);
+  return {
+    win,
+    msToEnd:    Math.max(0, win.endTs - Date.now()),
+    polyUp:     poly15.prices.up,
+    polyDn:     poly15.prices.down,
+    curBTC,
+    btcAgeMs:   (chain.lastUpdate != null) ? (Date.now() - chain.lastUpdate) : null,
+    openingBTC: poly15.windowOpeningBTC,
+  };
+}
+
+// ── 15-мин СТРАТЕГИИ (победители из логов + momentum для сравнения) ───────────
+const STRAT15_FAV_HOLD = {
+  id: 'favHold', name: 'Favorite Hold (70-92¢, до резолва)',
+  desc: 'Бэк фаворита 70–92¢ под закрытие окна, держим до резолва без SL. Плюсовая на логах 15-мин (88% WR, PF 2.0).',
+  defaults: { favLo: 0.70, favHi: 0.92, lateMs: 360000, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd > p.lateMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const side = np.up >= np.dn ? 'UP' : 'DOWN';
+    const price = Math.max(np.up, np.dn);
+    if (price < p.favLo || price > p.favHi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.03, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `favHold ${side} @${(price * 100).toFixed(0)}¢` };
+  },
+  shouldExit() { return null; },
+};
+const STRAT15_FAV_HOLD_X = {
+  id: 'favHoldX', name: 'Favorite Hold X (88-96¢, до резолва)',
+  desc: 'Бэк сильного фаворита 88–96¢ под закрытие, до резолва. На логах 15-мин: 98% WR, PF 4.4 (хвостовой риск).',
+  defaults: { favLo: 0.88, favHi: 0.96, lateMs: 360000, maxPerWindow: 1, kellyFrac: 0.08, maxFrac: 0.04 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd > p.lateMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const side = np.up >= np.dn ? 'UP' : 'DOWN';
+    const price = Math.max(np.up, np.dn);
+    if (price < p.favLo || price > p.favHi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.02, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `favHoldX ${side} @${(price * 100).toFixed(0)}¢` };
+  },
+  shouldExit() { return null; },
+};
+const STRAT15_QUIET_GRIND = {
+  id: 'quietGrind', name: 'Quiet Grind (фаворит 62-81¢, TP/SL) · реконстр.',
+  desc: 'РЕКОНСТРУКЦИЯ quietGrind (точного кода нет): фаворит 62–81¢ в середине окна, абс. TP 0.92 / SL 0.45. На логах 15-мин: 75% WR, +$212. Пороги в defaults.',
+  defaults: { lo: 0.62, hi: 0.81, minTimeMs: 120000, lateMs: 720000, tpAbs: 0.92, slAbs: 0.45, maxBtcAgeMs: 5000, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs || ctx.msToEnd > p.lateMs) return null;
+    if (p.maxBtcAgeMs && ctx.btcAgeMs != null && ctx.btcAgeMs > p.maxBtcAgeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const side = np.up >= np.dn ? 'UP' : 'DOWN';
+    const price = Math.max(np.up, np.dn);
+    if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.05, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `quietGrind ${side} @${(price * 100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) {
+    const cur = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (cur == null) return null;
+    if (p.tpAbs && cur >= p.tpAbs) return { reason: 'TP', exitPrice: cur };
+    if (p.slAbs && cur <= p.slAbs) return { reason: 'SL', exitPrice: cur };
+    return null;
+  },
+};
+const STRAT15_MOMENTUM = {
+  id: 'momentum15', name: 'Momentum 15м (фаворит по BTC, TP/SL)',
+  desc: 'Для сравнения: фаворит по факту движения BTC, движение в сторону ≥$30, абс. TP 0.90 / SL 0.40.',
+  defaults: { btcMoveMin: 30, lo: 0.50, hi: 0.85, minTimeMs: 120000, lateMs: 780000, tpAbs: 0.90, slAbs: 0.40, maxBtcAgeMs: 5000, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeMs || ctx.msToEnd > p.lateMs) return null;
+    if (p.maxBtcAgeMs && ctx.btcAgeMs != null && ctx.btcAgeMs > p.maxBtcAgeMs) return null;
+    if (ctx.curBTC == null || ctx.openingBTC == null) return null;
+    const delta = ctx.curBTC - ctx.openingBTC;
+    const side = delta > 0 ? 'UP' : (delta < 0 ? 'DOWN' : null);
+    if (!side) return null;
+    const moveToward = side === 'UP' ? delta : -delta;
+    if (moveToward < p.btcMoveMin) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const price = side === 'UP' ? np.up : np.dn;
+    if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.05, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `mom15 ${side} @${(price * 100).toFixed(0)}¢ Δ$${moveToward.toFixed(0)}` };
+  },
+  shouldExit(ctx, pos, p) {
+    const cur = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (cur == null) return null;
+    if (p.tpAbs && cur >= p.tpAbs) return { reason: 'TP', exitPrice: cur };
+    if (p.slAbs && cur <= p.slAbs) return { reason: 'SL', exitPrice: cur };
+    return null;
+  },
+};
+const STRAT_DEFINITIONS_15 = [STRAT15_FAV_HOLD, STRAT15_FAV_HOLD_X, STRAT15_QUIET_GRIND, STRAT15_MOMENTUM];
+
+function initStrategies15() {
+  for (const def of STRAT_DEFINITIONS_15) {
+    STRATEGIES_15[def.id] = {
+      def, demoEnabled: false, realEnabled: false,
+      params: { ...def.defaults },
+      demo: { balance: 1000, peakBalance: 1000, open: null, log: [] },
+      real: { balance: 1000, peakBalance: 1000, open: null, log: [] },
+    };
+  }
+}
+
+// ── 15-мин ДЕМО-симулятор: вход по сигналу, выход по правилу, settle по ИСХОДУ окна ──
+function _curPrice15(ctx, side) { return side === 'UP' ? ctx.polyUp : ctx.polyDn; }
+
+// Реальный ордер на 15-мин рынке — изолировано, тем же низкоуровневым placeClobOrder,
+// что и 5-минутка. Возвращает true ТОЛЬКО если ордер реально отправлен (иначе реал-учёт
+// не ведём — чтобы не повторить фейковый P&L копитрейдинга).
+async function _try15RealOrder(side, fill, usd) {
+  if (!REAL_TRADING || !polyWallet || !polyApiCreds || isSim || !polyClob) return false;
+  if (!poly15.market) return false;
+  const tokenId = fill.side === 'UP' ? poly15.market.tokenIdUp : poly15.market.tokenIdDown;
+  if (!tokenId) return false;
+  if (side === 'BUY' && realBalance !== null && (realBalance - (usd || 0)) < REAL_MIN_BALANCE) {
+    console.log(`[real15] SKIP buy — пол: $${realBalance.toFixed(2)} − $${(usd || 0).toFixed(2)} < $${REAL_MIN_BALANCE.toFixed(2)}`);
+    return false;
+  }
+  try {
+    const px = side === 'BUY' ? Math.min(0.99, fill.polyPrice + 0.02) : Math.max(0.01, fill.polyPrice - 0.02);
+    await placeClobOrder({ tokenId, side, size: side === 'BUY' ? usd : fill.shares, price: px, orderType: 'GTC' });
+    console.log(`[real15] ${side} ${fill.side} ${side === 'BUY' ? ('$' + (usd || 0).toFixed(2)) : ((fill.shares || 0).toFixed(2) + 'sh')} @~${px.toFixed(2)} OK`);
+    return true;
+  } catch (e) { console.error('[real15] order error:', e.message); return false; }
+}
+
+async function _open15(s, acct, ctx, entry, slug, isReal) {
+  const sizeBal = (isReal && realBalance !== null) ? realBalance : acct.balance;
+  let size = sizingByKelly(sizeBal, entry.ourProb, entry.polyPrice, s.params.kellyFrac, s.params.maxFrac);
+  if (s.params.fixedSizeUSD > 0) size = s.params.fixedSizeUSD;
+  if (size < 1) return;
+  if (!isReal && size > acct.balance) return;
+  const shares = size / entry.polyPrice;
+  if (isReal) {
+    const placed = await _try15RealOrder('BUY', { side: entry.side, polyPrice: entry.polyPrice, shares }, size);
+    if (!placed) return;                 // реал-позицию пишем ТОЛЬКО при реально отправленном ордере
+  } else {
+    acct.balance -= size;
+  }
+  acct.open = { side: entry.side, polyEntryPrice: entry.polyPrice, sizeUSDC: size, shares,
+    openTime: Date.now(), slug, openingBTC: ctx.openingBTC, lastPrice: entry.polyPrice, info: entry.info, isReal };
+}
+
+async function _close15(s, acct, exitPrice, reason, isReal) {
+  const o = acct.open; if (!o) return;
+  const px = (exitPrice == null || !isFinite(exitPrice)) ? o.lastPrice : exitPrice;
+  const isSettle = (reason === 'SETTLE' || reason === 'SETTLE?');
+  if (isReal && !isSettle) {
+    // досрочный выход на реале — продаём шэры; не удалось → НЕ закрываем (без фейка)
+    const placed = await _try15RealOrder('SELL', { side: o.side, polyPrice: px, shares: o.shares }, 0);
+    if (!placed) return;
+  }
+  // при SETTLE реал-позиция резолвится/реземится на ончейне — отдельный ордер не нужен
+  const proceeds = o.shares * px;
+  const pnl = proceeds - o.sizeUSDC;
+  if (!isReal) acct.balance += proceeds;   // на реале деньги в кошельке; в логе — оценка
+  acct.log.push({ side: o.side, polyEntryPrice: o.polyEntryPrice, polyExitPrice: px, sizeUSDC: o.sizeUSDC,
+    btc_open: o.openingBTC, pnl, won: pnl > 0, reason, openTime: o.openTime, closeTime: Date.now(), isReal });
+  if (acct.log.length > 500) acct.log = acct.log.slice(-500);
+  tradeJournal.push({ mode: isReal ? 'real' : 'demo', strategy: '15m:' + s.def.id, side: o.side,
+    polyEntryPrice: o.polyEntryPrice, polyExitPrice: px, sizeUSDC: o.sizeUSDC, pnl, reason, closeTime: Date.now() });
+  if (tradeJournal.length > TRADE_JOURNAL_MAX) tradeJournal.shift();
+  acct.open = null;
+}
+
+async function _settle15(s, acct, isReal) {
+  const o = acct.open; if (!o) return;
+  const winner = winnerBySlug15[o.slug];
+  let px;
+  if (winner === 'UP' || winner === 'DOWN') px = (winner === o.side) ? 1 : 0;   // фактический исход окна
+  else px = (o.lastPrice != null ? o.lastPrice : o.polyEntryPrice);             // окно не дорезолвилось — по последней цене
+  await _close15(s, acct, px, winner ? 'SETTLE' : 'SETTLE?', isReal);
+}
+
+async function _run15Account(s, acct, ctx, curSlug, isReal) {
+  if (acct.open) {
+    if (acct.open.slug !== curSlug) { await _settle15(s, acct, isReal); }
+    else {
+      const lp = _curPrice15(ctx, acct.open.side);
+      if (lp != null) acct.open.lastPrice = lp;
+      const ex = s.def.shouldExit(ctx, { side: acct.open.side, polyEntryPrice: acct.open.polyEntryPrice, entryBTC: acct.open.openingBTC, openTime: acct.open.openTime }, s.params);
+      if (ex) await _close15(s, acct, ex.exitPrice, ex.reason, isReal);
+    }
+  }
+  if (!acct.open && ctx.polyUp != null && ctx.polyDn != null) {
+    const entry = s.def.shouldEnter(ctx, s.params);
+    if (entry && entry.polyPrice != null) await _open15(s, acct, ctx, entry, curSlug, isReal);
+  }
+}
+
+let _p15Busy = false;   // защита от наложения асинхронных проходов (реал-ордера могут идти >1с)
+async function processStrategies15() {
+  if (_p15Busy) return;
+  _p15Busy = true;
+  try {
+    const ctx = getStratContext15();
+    const curSlug = ctx.win.slug;
+    for (const id in STRATEGIES_15) {
+      const s = STRATEGIES_15[id];
+      try {
+        if (s.demoEnabled) await _run15Account(s, s.demo, ctx, curSlug, false);
+        if (s.realEnabled) await _run15Account(s, s.real, ctx, curSlug, true);
+      } catch (e) { /* пер-стратегия — не валим цикл */ }
+    }
+  } finally { _p15Busy = false; }
+}
+
+
+function snapshot15() {
+  const strats = {};
+  for (const id in STRATEGIES_15) {
+    const s = STRATEGIES_15[id];
+    strats[id] = {
+      id, name: s.def.name, desc: s.def.desc,
+      demoEnabled: s.demoEnabled, realEnabled: s.realEnabled,
+      demo: accountSummary(s.demo), real: accountSummary(s.real),
+      params: s.params,
+    };
+  }
+  const win = currentPolyWindow15();
+  return {
+    poly: { status: poly15.status, lastErr: poly15.lastErr, up: poly15.prices.up, down: poly15.prices.down,
+            opening: poly15.windowOpeningBTC, msToEnd: Math.max(0, win.endTs - Date.now()), slug: win.slug },
+    strats,
+  };
+}
+
 const _rpcProviders = new Map();
 function getRpcProvider(url) {
   if (!_rpcProviders.has(url)) {
@@ -3690,7 +4004,6 @@ function _ownStreakActive(stratId, skipAfter, resumeWins) {
 const STRAT_UDG_LEADER = {
   id: 'udgLeaderStreak', name: 'UDG-LEADER STREAK (64-72, 5луз/1вин · свои)',
   desc: 'Форвард-тест. Лидер 64–72¢, фаза 30–270с, движение BTC в сторону фаворита ≥$20. TP 0.99 / SL 0.35 (абс.). Стрик по СВОИМ demo-исходам: пауза после 5 лузов, возврат после 1 вина. DEMO-ONLY. Бектест: +$125@$2 со стриком vs −$103 без, p=0.34 (возможна подгонка).',
-  demoOnly: true,
   defaults: { lo: 0.64, hi: 0.72, phaseFromS: 30, phaseToS: 270, btcMoveMin: 20, btcMoveMax: 0,
               tpAbs: 0.99, slAbs: 0.35, skipN: 5, resumeN: 1, maxBtcAgeMs: 3000,
               maxPerWindow: 1, kellyFrac: 0.09, maxFrac: 0.05 },
@@ -3728,7 +4041,6 @@ const STRAT_UDG_LEADER = {
 const STRAT_UNDERDOG_DELTA_STREAK = {
   id: 'underdogDeltaStreak', name: 'UNDERDOG DELTA STREAK (3луз/2вин · свои)',
   desc: 'Копия UNDERDOG DELTA (дог 15–35¢ при |Δ|<$17, свежесть ≤3с, TP 0.96, без SL) + стрик по СВОИМ demo-исходам: пауза после 3 лузов подряд, возврат после 2 винов. DEMO-ONLY. Форвард-тест — проверяем, держится ли эдж стрика на новых данных.',
-  demoOnly: true,
   defaults: { ...STRAT_UNDERDOG_DELTA.defaults, skipN: 3, resumeN: 2 },
   shouldEnter(ctx, p) {
     if (!_ownStreakActive('underdogDeltaStreak', p.skipN, p.resumeN)) return null;
@@ -3774,7 +4086,78 @@ const STRAT_UDG_LEADER_PHASE = {
   },
 };
 
+// ── ПЕРЕНОС ЛУЧШИХ ПАТТЕРНОВ ИЗ ЛОГОВ (forward-test, DEMO-ONLY) ────────────────
+// 1) FAV-HOLD без SL — главный устойчивый сигнал (по логам udgFav: 64–75¢, 80% WR,
+//    +$701, 0% выходов по SL). Бэк фаворита, держим до резолва, только высокий TP.
+const STRAT_FAV_HOLD_NOSL = {
+  id: 'favHoldNoSL', name: 'FAV-HOLD (64-90¢, без SL, до резолва) · РЕАЛ',
+  desc: 'Бэк фаворита 64–90¢, держим до резолва, БЕЗ stop-loss (только высокий TP 0.97). Перенос лучшего паттерна из логов (udgFav: 80% WR, +$701). Лузеры выбивало SL — здесь его нет. Включена на РЕАЛ малым размером.',
+  realDefault: true, demoDefault: true,
+  defaults: { favLo: 0.64, favHi: 0.90, tpAbs: 0.97, maxBtcAgeMs: 4000, maxPerWindow: 1, kellyFrac: 0.10, maxFrac: 0.05 },
+  shouldEnter(ctx, p) {
+    if (p.maxBtcAgeMs && ctx.btcAgeMs != null && ctx.btcAgeMs > p.maxBtcAgeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const side = np.up >= np.dn ? 'UP' : 'DOWN';
+    const price = Math.max(np.up, np.dn);
+    if (price < p.favLo || price > p.favHi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.03, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `favHoldNoSL ${side} @${(price * 100).toFixed(0)}¢` };
+  },
+  shouldExit(ctx, pos, p) {
+    const cur = pos.side === 'UP' ? ctx.polyUp : ctx.polyDn;
+    if (cur == null) return null;
+    if (p.tpAbs && cur >= p.tpAbs) return { reason: 'TP', exitPrice: cur };
+    return null;                                                  // НЕТ SL — держим до резолва
+  },
+};
+
+// 2) FAV-HOLD X — сильный фаворит 88–96¢ до резолва (перенос favHoldX из 15-мин:
+//    98% WR, PF 4.44). Страховой профиль: много мелких побед, редкий крупный лосс.
+const STRAT_FAV_HOLD_X5 = {
+  id: 'favHoldX5', name: 'FAV-HOLD X (88-96¢, до резолва) · РЕАЛ',
+  desc: 'Бэк сильного фаворита 88–96¢, держим до резолва. Перенос favHoldX (15-мин: 98% WR, PF 4.44). Высокий WR, но хвостовой риск: один проигрыш съедает ~10 побед. Включена на РЕАЛ малым размером.',
+  realDefault: true, demoDefault: true,
+  defaults: { favLo: 0.88, favHi: 0.96, maxBtcAgeMs: 4000, maxPerWindow: 1, kellyFrac: 0.08, maxFrac: 0.04 },
+  shouldEnter(ctx, p) {
+    if (p.maxBtcAgeMs && ctx.btcAgeMs != null && ctx.btcAgeMs > p.maxBtcAgeMs) return null;
+    const np = _normPoly(ctx); if (!np) return null;
+    const side = np.up >= np.dn ? 'UP' : 'DOWN';
+    const price = Math.max(np.up, np.dn);
+    if (price < p.favLo || price > p.favHi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.02, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `favHoldX ${side} @${(price * 100).toFixed(0)}¢` };
+  },
+  shouldExit() { return null; },                                  // держим до резолва
+};
+
+// 3) UDG-VOL VALUE — РЕКОНСТРУКЦИЯ udgVol (точного кода НЕТ в присланных зипах).
+//    По логам: дешёвый дог 23–38¢, 47% WR, но +$4.89/сделку (асимметрия). Гипотеза
+//    фильтра — крупное движение BTC (волатильность). Это ДОГАДКА — крутить пороги.
+const STRAT_UDG_VOL_VALUE = {
+  id: 'udgVolValue', name: 'UDG-VOL VALUE (дог 22-40¢ при движении) · РЕАЛ',
+  desc: 'РЕКОНСТРУКЦИЯ udgVol (точного кода нет): дешёвый дог 22–40¢ при крупном движении BTC (≥$40) — асимметричная ставка. Держим до резолва, без SL. По логам источника: 47% WR, +$4.89/сделку. Реконструкция по фильтру — на РЕАЛ малым размером.',
+  realDefault: true, demoDefault: true,
+  defaults: { lo: 0.22, hi: 0.40, btcMoveMin: 40, minTimeLeftMs: 60000, maxBtcAgeMs: 4000, maxPerWindow: 1, kellyFrac: 0.06, maxFrac: 0.03 },
+  shouldEnter(ctx, p) {
+    if (ctx.msToEnd < p.minTimeLeftMs) return null;
+    if (p.maxBtcAgeMs && ctx.btcAgeMs != null && ctx.btcAgeMs > p.maxBtcAgeMs) return null;
+    if (ctx.curBTC == null || ctx.openingBTC == null) return null;
+    if (Math.abs(ctx.curBTC - ctx.openingBTC) < p.btcMoveMin) return null;   // нужна волатильность
+    const np = _normPoly(ctx); if (!np) return null;
+    const side = np.up <= np.dn ? 'UP' : 'DOWN';                  // дешёвая сторона
+    const price = Math.min(np.up, np.dn);
+    if (price < p.lo || price > p.hi || price < MIN_ENTRY_PRICE) return null;
+    const ourProb = _clampProb(price + 0.06, price);
+    return { side, polyPrice: price, ourProb, edge: ourProb - price, info: `udgVol ${side} @${(price * 100).toFixed(0)}¢` };
+  },
+  shouldExit() { return null; },                                  // держим до резолва
+};
+
 const STRAT_DEFINITIONS = [
+  // ── ПЕРЕНОС ЛУЧШИХ ПАТТЕРНОВ ИЗ ЛОГОВ (forward-test, DEMO-ONLY) ──────────────
+  // Анализ логов 5- и 15-мин ботов (12–15 июня): стабильно В ПЛЮС только «бэк
+  // фаворита, держим до резолва, БЕЗ stop-loss». Лузеры (momentum/momScratch)
+  // выбивало тайтовыми SL в пиле. Эти три — перенос победителей на 5-мин каркас.
   // ── ОСТАВЛЕНЫ ПО ЗАПРОСУ (13 стратегий со скринов) ──────────────────────────
   STRAT_UNDERDOG_HOLD,        // UNDERDOG HOLD (★опора)
   STRAT_MOMENTUM,             // MOMENTUM / TREND (★опора)  · фикс. вход $5
@@ -3794,6 +4177,10 @@ const STRAT_DEFINITIONS = [
   STRAT_UNDERDOG_DELTA_STREAK,// UNDERDOG DELTA STREAK (skip3/resume2, свои исходы)
   // ── НА РЕАЛ малым размером (форвард-тест на живых деньгах) ────────────────────
   STRAT_UDG_LEADER_PHASE,     // UDG-LEADER PHASE (64-72, фаза 90-210с) — realDefault
+  // ── ПЕРЕНОС ПОБЕДИТЕЛЕЙ ИЗ ЛОГОВ (forward-test, DEMO-ONLY) ───────────────────
+  STRAT_FAV_HOLD_NOSL,        // FAV-HOLD 64-90¢ без SL (udgFav: 80% WR, +$701)
+  STRAT_FAV_HOLD_X5,          // FAV-HOLD X 88-96¢ (favHoldX: 98% WR, PF 4.44)
+  STRAT_UDG_VOL_VALUE,        // UDG-VOL VALUE дог 22-40¢ (реконструкция udgVol)
 ];
 
 // ─── UNDERDOG HOLD LOSS-STREAK CIRCUIT BREAKER ───────────────────────────────
@@ -5017,7 +5404,7 @@ function buildSnapshot() {
     ts:        Date.now(),
     ws:        wsStatus,
     isSim,
-    btc:       curBTC,
+    btc:       (ticks.length ? ticks[ticks.length - 1].price : null) || curBTC,  // дисплей: быстрый тик Coinbase (обновление каждую сек.), не медленный Chainlink
     bestBid, bestAsk,
     poly: {
       status:   poly.status,
@@ -5044,6 +5431,7 @@ function buildSnapshot() {
       balance:  realBalance,
     },
     copy: copySnapshot(),
+    track15: snapshot15(),
     journal: tradeJournal.slice(-120).reverse(),
     config: {
       invertSignal: INVERT_SIGNAL, tpAbsPrice: TP_ABS_PRICE, minEntryPrice: MIN_ENTRY_PRICE,
@@ -5770,6 +6158,31 @@ app.post('/api/strategy/:id/demo/toggle', (req, res) => {
   res.json({ id: req.params.id, demoEnabled: s.demoEnabled });
 });
 
+// ── 15-минутная дорожка: управление (демо-обкатка) ───────────────────────────
+app.post('/api/strat15/:id/toggle', (req, res) => {
+  const s = STRATEGIES_15[req.params.id];
+  if (!s) return res.status(404).json({ error: 'not found' });
+  const acct = (req.body || {}).account === 'real' ? 'real' : 'demo';
+  if (acct === 'real') s.realEnabled = !s.realEnabled; else s.demoEnabled = !s.demoEnabled;
+  saveState();
+  console.log(`[strat15] ${req.params.id} ${acct} → ${(acct === 'real' ? s.realEnabled : s.demoEnabled) ? 'ON' : 'OFF'}`);
+  res.json({ ok: true, track15: snapshot15() });
+});
+app.post('/api/strat15/:id/reset', (req, res) => {
+  const s = STRATEGIES_15[req.params.id];
+  if (!s) return res.status(404).json({ error: 'not found' });
+  const acct = (req.body || {}).account === 'real' ? 'real' : 'demo';
+  s[acct] = { balance: 1000, peakBalance: 1000, open: null, log: [] };
+  saveState();
+  res.json({ ok: true, track15: snapshot15() });
+});
+app.post('/api/strat15/reset-all', (req, res) => {
+  for (const id in STRATEGIES_15) STRATEGIES_15[id].demo = { balance: 1000, peakBalance: 1000, open: null, log: [] };
+  saveState();
+  res.json({ ok: true, track15: snapshot15() });
+});
+
+
 // API: toggle REAL account
 app.post('/api/strategy/:id/real/toggle', (req, res) => {
   const s = STRATEGIES[req.params.id];
@@ -6158,6 +6571,7 @@ app.get('/api/real/diagnose', async (_, res) => {
 
 // ─── BOOT ────────────────────────────────────────────────────────────────────
 initStrategies();
+initStrategies15();
 loadState();
 connectCoinbase();
 // Real trading: init wallet AFTER strategies are loaded
@@ -6173,10 +6587,14 @@ setInterval(() => {
 
 // Polymarket every 2s
 setInterval(() => { if (poly.autoFetch) fetchPolyMarket().catch(e => console.error('[poly]', e.message)); }, 1500);
+// 15-мин рынок (изолированная дорожка) каждые 2с
+setInterval(() => { fetchPolyMarket15().catch(e => console.error('[poly15]', e.message)); }, 2000);
 // Chainlink every 4s
 setInterval(() => { if (chain.enabled && !isSim) refreshChainlinkPrice().catch(() => {}); }, 1500);
 // Strategy engine every 1s
 setInterval(() => { try { processStrategies(); } catch (e) { console.error('[strategies]', e.message); } }, 1000);
+// 15-мин движок (демо + реал по тумблеру) каждую 1с
+setInterval(() => { processStrategies15().catch(e => console.error('[strategies15]', e.message)); }, 1000);
 // SSE broadcast every 1s
 setInterval(() => { if (sseClients.size > 0) broadcast(buildSnapshot()); }, 1000);
 // Auto-save every 60s
